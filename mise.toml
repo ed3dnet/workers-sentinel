@@ -1,0 +1,7 @@
+# Local development toolchain (mirrors the ed3dsite-2025 pattern).
+# Versions match the mise-installed tools on this machine; wrangler itself comes
+# from the repository devDependency via pnpm, not from a global install.
+[tools]
+node = "26.8.1"
+"npm:pnpm" = "10.24.0"
+just = "1.43.0"

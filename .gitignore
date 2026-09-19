@@ -36,3 +36,6 @@ coverage/
 .cache/
 .wrangler
 .claude
+
+# Local supervisor state (ownership records, Durable Object persistence)
+_devenv/cloudflare/.state/
