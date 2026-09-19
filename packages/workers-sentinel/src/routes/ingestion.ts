@@ -1,7 +1,9 @@
 import { type Context, Hono } from 'hono';
+import { cors } from 'hono/cors';
 import {
 	extractEvents,
 	extractKeyFromAuthHeader,
+	MAX_COMPRESSED_BODY_BYTES,
 	maybeDecompress,
 	parseEnvelope,
 } from '../lib/envelope-parser';
@@ -9,6 +11,19 @@ import { buildWebhookPayload, sendWebhook } from '../lib/webhook';
 import type { Env, Project } from '../types';
 
 export const ingestionRoutes = new Hono<{ Bindings: Env }>();
+
+// Sentry browser SDKs POST cross-origin without credentials: these endpoints
+// get permissive CORS (wildcard origin, NO credentials). This is the only part
+// of the API that may be reached cross-origin by design.
+for (const path of [
+	'/:projectId/envelope',
+	'/:projectId/envelope/',
+	'/:projectId/store',
+	'/:projectId/store/',
+	'/:projectId/security',
+]) {
+	ingestionRoutes.use(path, cors({ origin: '*', credentials: false }));
+}
 
 // Main envelope ingestion endpoint
 // POST /api/{project_id}/envelope/
@@ -43,9 +58,9 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 	// 3. Authorization header (basic auth style)
 	if (!publicKey) {
 		const authHeader = c.req.header('Authorization');
-		if (authHeader?.startsWith('Basic ')) {
+		if (authHeader && /^\s*basic\s+/i.test(authHeader)) {
 			try {
-				const decoded = atob(authHeader.substring(6));
+				const decoded = atob(authHeader.replace(/^\s*basic\s+/i, ''));
 				publicKey = decoded.split(':')[0];
 			} catch {
 				// Invalid base64
@@ -84,7 +99,14 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 	// Parse the request body
 	const contentEncoding = c.req.header('Content-Encoding') ?? null;
 	const contentType = c.req.header('Content-Type') || '';
+	const declaredLength = Number(c.req.header('Content-Length') ?? '0');
+	if (Number.isFinite(declaredLength) && declaredLength > MAX_COMPRESSED_BODY_BYTES) {
+		return c.json({ error: 'payload_too_large', message: 'Envelope exceeds size limit' }, 413);
+	}
 	const bodyBuffer = await c.req.arrayBuffer();
+	if (bodyBuffer.byteLength > MAX_COMPRESSED_BODY_BYTES) {
+		return c.json({ error: 'payload_too_large', message: 'Envelope exceeds size limit' }, 413);
+	}
 
 	let bodyText: string;
 	try {
@@ -105,8 +127,8 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 			const envelope = parseEnvelope(bodyText);
 			events = extractEvents(envelope);
 		}
-	} catch (error) {
-		console.error('Parse error:', error);
+	} catch {
+		// Do not log attacker-controlled body content
 		return c.json({ error: 'parse_failed', message: 'Failed to parse envelope' }, 400);
 	}
 
@@ -142,10 +164,14 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 				const result = await response.json();
 				results.push(result);
 			} else {
-				console.error('Ingest error:', await response.text());
+				// Log status only: response bodies may echo attacker content
+				console.error(`Ingest error: status ${response.status}`);
 			}
 		} catch (error) {
-			console.error('Ingest error:', error);
+			console.error(
+				'Ingest error:',
+				error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+			);
 		}
 	}
 
@@ -176,16 +202,32 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 	}
 
 	// Return the first event ID (standard Sentry response)
-	const firstResult = results[0] as { eventId: string } | undefined;
-	return c.json({ id: firstResult?.eventId || events[0]?.event_id || null });
+	const firstResult = results[0] as { eventId: string; duplicate?: boolean } | undefined;
+	return c.json({
+		id: firstResult?.eventId || events[0]?.event_id || null,
+		...(firstResult?.duplicate ? { duplicate: true } : {}),
+	});
 }
 
-// Security endpoint - returns project configuration
+// Security endpoint - returns the project's real ingestion security config
 // GET /api/{project_id}/security/
 ingestionRoutes.get('/:projectId/security', async (c) => {
-	// Return CORS headers for browser SDKs
+	const projectId = c.req.param('projectId');
+	const projectStateId = c.env.PROJECT_STATE.idFromName(projectId);
+	const projectState = c.env.PROJECT_STATE.get(projectStateId);
+	const settingsResponse = await projectState.fetch(
+		new Request('http://internal/settings', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({}),
+		}),
+	);
+	const settings = settingsResponse.ok
+		? ((await settingsResponse.json()) as { scrubHeaders?: string[] })
+		: {};
 	return c.json({
 		allowedDomains: ['*'],
 		scrubData: true,
+		scrubHeaders: settings.scrubHeaders ?? [],
 	});
 });

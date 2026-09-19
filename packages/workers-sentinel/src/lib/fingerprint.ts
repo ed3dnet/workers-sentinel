@@ -1,3 +1,5 @@
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import type { IssueMetadata, SentryEvent, StackFrame, Stacktrace } from '../types';
 
 /**
@@ -215,21 +217,9 @@ function normalizeMessage(message: string): string {
 
 /**
  * Hash an array of strings to create a fingerprint.
+ * SHA-256 (not a small non-crypto hash): a 32-bit djb2 digest allowed
+ * deliberate issue-grouping collisions with ~65k distinct events.
  */
 function hashArray(parts: string[]): string {
-	const str = parts.join('||');
-	return simpleHash(str);
-}
-
-/**
- * Simple hash function (djb2 algorithm).
- * For production, consider using SHA-256 via crypto.subtle.
- */
-function simpleHash(str: string): string {
-	let hash = 5381;
-	for (let i = 0; i < str.length; i++) {
-		hash = (hash * 33) ^ str.charCodeAt(i);
-	}
-	// Convert to hex string
-	return (hash >>> 0).toString(16).padStart(8, '0');
+	return bytesToHex(sha256(utf8ToBytes(parts.join('||'))));
 }

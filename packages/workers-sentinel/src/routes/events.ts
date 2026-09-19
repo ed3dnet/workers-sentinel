@@ -72,6 +72,39 @@ eventRoutes.get('/:slug/issues/:issueId/events', async (c) => {
 	return c.json(data);
 });
 
+// Get latest events for a project
+// GET /api/projects/:slug/events/latest
+// NOTE: registered BEFORE /:slug/events/:eventId, otherwise "latest" is
+// captured as an eventId and this endpoint is unreachable.
+eventRoutes.get('/:slug/events/latest', async (c) => {
+	const slug = c.req.param('slug');
+
+	const projectResult = await getProjectWithAccess(c, slug);
+	if (projectResult instanceof Response) {
+		return projectResult;
+	}
+
+	const { project } = projectResult;
+
+	const limit = c.req.query('limit');
+
+	const projectStateId = c.env.PROJECT_STATE.idFromName(project.id);
+	const projectState = c.env.PROJECT_STATE.get(projectStateId);
+
+	const response = await projectState.fetch(
+		new Request('http://internal/events/latest', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				limit: limit ? parseInt(limit, 10) : undefined,
+			}),
+		}),
+	);
+
+	const data = await response.json();
+	return c.json(data);
+});
+
 // Get a specific event
 // GET /api/projects/:slug/events/:eventId
 eventRoutes.get('/:slug/events/:eventId', async (c) => {
@@ -100,37 +133,6 @@ eventRoutes.get('/:slug/events/:eventId', async (c) => {
 		const error = await response.json();
 		return c.json(error, response.status as 404);
 	}
-
-	const data = await response.json();
-	return c.json(data);
-});
-
-// Get latest events for a project
-// GET /api/projects/:slug/events/latest
-eventRoutes.get('/:slug/events/latest', async (c) => {
-	const slug = c.req.param('slug');
-
-	const projectResult = await getProjectWithAccess(c, slug);
-	if (projectResult instanceof Response) {
-		return projectResult;
-	}
-
-	const { project } = projectResult;
-
-	const limit = c.req.query('limit');
-
-	const projectStateId = c.env.PROJECT_STATE.idFromName(project.id);
-	const projectState = c.env.PROJECT_STATE.get(projectStateId);
-
-	const response = await projectState.fetch(
-		new Request('http://internal/events/latest', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				limit: limit ? parseInt(limit, 10) : undefined,
-			}),
-		}),
-	);
 
 	const data = await response.json();
 	return c.json(data);

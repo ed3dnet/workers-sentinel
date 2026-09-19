@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { sanitizeEvent } from '../lib/envelope-parser';
 import {
 	extractCulprit,
 	extractMetadata,
@@ -8,6 +9,28 @@ import {
 import type { Env, FilterType, InboundFilter, Issue, ProjectSettings, SentryEvent } from '../types';
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Clamp a client-supplied page limit. Negative or non-numeric values fall
+ * back to the default: SQLite treats a negative LIMIT as unlimited, so
+ * `?limit=-1` must never reach a query.
+ */
+export function clampLimit(raw: number | undefined | null, fallback: number, max = 100): number {
+	if (raw === undefined || raw === null || !Number.isFinite(raw) || raw < 1) return fallback;
+	return Math.min(Math.floor(raw), max);
+}
+
+/** Headers scrubbed from stored events unless a project overrides the list. */
+const DEFAULT_SCRUB_HEADERS = [
+	'authorization',
+	'proxy-authorization',
+	'cookie',
+	'set-cookie',
+	'x-api-key',
+	'x-auth-token',
+	'x-session-token',
+	'x-csrf-token',
+];
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS issues (
@@ -298,6 +321,8 @@ export class ProjectState extends DurableObject<Env> {
 					return this.handleDeleteFilter(request);
 				case '/issues/merge':
 					return this.handleMergeIssues(request);
+				case '/purge':
+					return this.handlePurge();
 				default:
 					return new Response(JSON.stringify({ error: 'not_found' }), {
 						status: 404,
@@ -316,6 +341,17 @@ export class ProjectState extends DurableObject<Env> {
 		}
 	}
 
+	private async handlePurge(): Promise<Response> {
+		// Drop every table row and all KV storage in this Durable Object.
+		// Called when a project is deleted so tenant data does not outlive it.
+		await this.ctx.storage.deleteAll();
+		// Allow the schema to be recreated lazily on the next request
+		this.initialized = false;
+		return new Response(JSON.stringify({ purged: true }), {
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
+
 	private async handleIngest(request: Request): Promise<Response> {
 		// Check rate limit before processing
 		const rateCheck = this.checkRateLimit();
@@ -332,11 +368,18 @@ export class ProjectState extends DurableObject<Env> {
 			);
 		}
 
-		const event = (await request.json()) as SentryEvent;
+		const event = this.redactEvent(sanitizeEvent((await request.json()) as SentryEvent));
 
 		const eventId = event.event_id || crypto.randomUUID();
 		const now = new Date().toISOString();
 		const timestamp = event.timestamp || now;
+
+		// Duplicate event_id: acknowledge without double-counting (the client
+		// controls event_id, so replays must be idempotent)
+		const duplicate = this.sql.exec('SELECT 1 FROM events WHERE id = ?', eventId).toArray();
+		if (duplicate.length > 0) {
+			return this.jsonResponse({ eventId, duplicate: true });
+		}
 
 		// Generate fingerprint
 		const fingerprint = generateFingerprint(event);
@@ -451,8 +494,10 @@ export class ProjectState extends DurableObject<Env> {
 			}
 		}
 
-		// Update hourly stats
-		const bucket = this.getHourBucket(timestamp);
+		// Update hourly stats. Bucket by server receipt time: client timestamps
+		// are attacker-controlled and previously let future-dated rows outlive
+		// retention pruning (which runs on received_at).
+		const bucket = this.getHourBucket(now);
 		this.sql.exec(
 			`INSERT INTO issue_stats (issue_id, bucket, count)
        VALUES (?, ?, 1)
@@ -613,7 +658,7 @@ export class ProjectState extends DurableObject<Env> {
 				tags?: string[];
 			};
 
-		const pageLimit = Math.min(limit || 25, 100);
+		const pageLimit = clampLimit(limit, 25);
 		const sortField = sort && ProjectState.ALLOWED_SORT_FIELDS.has(sort) ? sort : 'last_seen';
 		const sortOrder = 'DESC';
 		const now = new Date().toISOString();
@@ -646,8 +691,9 @@ export class ProjectState extends DurableObject<Env> {
 		}
 
 		if (query) {
-			sql += ' AND (title LIKE ? OR culprit LIKE ?)';
-			params.push(`%${query}%`, `%${query}%`);
+			sql += " AND (title LIKE ? ESCAPE '\\' OR culprit LIKE ? ESCAPE '\\')";
+			const escaped = query.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+			params.push(`%${escaped}%`, `%${escaped}%`);
 		}
 
 		if (tags && tags.length > 0) {
@@ -831,7 +877,7 @@ export class ProjectState extends DurableObject<Env> {
 			limit?: number;
 		};
 
-		const pageLimit = Math.min(limit || 25, 100);
+		const pageLimit = clampLimit(limit, 25);
 
 		let sql = 'SELECT * FROM events WHERE issue_id = ?';
 		const params: (string | number)[] = [issueId];
@@ -879,7 +925,7 @@ export class ProjectState extends DurableObject<Env> {
 	private async handleGetLatestEvents(request: Request): Promise<Response> {
 		const { limit } = (await request.json()) as { limit?: number };
 
-		const pageLimit = Math.min(limit || 25, 100);
+		const pageLimit = clampLimit(limit, 25);
 
 		const rows = this.sql
 			.exec('SELECT * FROM events ORDER BY timestamp DESC LIMIT ?', pageLimit)
@@ -933,7 +979,7 @@ export class ProjectState extends DurableObject<Env> {
 
 	private async handleGetTags(request: Request): Promise<Response> {
 		const { limit } = (await request.json()) as { limit?: number };
-		const facetLimit = Math.min(limit || 10, 50);
+		const facetLimit = clampLimit(limit, 10, 50);
 
 		const keys = this.sql
 			.exec(
@@ -985,7 +1031,7 @@ export class ProjectState extends DurableObject<Env> {
 			return this.jsonResponse({ error: 'missing_key' }, 400);
 		}
 
-		const pageLimit = Math.min(limit || 25, 100);
+		const pageLimit = clampLimit(limit, 25);
 
 		let sql = `SELECT value, COUNT(DISTINCT issue_id) as issue_count, COUNT(*) as event_count
 			FROM event_tags
@@ -1017,7 +1063,7 @@ export class ProjectState extends DurableObject<Env> {
 			limit?: number;
 		};
 
-		const pageLimit = Math.min(limit || 25, 100);
+		const pageLimit = clampLimit(limit, 25);
 		const params: (string | number)[] = [];
 
 		let sql = 'SELECT * FROM releases WHERE 1=1';
@@ -1283,7 +1329,7 @@ export class ProjectState extends DurableObject<Env> {
 			limit?: number;
 		};
 
-		const pageLimit = Math.min(limit || 50, 100);
+		const pageLimit = clampLimit(limit, 50);
 
 		let sql = 'SELECT * FROM issue_activity WHERE issue_id = ?';
 		const params: (string | number)[] = [issueId];
@@ -1769,11 +1815,78 @@ export class ProjectState extends DurableObject<Env> {
 
 	private handleGetSettings(): Response {
 		const retentionDays = this.getRetentionDays();
-		return this.jsonResponse({ retentionDays });
+		return this.jsonResponse({ retentionDays, scrubHeaders: this.getScrubHeaders() });
+	}
+
+	/** Header names whose values are removed from stored events (case-insensitive). */
+	private getScrubHeaders(): string[] {
+		try {
+			const rows = this.sql
+				.exec("SELECT value FROM settings WHERE key = 'scrub_headers'")
+				.toArray();
+			if (rows.length > 0) {
+				const parsed = JSON.parse(rows[0].value as string);
+				if (Array.isArray(parsed)) return parsed.filter((e) => typeof e === 'string');
+			}
+		} catch {
+			// Fall through to defaults
+		}
+		return [...DEFAULT_SCRUB_HEADERS];
+	}
+
+	/**
+	 * Remove sensitive data from an event before persistence: configured
+	 * request headers, cookies, environment variables and query-string style
+	 * secrets. Applied to every stored copy of the payload.
+	 */
+	private redactEvent(event: SentryEvent): SentryEvent {
+		const scrub = new Set(this.getScrubHeaders().map((header) => header.toLowerCase()));
+		const FILTERED = '[Filtered]';
+
+		const request = event.request as
+			| {
+					headers?: Record<string, string>;
+					cookies?: unknown;
+					env?: Record<string, string>;
+					query_string?: string;
+			  }
+			| undefined;
+		if (request) {
+			if (request.headers && typeof request.headers === 'object') {
+				for (const key of Object.keys(request.headers)) {
+					if (scrub.has(key.toLowerCase())) {
+						request.headers[key] = FILTERED;
+					}
+				}
+			}
+			if (request.cookies !== undefined) {
+				request.cookies = FILTERED;
+			}
+			if (request.env && typeof request.env === 'object') {
+				for (const key of Object.keys(request.env)) {
+					request.env[key] = FILTERED;
+				}
+			}
+			if (typeof request.query_string === 'string') {
+				request.query_string = request.query_string.replace(
+					/([?&])([^?&=#]*?(?:secret|token|key|password|credential)[^?&=#]*)=([^?&]*)/gi,
+					'$1$2=[Filtered]',
+				);
+			}
+		}
+
+		// Strip credentials from structured user data
+		if (event.user && typeof event.user === 'object') {
+			if (event.user.ip_address) event.user.ip_address = undefined;
+		}
+
+		return event;
 	}
 
 	private async handleUpdateSettings(request: Request): Promise<Response> {
-		const { retentionDays } = (await request.json()) as ProjectSettings;
+		const { retentionDays, scrubHeaders } = (await request.json()) as ProjectSettings & {
+			scrubHeaders?: string[];
+		};
 
 		if (
 			typeof retentionDays !== 'number' ||
@@ -1786,6 +1899,23 @@ export class ProjectState extends DurableObject<Env> {
 					message: 'retentionDays must be 0 or a positive integer',
 				},
 				400,
+			);
+		}
+
+		if (scrubHeaders !== undefined) {
+			if (
+				!Array.isArray(scrubHeaders) ||
+				scrubHeaders.length > 50 ||
+				scrubHeaders.some((header) => typeof header !== 'string' || header.length > 100)
+			) {
+				return this.jsonResponse(
+					{ error: 'invalid_scrub_headers', message: 'scrubHeaders must be ≤50 header names' },
+					400,
+				);
+			}
+			this.sql.exec(
+				"INSERT OR REPLACE INTO settings (key, value) VALUES ('scrub_headers', ?)",
+				JSON.stringify(scrubHeaders),
 			);
 		}
 
@@ -1826,6 +1956,22 @@ export class ProjectState extends DurableObject<Env> {
 		const id = crypto.randomUUID();
 		const now = new Date().toISOString();
 		const size = new TextEncoder().encode(content).length;
+
+		// Per-project quota: unbounded uploads are a storage-exhaustion vector
+		// (upserts on the same release/fileUrl replace rather than count)
+		const existing = this.sql
+			.exec('SELECT id FROM source_maps WHERE release = ? AND file_url = ?', release, fileUrl)
+			.toArray();
+		if (existing.length === 0) {
+			const countRows = this.sql.exec('SELECT COUNT(*) as count FROM source_maps').toArray();
+			const count = countRows.length > 0 ? (countRows[0].count as number) : 0;
+			if (count >= 200) {
+				return this.jsonResponse(
+					{ error: 'quota_exceeded', message: 'Source map quota (200) exceeded for this project' },
+					400,
+				);
+			}
+		}
 
 		this.sql.exec(
 			`INSERT INTO source_maps (id, release, file_url, content, created_at, size)
@@ -1923,6 +2069,15 @@ export class ProjectState extends DurableObject<Env> {
 			primaryIssueId: string;
 			issueIds: string[];
 		};
+
+		// Bound the merge list: an unbounded array means unbounded SQL
+		// statements and DO CPU time per request (bulk-update caps at 100)
+		if (!Array.isArray(issueIds) || issueIds.length > 100) {
+			return this.jsonResponse(
+				{ error: 'invalid_issue_ids', message: 'issueIds must be an array of at most 100 ids' },
+				400,
+			);
+		}
 
 		// Validate primary issue exists
 		const primaryRows = this.sql

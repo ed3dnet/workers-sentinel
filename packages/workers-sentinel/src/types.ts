@@ -1,6 +1,10 @@
 export interface Env {
 	AUTH_STATE: DurableObjectNamespace;
 	PROJECT_STATE: DurableObjectNamespace;
+	/** Optional operator secret: when set, the first registration (admin bootstrap) must present it. */
+	SETUP_TOKEN?: string;
+	/** Optional comma-separated list of origins allowed cross-origin access to the dashboard API. */
+	CORS_ORIGINS?: string;
 	ASSETS?: Fetcher;
 }
 

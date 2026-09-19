@@ -150,12 +150,14 @@ projectRoutes.patch('/:slug', async (c) => {
 		webhookUrl?: string | null;
 		maxEventsPerHour?: number;
 		retentionDays?: number;
+		scrubHeaders?: string[];
 	}>();
 
 	if (
 		body.webhookUrl === undefined &&
 		body.maxEventsPerHour === undefined &&
-		body.retentionDays === undefined
+		body.retentionDays === undefined &&
+		body.scrubHeaders === undefined
 	) {
 		return c.json({ error: 'no_updates', message: 'No fields to update were provided' }, 400);
 	}
@@ -177,7 +179,28 @@ projectRoutes.patch('/:slug', async (c) => {
 		return c.json(error, getResponse.status as ContentfulStatusCode);
 	}
 
-	const projectData = (await getResponse.json()) as { project: { id: string } };
+	const projectData = (await getResponse.json()) as {
+		project: { id: string };
+		memberRole?: string;
+	};
+
+	// Security-relevant project config (rate limits, retention, scrubbing)
+	// requires owner/admin, mirroring the webhookUrl gate in AuthState.
+	if (
+		body.maxEventsPerHour !== undefined ||
+		body.retentionDays !== undefined ||
+		body.scrubHeaders !== undefined
+	) {
+		if (projectData.memberRole !== 'owner' && projectData.memberRole !== 'admin') {
+			return c.json(
+				{
+					error: 'forbidden',
+					message: 'Only project owners and admins can change security settings',
+				},
+				403,
+			);
+		}
+	}
 
 	const result: Record<string, unknown> = {};
 
@@ -224,8 +247,8 @@ projectRoutes.patch('/:slug', async (c) => {
 		Object.assign(result, data);
 	}
 
-	// Update retention settings in ProjectState if provided
-	if (body.retentionDays !== undefined) {
+	// Update retention/scrub settings in ProjectState if provided
+	if (body.retentionDays !== undefined || body.scrubHeaders !== undefined) {
 		const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
 		const projectState = c.env.PROJECT_STATE.get(projectStateId);
 
@@ -233,7 +256,10 @@ projectRoutes.patch('/:slug', async (c) => {
 			new Request('http://internal/settings/update', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ retentionDays: body.retentionDays }),
+				body: JSON.stringify({
+					retentionDays: body.retentionDays === undefined ? 0 : body.retentionDays,
+					scrubHeaders: body.scrubHeaders,
+				}),
 			}),
 		);
 
@@ -383,6 +409,17 @@ projectRoutes.delete('/:slug', async (c) => {
 			}),
 		}),
 	);
+
+	if (!deleteResponse.ok) {
+		const data = await deleteResponse.json();
+		return c.json(data, deleteResponse.status as ContentfulStatusCode);
+	}
+
+	// Purge the ProjectState Durable Object so events, source maps, comments
+	// and stats do not outlive the deleted project
+	const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
+	const projectState = c.env.PROJECT_STATE.get(projectStateId);
+	await projectState.fetch(new Request('http://internal/purge', { method: 'POST' }));
 
 	const data = await deleteResponse.json();
 	return c.json(data, deleteResponse.status as ContentfulStatusCode);

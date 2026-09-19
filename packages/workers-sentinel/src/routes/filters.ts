@@ -9,11 +9,11 @@ type AppContext = Context<{ Bindings: Env; Variables: Variables }>;
 
 export const filterRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// Helper to get project and verify access
+// Helper to get project and verify access; returns the caller's project role
 async function getProjectWithAccess(
 	c: AppContext,
 	slug: string,
-): Promise<{ project: Project } | Response> {
+): Promise<{ project: Project; memberRole?: string } | Response> {
 	const auth = c.get('auth');
 	if (!auth) {
 		return c.json({ error: 'unauthorized' }, 401);
@@ -35,6 +35,18 @@ async function getProjectWithAccess(
 	}
 
 	return response.json();
+}
+
+// Write operations on filters can silently suppress ingested events, so they
+// require owner/admin, not plain membership.
+function requireElevatedRole(c: AppContext, memberRole: string | undefined): Response | null {
+	if (memberRole !== 'owner' && memberRole !== 'admin') {
+		return c.json(
+			{ error: 'forbidden', message: 'Only project owners and admins can manage filters' },
+			403,
+		);
+	}
+	return null;
 }
 
 // List filters for a project
@@ -74,7 +86,9 @@ filterRoutes.post('/:slug/filters', async (c) => {
 		return projectResult;
 	}
 
-	const { project } = projectResult;
+	const { project, memberRole } = projectResult;
+	const denied = requireElevatedRole(c, memberRole);
+	if (denied) return denied;
 	const body = await c.req.json<{
 		filterType: string;
 		pattern: string;
@@ -111,7 +125,9 @@ filterRoutes.patch('/:slug/filters/:filterId', async (c) => {
 		return projectResult;
 	}
 
-	const { project } = projectResult;
+	const { project, memberRole } = projectResult;
+	const denied = requireElevatedRole(c, memberRole);
+	if (denied) return denied;
 	const body = await c.req.json<{
 		enabled?: boolean;
 		pattern?: string;
@@ -149,7 +165,9 @@ filterRoutes.delete('/:slug/filters/:filterId', async (c) => {
 		return projectResult;
 	}
 
-	const { project } = projectResult;
+	const { project, memberRole } = projectResult;
+	const denied = requireElevatedRole(c, memberRole);
+	if (denied) return denied;
 
 	const projectStateId = c.env.PROJECT_STATE.idFromName(project.id);
 	const projectState = c.env.PROJECT_STATE.get(projectStateId);

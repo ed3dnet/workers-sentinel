@@ -45,20 +45,77 @@ export function buildWebhookPayload(
 	};
 }
 
-export async function sendWebhook(url: string, payload: WebhookPayload): Promise<void> {
+const WEBHOOK_TIMEOUT_MS = 10000;
+
+/**
+ * Validate a webhook destination. Only https:// URLs whose hostname is not a
+ * loopback/link-local/private literal are accepted. This is defense in depth:
+ * Workers egress cannot reach RFC1918 space in production, but local dev under
+ * workerd can, and redirects must also be refused (an attacker-controlled
+ * redirect target is not re-validated by fetch).
+ */
+export function validateWebhookUrl(
+	raw: string,
+): { ok: true; url: URL } | { ok: false; reason: string } {
+	let url: URL;
 	try {
-		const response = await fetch(url, {
+		url = new URL(raw);
+	} catch {
+		return { ok: false, reason: 'invalid URL' };
+	}
+	if (url.protocol !== 'https:') {
+		return { ok: false, reason: 'only https URLs are allowed' };
+	}
+	const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+	if (
+		host === 'localhost' ||
+		host.endsWith('.localhost') ||
+		host.endsWith('.local') ||
+		host.endsWith('.internal') ||
+		/^127\./.test(host) ||
+		/^0\./.test(host) ||
+		/^10\./.test(host) ||
+		/^192\.168\./.test(host) ||
+		/^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+		/^169\.254\./.test(host) ||
+		/^::1$/.test(host) ||
+		/^f[cd][0-9a-f]{2}:/.test(host)
+	) {
+		return { ok: false, reason: 'webhook host must not be a private or loopback address' };
+	}
+	if (url.username || url.password) {
+		return { ok: false, reason: 'credentials in webhook URL are not allowed' };
+	}
+	return { ok: true, url };
+}
+
+export async function sendWebhook(url: string, payload: WebhookPayload): Promise<void> {
+	const validated = validateWebhookUrl(url);
+	if (!validated.ok) {
+		console.error(`Webhook delivery refused: ${validated.reason}`);
+		return;
+	}
+	try {
+		const response = await fetch(validated.url, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(payload),
+			// Redirects are refused: a redirect target would bypass the
+			// scheme/host validation above
+			redirect: 'error',
+			signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
 		});
 		if (!response.ok) {
-			const body = await response.text();
-			console.error(`Webhook delivery failed: ${response.status} ${response.statusText} - ${body}`);
+			// Never read or log the target's response body: it can echo
+			// attacker-controlled content into observability logs
+			console.error(`Webhook delivery failed: ${response.status}`);
 		} else {
 			await response.body?.cancel();
 		}
 	} catch (error) {
-		console.error('Webhook delivery error:', error);
+		console.error(
+			'Webhook delivery error:',
+			error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+		);
 	}
 }
