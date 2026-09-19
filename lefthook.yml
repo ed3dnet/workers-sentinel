@@ -1,0 +1,20 @@
+# Lefthook git hooks. Activate with `lefthook install` (run by `just install`).
+pre-commit:
+  parallel: true
+  jobs:
+    - name: lint
+      glob: "*.{js,mjs,cjs,ts,tsx,vue,json,jsonc}"
+      run: pnpm exec biome check --no-errors-on-unmatched {staged_files}
+    # Unit suite (vitest-pool-workers, 248 tests) whenever worker code,
+    # tests, or config are part of the commit.
+    - name: unit tests
+      glob: "{packages/workers-sentinel/src/**,packages/workers-sentinel/test/**,packages/workers-sentinel/wrangler.jsonc,packages/workers-sentinel/vitest.config.ts,pnpm-lock.yaml}"
+      run: pnpm --dir packages/workers-sentinel test
+
+# Integration tests run only when the push updates refs/heads/main.
+# use_stdin forwards git's ref lines so the wrapper can detect the target.
+pre-push:
+  use_stdin: true
+  jobs:
+    - name: integration tests (target main)
+      run: bash scripts/pre-push-main.sh

@@ -88,6 +88,15 @@ The publicKey is validated against AuthState's projects table. ProjectState is a
 
 Cloudflare Workers can send events via service binding instead of HTTP for lower latency. The ingestion endpoint works identically - service bindings only change transport, not authentication. See README for custom transport setup.
 
+## Git hooks (lefthook)
+
+Lefthook is mise-pinned (`lefthook = "2.1.14"`) and activated by `just install` (`lefthook install`). Configuration lives in `lefthook.yml`:
+
+- **pre-commit** (all commits): biome on staged js/ts/vue/json files; the full worker unit suite (vitest-pool-workers) whenever `packages/workers-sentinel/{src,test}/**`, `wrangler.jsonc`, `vitest.config.ts` or `pnpm-lock.yaml` are staged.
+- **pre-push**: black-box integration suite (`just test-integration`) — only when the push updates `refs/heads/main` (detected from git's ref lines via lefthook's `use_stdin`; deletions never trigger it).
+
+The integration runner (`scripts/integration.mjs`) stands up its **own** wrangler dev instance — its own port, its own `--persist-to` under a temp dir, `SETUP_TOKEN` injected via `--var` (process env does not become Worker bindings under `wrangler dev`) — waits for `/api/health`, runs `node --test packages/workers-sentinel/integration/`, and tears the whole process group down. It never touches the guarded supervisor's port or `_devenv/` state. Tests in `packages/workers-sentinel/integration/` are plain `node:test` files driven by `SENTINEL_INTEGRATION_URL`/`SENTINEL_SETUP_TOKEN`; they assume a pristine install (first-user bootstrap, global settings) and must not be pointed at a shared stack.
+
 ## Security posture (post-remediation, 2026-09)
 
 Full remediation of the findings in `security-analysis/reports/` (see INDEX.md). Key properties now enforced:

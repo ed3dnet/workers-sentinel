@@ -5,9 +5,10 @@ set shell := ["bash", "-cu"]
 default:
     @just --list
 
-# Install workspace dependencies; never starts anything.
+# Install workspace dependencies and git hooks; never starts anything.
 install:
     pnpm install
+    lefthook install
 
 # Build dashboard then worker packages (wrangler dev also runs the dashboard build itself).
 build:
@@ -37,6 +38,10 @@ send-demo-events:
 # Worker test suite (vitest-pool-workers, no supervisor needed).
 test:
     pnpm --dir packages/workers-sentinel test
+
+# Black-box integration suite; boots its own wrangler dev (own port/state).
+test-integration:
+    node scripts/integration.mjs
 
 typecheck:
     pnpm typecheck
