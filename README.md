@@ -144,6 +144,19 @@ pnpm install
 pnpm deploy
 ```
 
+### Local Development (guarded supervisor)
+
+Run the full stack locally under Workerd — no Cloudflare account or credentials needed:
+
+```bash
+just install            # pnpm install across the workspace (mise pins node/pnpm/just via mise.toml)
+just dev-up             # foreground local supervisor: dashboard + worker + Durable Objects on 127.0.0.1
+just send-demo-events   # seed a demo user/project/events to see ingestion and grouping
+just dev-down           # authenticated stop from another terminal
+```
+
+The supervisor (in `_devenv/cloudflare/`) is loopback-only, persists Durable Object state under `_devenv/cloudflare/.state/`, and strips Cloudflare credentials from child processes so local development cannot reach your Cloudflare account. See AGENTS.md for the full command list and the stale-state reconciliation runbook.
+
 ### First-Time Setup
 
 1. **Deploy your worker** to Cloudflare
