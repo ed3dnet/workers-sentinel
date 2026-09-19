@@ -6,9 +6,9 @@
 	"license": "MIT",
 	"type": "module",
 	"scripts": {
-		"dev": "pnpm --filter @workers-sentinel/worker dev",
-		"build": "pnpm --filter @workers-sentinel/dashboard build && pnpm --filter @workers-sentinel/worker build",
-		"deploy": "pnpm build && pnpm --filter @workers-sentinel/worker deploy",
+		"dev": "pnpm --filter workers-sentinel dev",
+		"build": "pnpm --filter @workers-sentinel/dashboard build && pnpm --filter workers-sentinel build",
+		"deploy": "pnpm build && pnpm --filter workers-sentinel deploy",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",
 		"format": "biome format --write .",
