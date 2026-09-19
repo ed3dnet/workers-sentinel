@@ -1,5 +1,4 @@
 import { Hono } from 'hono';
-import { cors } from 'hono/cors';
 import { authMiddleware } from './middleware/auth';
 import { adminRoutes } from './routes/admin';
 import { authRoutes, tokenRoutes } from './routes/auth';
@@ -26,16 +25,52 @@ type Variables = {
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// CORS for dashboard
-app.use(
-	'/api/*',
-	cors({
-		origin: '*',
-		allowHeaders: ['Content-Type', 'Authorization'],
-		allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-		credentials: true,
-	}),
-);
+// CORS for the dashboard/API surface: the SPA is served same-origin by this
+// worker, so cross-origin access is only granted to explicitly configured
+// origins (CORS_ORIGINS, comma-separated). Never combines wildcard origins
+// with credentials.
+app.use('/api/*', async (c, next) => {
+	const origin = c.req.header('Origin');
+	const allowlist = (c.env.CORS_ORIGINS ?? '')
+		.split(',')
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+	const allowed = origin && allowlist.includes(origin) ? origin : null;
+	if (allowed) {
+		c.header('Access-Control-Allow-Origin', allowed);
+		c.header('Access-Control-Allow-Credentials', 'true');
+		c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+		c.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+		c.header('Vary', 'Origin');
+	}
+	// SDK ingestion paths handle their own permissive preflight; everything
+	// else answers preflight with a bare 204 and no CORS grant.
+	const isSdkPath = /^\/api\/[^/]+\/(envelope|store|security)\/?$/.test(c.req.path);
+	if (c.req.method === 'OPTIONS' && !isSdkPath) {
+		return c.body(null, 204);
+	}
+	await next();
+	return;
+});
+
+// Security headers for every response (API and dashboard assets alike)
+const CSP =
+	"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+app.use('*', async (c, next) => {
+	await next();
+	const headers = new Headers(c.res.headers);
+	headers.set('X-Content-Type-Options', 'nosniff');
+	headers.set('X-Frame-Options', 'DENY');
+	headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+	headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+	headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+	const contentType = headers.get('Content-Type') ?? '';
+	if (contentType.includes('text/html')) {
+		headers.set('Content-Security-Policy', CSP);
+	}
+	c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
+	return;
+});
 
 // Health check
 app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
