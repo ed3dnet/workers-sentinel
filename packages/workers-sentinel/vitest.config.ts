@@ -1,7 +1,12 @@
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import { configDefaults } from 'vitest/config';
 
 export default defineWorkersConfig({
 	test: {
+		// integration/** is the black-box node:test suite run by
+		// scripts/integration.mjs against a live wrangler instance, not the
+		// in-isolate vitest suite
+		exclude: [...configDefaults.exclude, 'integration/**'],
 		poolOptions: {
 			workers: {
 				isolatedStorage: false,
