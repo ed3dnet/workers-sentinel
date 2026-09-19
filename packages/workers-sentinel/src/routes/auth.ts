@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { extractBearerToken } from '../middleware/auth';
 import type { AuthContext, Env } from '../types';
 
 type Variables = {
@@ -10,7 +11,12 @@ export const tokenRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // Register a new user
 authRoutes.post('/register', async (c) => {
-	const body = await c.req.json<{ email: string; password: string; name: string }>();
+	const body = await c.req.json<{
+		email: string;
+		password: string;
+		name: string;
+		setupToken?: string;
+	}>();
 
 	if (!body.email || !body.password || !body.name) {
 		return c.json(
@@ -26,12 +32,15 @@ authRoutes.post('/register', async (c) => {
 		new Request('http://internal/register', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body),
+			body: JSON.stringify({
+				...body,
+				ip: c.req.header('CF-Connecting-IP') ?? undefined,
+			}),
 		}),
 	);
 
 	const data = await response.json();
-	return c.json(data, response.status as 200 | 400 | 409);
+	return c.json(data, response.status as 200 | 400 | 403 | 409 | 429);
 });
 
 // Login
@@ -57,10 +66,9 @@ authRoutes.post('/login', async (c) => {
 	return c.json(data, response.status as 200 | 400 | 401);
 });
 
-// Logout
+// Logout: invalidate the presented session
 authRoutes.post('/logout', async (c) => {
-	const authHeader = c.req.header('Authorization');
-	const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
+	const token = extractBearerToken(c.req.header('Authorization'));
 
 	if (!token) {
 		return c.json({ success: true });
@@ -80,15 +88,83 @@ authRoutes.post('/logout', async (c) => {
 	return c.json({ success: true });
 });
 
-// Get current user
-authRoutes.get('/me', async (c) => {
-	const authHeader = c.req.header('Authorization');
-
-	if (!authHeader || !authHeader.startsWith('Bearer ')) {
-		return c.json({ error: 'unauthorized', message: 'Missing authorization header' }, 401);
+// Logout-all: invalidate every session for the authenticated user (session auth only)
+authRoutes.post('/logout-all', async (c) => {
+	const token = extractBearerToken(c.req.header('Authorization'));
+	if (!token || token.startsWith('wst_')) {
+		return c.json({ error: 'unauthorized', message: 'Session authentication required' }, 401);
 	}
 
-	const token = authHeader.substring(7);
+	const authStateId = c.env.AUTH_STATE.idFromName('global');
+	const authState = c.env.AUTH_STATE.get(authStateId);
+
+	const response = await authState.fetch(
+		new Request('http://internal/validate-session', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ token }),
+		}),
+	);
+	if (!response.ok) {
+		return c.json({ error: 'unauthorized', message: 'Invalid or expired session' }, 401);
+	}
+	const { user } = (await response.json()) as { user: { id: string } };
+
+	await authState.fetch(
+		new Request('http://internal/logout-all', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ userId: user.id }),
+		}),
+	);
+
+	return c.json({ success: true });
+});
+
+// Change password (requires the current password; revokes all sessions)
+authRoutes.post('/change-password', async (c) => {
+	const token = extractBearerToken(c.req.header('Authorization'));
+	if (!token || token.startsWith('wst_')) {
+		return c.json({ error: 'unauthorized', message: 'Session authentication required' }, 401);
+	}
+
+	const authStateId = c.env.AUTH_STATE.idFromName('global');
+	const authState = c.env.AUTH_STATE.get(authStateId);
+	const response = await authState.fetch(
+		new Request('http://internal/validate-session', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ token }),
+		}),
+	);
+	if (!response.ok) {
+		return c.json({ error: 'unauthorized', message: 'Invalid or expired session' }, 401);
+	}
+	const { user } = (await response.json()) as { user: { id: string } };
+
+	const body = await c.req.json<{ currentPassword?: string; newPassword?: string }>();
+	const change = await authState.fetch(
+		new Request('http://internal/change-password', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				userId: user.id,
+				currentPassword: body.currentPassword,
+				newPassword: body.newPassword,
+			}),
+		}),
+	);
+	const data = await change.json();
+	return c.json(data, change.status as 200 | 400 | 401 | 404);
+});
+
+// Get current user
+authRoutes.get('/me', async (c) => {
+	const token = extractBearerToken(c.req.header('Authorization'));
+
+	if (!token) {
+		return c.json({ error: 'unauthorized', message: 'Missing authorization header' }, 401);
+	}
 
 	const authStateId = c.env.AUTH_STATE.idFromName('global');
 	const authState = c.env.AUTH_STATE.get(authStateId);

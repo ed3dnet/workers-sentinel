@@ -33,7 +33,7 @@ export async function createTestUser(
 			const response = await SELF.fetch('http://localhost/api/auth/register', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(user),
+				body: JSON.stringify({ ...user, setupToken: 'test-setup-token' }),
 			});
 
 			if (!response.ok) {

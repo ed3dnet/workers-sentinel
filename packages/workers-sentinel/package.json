@@ -43,6 +43,7 @@
 	},
 	"homepage": "https://github.com/G4brym/workers-sentinel#readme",
 	"dependencies": {
+		"@noble/hashes": "^2.4.0",
 		"hono": "^4.6.14",
 		"tsup": "^8.5.1"
 	},

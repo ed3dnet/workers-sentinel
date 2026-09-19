@@ -5,20 +5,25 @@ type Variables = {
 	auth?: AuthContext;
 };
 
+/** Case-insensitive Bearer scheme extraction with trimming. */
+export function extractBearerToken(header: string | undefined): string | null {
+	if (!header) return null;
+	const match = /^\s*bearer\s+(.+)$/i.exec(header);
+	return match ? match[1].trim() : null;
+}
+
 export const authMiddleware = createMiddleware<{
 	Bindings: Env;
 	Variables: Variables;
 }>(async (c, next) => {
-	const authHeader = c.req.header('Authorization');
+	const token = extractBearerToken(c.req.header('Authorization'));
 
-	if (!authHeader || !authHeader.startsWith('Bearer ')) {
+	if (!token) {
 		return c.json(
 			{ error: 'unauthorized', message: 'Missing or invalid authorization header' },
 			401,
 		);
 	}
-
-	const token = authHeader.substring(7);
 
 	// Get the singleton AuthState Durable Object
 	const authStateId = c.env.AUTH_STATE.idFromName('global');

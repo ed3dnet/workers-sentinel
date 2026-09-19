@@ -8,6 +8,9 @@ export default defineWorkersConfig({
 				singleWorker: true,
 				main: './test/entry.ts',
 				wrangler: { configPath: './wrangler.jsonc' },
+				miniflare: {
+					bindings: { SETUP_TOKEN: 'test-setup-token' },
+				},
 			},
 		},
 	},
