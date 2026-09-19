@@ -18,11 +18,29 @@ const WRANGLER_DIR = 'packages/workers-sentinel';
 // The repo config is JSONC; these text guards keep it local-only without a
 // full JSONC parser. Wrangler itself parses the file properly.
 function assertLocalConfig(text) {
-	if (/\baccount_id\b/.test(text) || /"routes?"|\broute\b/.test(text)) {
-		throw new Error('wrangler.jsonc must not declare account_id or routes for local dev');
+	if (/\baccount_id\b/.test(text)) {
+		throw new Error('wrangler.jsonc must not declare account_id for local dev');
 	}
 	if (/"remote"\s*:\s*true/.test(text)) {
 		throw new Error('wrangler.jsonc must not enable remote dev');
+	}
+	// Routes: Workers custom-domain entries are deploy-time-only declarations
+	// and inert under `wrangler dev --local`, so they may live in the repo
+	// config. Zone-level route patterns (bare strings or entries without
+	// custom_domain: true) stay forbidden.
+	const routesMatch = text.match(/"routes"\s*:\s*(\[[\s\S]*?\])/);
+	if (routesMatch) {
+		const entries = routesMatch[1].match(/\{[^{}]*\}/g) ?? [];
+		if (entries.length === 0) {
+			throw new Error('wrangler.jsonc must not declare zone routes for local dev');
+		}
+		for (const entry of entries) {
+			if (!/"custom_domain"\s*:\s*true/.test(entry)) {
+				throw new Error(
+					'Only custom_domain route entries are allowed in the repo config; zone routes are remote-only',
+				);
+			}
+		}
 	}
 }
 

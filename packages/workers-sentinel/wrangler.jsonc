@@ -7,6 +7,16 @@
 	"observability": {
 		"enabled": true
 	},
+	// Production: custom domain only; the workers.dev subdomain stays off.
+	// Custom-domain routes are deploy-time declarations — inert under
+	// `wrangler dev --local`.
+	"workers_dev": false,
+	"routes": [
+		{
+			"pattern": "aw-heck.ed3d.net",
+			"custom_domain": true
+		}
+	],
 	"build": {
 		"command": "cd ../dashboard && npm run build"
 	},
