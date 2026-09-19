@@ -88,6 +88,29 @@ The publicKey is validated against AuthState's projects table. ProjectState is a
 
 Cloudflare Workers can send events via service binding instead of HTTP for lower latency. The ingestion endpoint works identically - service bindings only change transport, not authentication. See README for custom transport setup.
 
+## Security posture (post-remediation, 2026-09)
+
+Full remediation of the findings in `security-analysis/reports/` (see INDEX.md). Key properties now enforced:
+
+- **Passwords**: argon2id (OWASP m=19MiB/t=2/p=1) via `@noble/hashes` pure JS — workerd disallows dynamic WASM compilation, so hash-wasm-style libraries fail at runtime. Legacy unsalted SHA-256 hashes upgrade transparently on successful login. Verification is constant-time; unknown accounts burn a dummy argon2 to equalize timing.
+- **Sessions/API tokens**: stored hashed at rest (fast SHA-256 lookup hash — sufficient for 256-bit random tokens); max 20 sessions/user (oldest pruned); `POST /api/auth/logout-all` revokes everything; password change (`/api/auth/change-password`, requires current password) revokes all sessions.
+- **Auth throttling**: 5 failed logins per email → 15min lockout (429 + retryAfter); registration limited 5/hour per `CF-Connecting-IP`; admin can close registration via `PUT /api/admin/settings {registrationOpen:false}`; first registration on a fresh install requires the `SETUP_TOKEN` env secret when set (fixes first-user-admin squatting).
+- **Accounts**: admin can disable/enable users (`PATCH /api/admin/users/:id`) — disables kill sessions and return uniform login errors (no disable oracle).
+- **CORS**: same-origin by default; cross-origin dashboard API access only for origins in the `CORS_ORIGINS` env (comma-separated). Only SDK ingestion endpoints (`/:projectId/envelope|store|security`) serve wildcard CORS — without credentials.
+- **Headers/CSP**: hardening headers on all worker responses + strict CSP and friends via `packages/dashboard/public/_headers` for asset-served pages (the assets layer bypasses the worker for non-`run_worker_first` paths).
+- **Ingestion**: 1MiB compressed / 5MiB decompressed caps (gzip bombs rejected), ≤20 envelope items, strict malformed-item handling; `sanitizeEvent` validates/replaces client-controlled `event_id`/`timestamp`/`level`, truncates fields, caps tag/frame/breadcrumb cardinality (applied inside ProjectState so RPC ingestion is covered); duplicate `event_id` is an idempotent no-op, not a 500.
+- **Redaction**: `authorization`/`cookie`/`set-cookie`/`x-api-key`/etc. request headers, cookies, env dicts and secret-ish query params are scrubbed before storage; per-project `scrubHeaders` via `PATCH /api/projects/:slug` (owner/admin); `GET /api/{projectId}/security` reflects the real config.
+- **Tenancy**: project security config (retentionDays, maxEventsPerHour, scrubHeaders, webhookUrl) and inbound filters require owner/admin; project deletion purges the ProjectState DO entirely (`storage.deleteAll`); `get-project` has no unscoped branch.
+- **Storage/DoS**: all list endpoints clamp `limit` (1..100; negative fell through to SQLite `LIMIT -1` = unlimited); sourcemap uploads capped 5MiB/200-per-project; merge lists capped at 100; stats bucket by server receipt time (client timestamps can no longer outlive retention); fingerprints use SHA-256, not 32-bit djb2.
+- **Webhooks**: https-only, no credentials-in-URL, private/loopback hosts rejected, redirects refused, 10s timeout, target response bodies never logged; webhook URLs hidden from plain members.
+- **Route hygiene**: `/api/projects/:slug/events/latest` registered before `/:eventId` (was shadowed); auth header parsing case-insensitive and trim-tolerant; attacker-controlled content is not logged.
+
+Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API allowlist). Set both as wrangler secrets/vars in production.
+
+Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
+
+Tests: 248 across 30 files (`just test`). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+
 ## Polytoken harness sessions
 
 Long-lived processes run as **shell services**, not background shell jobs (background jobs are reaped between turns). The local stack is a single foreground supervisor, so one service holds it:
