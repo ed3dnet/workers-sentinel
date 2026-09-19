@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { authMiddleware } from './middleware/auth';
 import { adminRoutes } from './routes/admin';
+import { attachmentRoutes } from './routes/attachments';
 import { authRoutes, tokenRoutes } from './routes/auth';
 import { eventRoutes } from './routes/events';
 import { filterRoutes } from './routes/filters';
@@ -92,6 +93,7 @@ app.route('/api/projects', projectRoutes);
 app.route('/api/projects', memberRoutes);
 app.route('/api/projects', issueRoutes);
 app.route('/api/projects', eventRoutes);
+app.route('/api/projects', attachmentRoutes);
 app.route('/api/projects', releaseRoutes);
 app.route('/api/projects', sourcemapRoutes);
 app.route('/api/projects', filterRoutes);
@@ -100,10 +102,24 @@ app.route('/api/projects', filterRoutes);
 app.use('/api/admin/*', authMiddleware);
 app.route('/api/admin', adminRoutes);
 
-// Serve dashboard for all non-API routes
+// Unknown /api/* GETs must not fall through to the SPA: API clients get a
+// JSON 404 instead of the dashboard's HTML (served with a 200). Auth runs
+// first on protected namespaces, so anonymous probes of unknown protected
+// paths still answer 401, not 404.
 app.get('*', (c) => {
+	if (c.req.path.startsWith('/api/')) {
+		return c.json({ error: 'not_found' }, 404);
+	}
 	// Assets binding handles static files
 	return c.env.ASSETS?.fetch(c.req.raw) ?? c.text('Dashboard not found', 404);
+});
+
+// Same contract for unmatched non-GET /api/* methods (e.g. POST /api/nope)
+app.notFound((c) => {
+	if (c.req.path.startsWith('/api/')) {
+		return c.json({ error: 'not_found' }, 404);
+	}
+	return c.text('Not Found', 404);
 });
 
 export default app;

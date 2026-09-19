@@ -6,9 +6,23 @@ import {
 	extractTitle,
 	generateFingerprint,
 } from '../lib/fingerprint';
-import type { Env, FilterType, InboundFilter, Issue, ProjectSettings, SentryEvent } from '../types';
+import type {
+	DroppedAttachment,
+	Env,
+	ExtractedAttachment,
+	FilterType,
+	InboundFilter,
+	Issue,
+	ProjectSettings,
+	SentryEvent,
+} from '../types';
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/** Per-project attachment payload budget across all stored rows. */
+export const MAX_PROJECT_ATTACHMENT_BYTES = 64 * 1024 * 1024;
+/** Per-project attachment row cap (zero-byte rows still count). */
+export const MAX_PROJECT_ATTACHMENT_ROWS = 10_000;
 
 /**
  * Clamp a client-supplied page limit. Negative or non-numeric values fall
@@ -113,6 +127,19 @@ CREATE TABLE IF NOT EXISTS event_tags (
 CREATE INDEX IF NOT EXISTS idx_event_tags_key_value ON event_tags(key, value);
 CREATE INDEX IF NOT EXISTS idx_event_tags_issue ON event_tags(issue_id);
 
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT,
+  size INTEGER NOT NULL DEFAULT 0,
+  data TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK (length(filename) <= 200),
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_event ON attachments(event_id);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -209,6 +236,20 @@ const MIGRATIONS = [
 );`,
 ];
 
+/** Terminal states of the transactional ingest sequence. */
+type IngestOutcome =
+	| { kind: 'duplicate' }
+	| { kind: 'filtered' }
+	| { kind: 'rate_limited' }
+	| {
+			kind: 'stored';
+			issueId: string;
+			isNewIssue: boolean;
+			title?: string;
+			level: string;
+			culprit: string | null;
+	  };
+
 export class ProjectState extends DurableObject<Env> {
 	private sql: SqlStorage;
 	private initialized = false;
@@ -251,6 +292,8 @@ export class ProjectState extends DurableObject<Env> {
 			switch (path) {
 				case '/ingest':
 					return this.handleIngest(request);
+				case '/ingest-with-attachments':
+					return this.handleIngestWithAttachments(request);
 				case '/issues':
 					return this.handleGetIssues(request);
 				case '/issue':
@@ -265,6 +308,10 @@ export class ProjectState extends DurableObject<Env> {
 					return this.handleGetIssueEvents(request);
 				case '/event':
 					return this.handleGetEvent(request);
+				case '/event/attachments':
+					return this.handleListEventAttachments(request);
+				case '/attachment':
+					return this.handleGetAttachment(request);
 				case '/events/latest':
 					return this.handleGetLatestEvents(request);
 				case '/stats':
@@ -353,6 +400,41 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	private async handleIngest(request: Request): Promise<Response> {
+		const event = (await request.json()) as SentryEvent;
+		return this.ingestEvent(event);
+	}
+
+	/**
+	 * Internal ingest boundary for the worker's envelope route: accepts the
+	 * already-validated event plus its extracted attachments. Same semantics
+	 * as `/ingest` (bare event) for callers that have no attachments.
+	 */
+	private async handleIngestWithAttachments(request: Request): Promise<Response> {
+		const { event, attachments } = (await request.json()) as {
+			event: SentryEvent;
+			attachments?: ExtractedAttachment[];
+		};
+		return this.ingestEvent(event, Array.isArray(attachments) ? attachments : []);
+	}
+
+	/**
+	 * Ingest one event (plus optional pre-validated attachments).
+	 *
+	 * All async preparation (sanitize, redact, user hash, attachment budgets)
+	 * happens before any mutation; the entire mutation sequence then runs
+	 * inside a single `transactionSync` boundary, so a mid-sequence failure
+	 * (e.g. a constraint violation) rolls back every SQL effect — event,
+	 * issue, tags, stats and the persisted rate-limit counter alike. The
+	 * in-memory rate-limit cache is refreshed from the persisted counter only
+	 * after the transaction commits: a rollback consumes no quota. Policy
+	 * drops (over-budget attachments, filtered events) are decided before the
+	 * transaction and reported, never thrown. Duplicate detection runs inside
+	 * the boundary, so a retry after a rollback succeeds cleanly.
+	 */
+	private async ingestEvent(
+		rawEvent: SentryEvent,
+		attachments: ExtractedAttachment[] = [],
+	): Promise<Response> {
 		// Check rate limit before processing
 		const rateCheck = this.checkRateLimit();
 		if (!rateCheck.allowed) {
@@ -368,17 +450,114 @@ export class ProjectState extends DurableObject<Env> {
 			);
 		}
 
-		const event = this.redactEvent(sanitizeEvent((await request.json()) as SentryEvent));
+		const event = this.redactEvent(sanitizeEvent(rawEvent));
 
 		const eventId = event.event_id || crypto.randomUUID();
 		const now = new Date().toISOString();
 		const timestamp = event.timestamp || now;
+		const userHash = await this.hashUserIdentifier(event.user);
+
+		// Attachment budgets are decided pre-transaction and reported, never thrown
+		const { storable, dropped } = this.applyAttachmentBudgets(attachments);
+		const hasAttachments = attachments.length > 0;
+
+		let outcome: IngestOutcome;
+		try {
+			outcome = this.ctx.storage.transactionSync(() =>
+				this.ingestEventTransaction(event, eventId, timestamp, now, userHash, storable),
+			);
+		} catch (error) {
+			// The whole transaction rolled back: no event, issue, tags, stats or
+			// persisted rate-limit effects survive, and the in-memory cache was
+			// never touched. Surface a clean 500 without echoing attacker input.
+			console.error(
+				'Ingest transaction failed:',
+				error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+			);
+			return new Response(
+				JSON.stringify({ error: 'internal_error', message: 'Event ingest failed' }),
+				{ status: 500, headers: { 'Content-Type': 'application/json' } },
+			);
+		}
+
+		// Refresh the in-memory rate-limit cache from the persisted counter
+		// only after the transaction commits.
+		if (outcome.kind === 'stored') {
+			this.refreshRateLimitCount();
+		}
+
+		if (outcome.kind === 'duplicate') {
+			return this.jsonResponse({ eventId, duplicate: true });
+		}
+
+		if (outcome.kind === 'rate_limited') {
+			return new Response(
+				JSON.stringify({ error: 'rate_limited', message: 'Project event quota exceeded' }),
+				{
+					status: 429,
+					headers: {
+						'Content-Type': 'application/json',
+						'Retry-After': String(this.retryAfterSeconds() || 3600),
+					},
+				},
+			);
+		}
+
+		if (outcome.kind === 'filtered') {
+			return this.jsonResponse({
+				filtered: true,
+				eventId,
+				...(hasAttachments
+					? {
+							droppedAttachments: attachments.map((a) => ({
+								filename: a.filename,
+								reason: 'event_filtered' as const,
+							})),
+						}
+					: {}),
+			});
+		}
+
+		return this.jsonResponse({
+			eventId,
+			issueId: outcome.issueId,
+			isNewIssue: outcome.isNewIssue,
+			title: outcome.title,
+			level: outcome.level,
+			culprit: outcome.culprit,
+			...(hasAttachments ? { droppedAttachments: dropped } : {}),
+		});
+	}
+
+	/** The synchronous mutation sequence of `ingestEvent`, run transactionally. */
+	private ingestEventTransaction(
+		event: SentryEvent,
+		eventId: string,
+		timestamp: string,
+		now: string,
+		userHash: string | null,
+		attachments: ExtractedAttachment[],
+	): IngestOutcome {
+		// Atomic quota admission: the pre-transaction check is advisory (it
+		// runs before async prep, where requests can interleave); this one
+		// reads the persisted counter inside the transaction and is exact.
+		const maxPerHour = Number.parseInt(this.getConfigValue('max_events_per_hour') || '0', 10);
+		const bucket = this.getHourBucket(now);
+		if (maxPerHour > 0) {
+			const countRow = this.sql
+				.exec('SELECT count FROM rate_limit_counters WHERE bucket = ?', bucket)
+				.toArray();
+			const currentCount = countRow.length > 0 ? (countRow[0].count as number) : 0;
+			if (currentCount >= maxPerHour) {
+				return { kind: 'rate_limited' };
+			}
+		}
 
 		// Duplicate event_id: acknowledge without double-counting (the client
 		// controls event_id, so replays must be idempotent)
 		const duplicate = this.sql.exec('SELECT 1 FROM events WHERE id = ?', eventId).toArray();
 		if (duplicate.length > 0) {
-			return this.jsonResponse({ eventId, duplicate: true });
+			return { kind: 'duplicate' };
 		}
 
 		// Generate fingerprint
@@ -395,7 +574,7 @@ export class ProjectState extends DurableObject<Env> {
 				'UPDATE inbound_filters SET dropped_count = dropped_count + 1 WHERE id = ?',
 				matchedFilterId,
 			);
-			return this.jsonResponse({ filtered: true, eventId });
+			return { kind: 'filtered' };
 		}
 		// Check if this fingerprint has been redirected (from a merged issue)
 		let effectiveFingerprint = fingerprint;
@@ -497,7 +676,6 @@ export class ProjectState extends DurableObject<Env> {
 		// Update hourly stats. Bucket by server receipt time: client timestamps
 		// are attacker-controlled and previously let future-dated rows outlive
 		// retention pruning (which runs on received_at).
-		const bucket = this.getHourBucket(now);
 		this.sql.exec(
 			`INSERT INTO issue_stats (issue_id, bucket, count)
        VALUES (?, ?, 1)
@@ -506,13 +684,15 @@ export class ProjectState extends DurableObject<Env> {
 			bucket,
 		);
 
-		// Update rate limit counter
-		this.rateLimitCount++;
-		const currentBucket = this.getHourBucket(new Date().toISOString());
+		// Update rate limit counter (persisted; the in-memory cache is
+		// refreshed from it only after the transaction commits). Old-hour
+		// buckets are cleaned up here too, so every persisted rate-limit
+		// mutation lives inside the transaction boundary.
 		this.sql.exec(
 			'INSERT INTO rate_limit_counters (bucket, count) VALUES (?, 1) ON CONFLICT(bucket) DO UPDATE SET count = count + 1',
-			currentBucket,
+			bucket,
 		);
+		this.sql.exec('DELETE FROM rate_limit_counters WHERE bucket < ?', bucket);
 		// Track environment
 		const environment = event.environment || null;
 		if (environment) {
@@ -594,46 +774,109 @@ export class ProjectState extends DurableObject<Env> {
 		}
 
 		// Track unique users
-		if (event.user) {
-			const userHash = await this.hashUserIdentifier(event.user);
-			if (userHash) {
-				const existingUserRows = this.sql
-					.exec(
-						'SELECT issue_id FROM issue_users WHERE issue_id = ? AND user_hash = ?',
-						issueId,
-						userHash,
-					)
-					.toArray();
+		if (event.user && userHash) {
+			const existingUserRows = this.sql
+				.exec(
+					'SELECT issue_id FROM issue_users WHERE issue_id = ? AND user_hash = ?',
+					issueId,
+					userHash,
+				)
+				.toArray();
 
-				if (existingUserRows.length > 0) {
-					this.sql.exec(
-						'UPDATE issue_users SET last_seen = ? WHERE issue_id = ? AND user_hash = ?',
-						now,
-						issueId,
-						userHash,
-					);
-				} else {
-					this.sql.exec(
-						'INSERT INTO issue_users (issue_id, user_hash, first_seen, last_seen) VALUES (?, ?, ?, ?)',
-						issueId,
-						userHash,
-						now,
-						now,
-					);
-					// Update user count
-					this.sql.exec('UPDATE issues SET user_count = user_count + 1 WHERE id = ?', issueId);
-				}
+			if (existingUserRows.length > 0) {
+				this.sql.exec(
+					'UPDATE issue_users SET last_seen = ? WHERE issue_id = ? AND user_hash = ?',
+					now,
+					issueId,
+					userHash,
+				);
+			} else {
+				this.sql.exec(
+					'INSERT INTO issue_users (issue_id, user_hash, first_seen, last_seen) VALUES (?, ?, ?, ?)',
+					issueId,
+					userHash,
+					now,
+					now,
+				);
+				// Update user count
+				this.sql.exec('UPDATE issues SET user_count = user_count + 1 WHERE id = ?', issueId);
 			}
 		}
 
-		return this.jsonResponse({
-			eventId,
+		// Store attachments. The deterministic id (eventId:index) plus the
+		// narrow ON CONFLICT scope make replays idempotent while CHECK and
+		// FK violations still throw and roll back the whole transaction.
+		for (let i = 0; i < attachments.length; i++) {
+			const attachment = attachments[i];
+			this.sql.exec(
+				`INSERT INTO attachments (id, event_id, filename, content_type, size, data, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(id) DO NOTHING`,
+				`${eventId}:${i}`,
+				eventId,
+				attachment.filename,
+				attachment.contentType,
+				attachment.size,
+				attachment.data,
+				now,
+			);
+		}
+
+		return {
+			kind: 'stored',
 			issueId,
 			isNewIssue: !existingIssue,
 			title: newIssueTitle,
 			level: event.level || 'error',
 			culprit: newIssueCulprit ?? null,
-		});
+		};
+	}
+
+	/**
+	 * Apply the per-project attachment budgets (payload bytes and row count)
+	 * to a batch of extracted attachments. Decided before the transaction and
+	 * reported as drops; existing data is never auto-deleted to make room.
+	 * Defaults (64 MiB / 10,000 rows) can be tuned per project via config
+	 * (`maxAttachmentBytes` / `maxAttachmentRows`).
+	 */
+	private applyAttachmentBudgets(attachments: ExtractedAttachment[]): {
+		storable: ExtractedAttachment[];
+		dropped: DroppedAttachment[];
+	} {
+		if (attachments.length === 0) {
+			return { storable: [], dropped: [] };
+		}
+		const bytesConfig = Number.parseInt(
+			this.getConfigValue('max_attachment_total_bytes') || '',
+			10,
+		);
+		const rowsConfig = Number.parseInt(this.getConfigValue('max_attachment_count') || '', 10);
+		const maxBytes =
+			Number.isInteger(bytesConfig) && bytesConfig > 0 ? bytesConfig : MAX_PROJECT_ATTACHMENT_BYTES;
+		const maxRows =
+			Number.isInteger(rowsConfig) && rowsConfig > 0 ? rowsConfig : MAX_PROJECT_ATTACHMENT_ROWS;
+
+		const usage = this.sql
+			.exec('SELECT COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS total FROM attachments')
+			.one();
+		let rows = (usage?.cnt as number) || 0;
+		let bytes = (usage?.total as number) || 0;
+		const storable: ExtractedAttachment[] = [];
+		const dropped: DroppedAttachment[] = [];
+		for (const attachment of attachments) {
+			if (rows + 1 > maxRows) {
+				dropped.push({ filename: attachment.filename, reason: 'project_attachment_count' });
+				continue;
+			}
+			if (bytes + attachment.size > maxBytes) {
+				dropped.push({ filename: attachment.filename, reason: 'project_attachment_quota' });
+				continue;
+			}
+			storable.push(attachment);
+			rows += 1;
+			bytes += attachment.size;
+		}
+		return { storable, dropped };
 	}
 
 	private static readonly ALLOWED_SORT_FIELDS = new Set([
@@ -919,6 +1162,79 @@ export class ProjectState extends DurableObject<Env> {
 		return this.jsonResponse({
 			event: JSON.parse(row.data as string),
 			issueId: row.issue_id,
+		});
+	}
+
+	/**
+	 * Attachment metadata for one event (no payload data). `issueId` is
+	 * derived from the event at read time rather than stored, so issue merges
+	 * cannot strand attachment links.
+	 */
+	private async handleListEventAttachments(request: Request): Promise<Response> {
+		const { eventId } = (await request.json()) as { eventId?: string };
+
+		if (!eventId) {
+			return this.jsonResponse({ error: 'missing_event_id' }, 400);
+		}
+
+		const eventRows = this.sql.exec('SELECT issue_id FROM events WHERE id = ?', eventId).toArray();
+		if (eventRows.length === 0) {
+			return this.jsonResponse({ error: 'event_not_found' }, 404);
+		}
+
+		const rows = this.sql
+			.exec(
+				`SELECT id, event_id, filename, content_type, size, created_at FROM attachments
+				 WHERE event_id = ? ORDER BY rowid`,
+				eventId,
+			)
+			.toArray();
+
+		return this.jsonResponse({
+			issueId: eventRows[0].issue_id,
+			attachments: rows.map((row) => ({
+				id: row.id as string,
+				eventId: row.event_id as string,
+				filename: row.filename as string,
+				contentType: (row.content_type as string) ?? 'text/plain',
+				size: row.size as number,
+				createdAt: row.created_at as string,
+			})),
+		});
+	}
+
+	/** One attachment with payload data, for the authenticated download route. */
+	private async handleGetAttachment(request: Request): Promise<Response> {
+		const { attachmentId } = (await request.json()) as { attachmentId?: string };
+
+		if (!attachmentId) {
+			return this.jsonResponse({ error: 'missing_attachment_id' }, 400);
+		}
+
+		// `.one()` throws on zero rows; a missing attachment is a 404, not a 500
+		const rows = this.sql
+			.exec(
+				`SELECT id, event_id, filename, content_type, size, data, created_at
+				 FROM attachments WHERE id = ?`,
+				attachmentId,
+			)
+			.toArray();
+
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'attachment_not_found' }, 404);
+		}
+
+		const row = rows[0];
+		return this.jsonResponse({
+			attachment: {
+				id: row.id as string,
+				eventId: row.event_id as string,
+				filename: row.filename as string,
+				contentType: (row.content_type as string) ?? 'text/plain',
+				size: row.size as number,
+				data: row.data as string,
+				createdAt: row.created_at as string,
+			},
 		});
 	}
 
@@ -1681,6 +1997,20 @@ export class ProjectState extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * Recompute the in-memory rate-limit cache from the persisted counter.
+	 * Called only after the ingest transaction commits, so a rollback leaves
+	 * both the persisted counter and the cache untouched.
+	 */
+	private refreshRateLimitCount(): void {
+		const bucket = this.getHourBucket(new Date().toISOString());
+		const row = this.sql
+			.exec('SELECT count FROM rate_limit_counters WHERE bucket = ?', bucket)
+			.toArray();
+		this.rateLimitBucket = bucket;
+		this.rateLimitCount = row.length > 0 ? (row[0].count as number) : 0;
+	}
+
 	private checkRateLimit(): { allowed: boolean; retryAfter?: number } {
 		const maxPerHour = this.getConfigValue('max_events_per_hour');
 		if (!maxPerHour || maxPerHour === '0') {
@@ -1689,24 +2019,36 @@ export class ProjectState extends DurableObject<Env> {
 		const limit = Number.parseInt(maxPerHour, 10);
 		if (limit <= 0) return { allowed: true };
 
-		const currentBucket = this.getHourBucket(new Date().toISOString());
-		if (currentBucket !== this.rateLimitBucket) {
-			// New hour — reset counter and clean old buckets
-			this.rateLimitBucket = currentBucket;
-			this.rateLimitCount = 0;
-			this.sql.exec('DELETE FROM rate_limit_counters WHERE bucket < ?', currentBucket);
-		}
-
-		if (this.rateLimitCount >= limit) {
-			// Calculate seconds until next hour
-			const now = new Date();
-			const nextHour = new Date(now);
-			nextHour.setMinutes(0, 0, 0);
-			nextHour.setHours(nextHour.getHours() + 1);
-			const retryAfter = Math.ceil((nextHour.getTime() - now.getTime()) / 1000);
-			return { allowed: false, retryAfter };
+		if (this.currentRateCount() >= limit) {
+			return { allowed: false, retryAfter: this.retryAfterSeconds() };
 		}
 		return { allowed: true };
+	}
+
+	/**
+	 * Current-hour event count. Read-only: the in-memory cache is consulted
+	 * only when it belongs to the current hour; on rollover (or before the
+	 * first refresh) the persisted counter is read instead. Mutating the
+	 * cache or deleting old buckets happens inside the ingest transaction.
+	 */
+	private currentRateCount(): number {
+		const bucket = this.getHourBucket(new Date().toISOString());
+		if (bucket === this.rateLimitBucket) {
+			return this.rateLimitCount;
+		}
+		const row = this.sql
+			.exec('SELECT count FROM rate_limit_counters WHERE bucket = ?', bucket)
+			.toArray();
+		return row.length > 0 ? (row[0].count as number) : 0;
+	}
+
+	/** Seconds until the top of the current hour (rate-limit retry hint). */
+	private retryAfterSeconds(): number {
+		const now = new Date();
+		const nextHour = new Date(now);
+		nextHour.setMinutes(0, 0, 0);
+		nextHour.setHours(nextHour.getHours() + 1);
+		return Math.ceil((nextHour.getTime() - now.getTime()) / 1000);
 	}
 
 	private getConfigValue(key: string): string | null {
@@ -1725,13 +2067,27 @@ export class ProjectState extends DurableObject<Env> {
 
 	private handleGetConfig(): Response {
 		const maxEventsPerHour = this.getConfigValue('max_events_per_hour') || '0';
+		const maxAttachmentBytes =
+			Number.parseInt(this.getConfigValue('max_attachment_total_bytes') || '', 10) ||
+			MAX_PROJECT_ATTACHMENT_BYTES;
+		const maxAttachmentRows =
+			Number.parseInt(this.getConfigValue('max_attachment_count') || '', 10) ||
+			MAX_PROJECT_ATTACHMENT_ROWS;
 		return this.jsonResponse({
-			config: { maxEventsPerHour: Number.parseInt(maxEventsPerHour, 10) },
+			config: {
+				maxEventsPerHour: Number.parseInt(maxEventsPerHour, 10),
+				maxAttachmentBytes,
+				maxAttachmentRows,
+			},
 		});
 	}
 
 	private async handleUpdateConfig(request: Request): Promise<Response> {
-		const { maxEventsPerHour } = (await request.json()) as { maxEventsPerHour?: number };
+		const { maxEventsPerHour, maxAttachmentBytes, maxAttachmentRows } = (await request.json()) as {
+			maxEventsPerHour?: number;
+			maxAttachmentBytes?: number;
+			maxAttachmentRows?: number;
+		};
 		if (maxEventsPerHour !== undefined) {
 			if (typeof maxEventsPerHour !== 'number' || maxEventsPerHour < 0) {
 				return this.jsonResponse(
@@ -1741,16 +2097,42 @@ export class ProjectState extends DurableObject<Env> {
 			}
 			this.setConfigValue('max_events_per_hour', String(Math.floor(maxEventsPerHour)));
 		}
+		if (maxAttachmentBytes !== undefined) {
+			if (
+				typeof maxAttachmentBytes !== 'number' ||
+				!Number.isInteger(maxAttachmentBytes) ||
+				maxAttachmentBytes <= 0
+			) {
+				return this.jsonResponse(
+					{
+						error: 'invalid_value',
+						message: 'maxAttachmentBytes must be a positive integer',
+					},
+					400,
+				);
+			}
+			this.setConfigValue('max_attachment_total_bytes', String(maxAttachmentBytes));
+		}
+		if (maxAttachmentRows !== undefined) {
+			if (
+				typeof maxAttachmentRows !== 'number' ||
+				!Number.isInteger(maxAttachmentRows) ||
+				maxAttachmentRows <= 0
+			) {
+				return this.jsonResponse(
+					{ error: 'invalid_value', message: 'maxAttachmentRows must be a positive integer' },
+					400,
+				);
+			}
+			this.setConfigValue('max_attachment_count', String(maxAttachmentRows));
+		}
 		return this.handleGetConfig();
 	}
 
 	private handleRateLimitStatus(): Response {
 		const maxPerHour = Number.parseInt(this.getConfigValue('max_events_per_hour') || '0', 10);
 		const currentBucket = this.getHourBucket(new Date().toISOString());
-		let currentCount = this.rateLimitCount;
-		if (currentBucket !== this.rateLimitBucket) {
-			currentCount = 0;
-		}
+		const currentCount = this.currentRateCount();
 		return this.jsonResponse({
 			maxEventsPerHour: maxPerHour,
 			currentHourCount: currentCount,

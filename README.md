@@ -6,7 +6,7 @@
 </div>
 
 <p align="center">
-    <em>A self-hosted, Sentry-compatible error tracking system running entirely on Cloudflare Workers</em>
+    <em>A self-hosted error tracking system with Sentry SDK ingestion compatibility, running entirely on Cloudflare Workers</em>
 </p>
 
 <p align="center">
@@ -167,7 +167,9 @@ The supervisor (in `_devenv/cloudflare/`) is loopback-only, persists Durable Obj
 
 ## SDK Configuration
 
-Workers Sentinel is compatible with official Sentry SDKs. Simply use your Sentinel DSN instead of a Sentry DSN.
+Workers Sentinel accepts events from official Sentry SDKs — it speaks the Sentry **ingestion** protocol (envelope and legacy store endpoints, DSN auth). Simply use your Sentinel DSN instead of a Sentry DSN.
+
+The management/fetch API (`/api/projects/…`) is a native JSON API, **not** a Sentry-compatible one: `sentry-cli` is not supported, and compatibility with Sentry's `/api/0/` REST surface is an explicit non-goal. See AGENTS.md ("Native API reference (fetch-side)") for the real contract — pagination, attachment endpoints and drop reasons, event-id normalization, and auth scopes.
 
 ### Cloudflare Workers (Service Binding with RPC)
 

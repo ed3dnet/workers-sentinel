@@ -225,11 +225,44 @@ export interface EnvelopeHeader {
 export interface EnvelopeItem {
 	type: 'event' | 'session' | 'attachment' | 'transaction' | 'client_report';
 	payload: unknown;
+	/** Declared payload length in bytes when the item header carried one. */
+	length?: number;
+	/** Item header `content_type` (meaningful for attachments). */
+	content_type?: string;
+	/** Item header `filename` (meaningful for attachments). */
+	filename?: string;
 }
 
 export interface ParsedEnvelope {
 	header: EnvelopeHeader;
 	items: EnvelopeItem[];
+}
+
+/**
+ * A text attachment extracted from an envelope, validated and bounded, ready
+ * to persist alongside its event. `size` is the byte length of the original
+ * framed payload slice (UTF-8 bytes, not UTF-16 code units).
+ */
+export interface ExtractedAttachment {
+	filename: string;
+	contentType: string;
+	data: string;
+	size: number;
+}
+
+/** Why an attachment was not stored. Reported, never fatal to the event. */
+export type AttachmentDropReason =
+	| 'too_large'
+	| 'too_many'
+	| 'binary_unsupported'
+	| 'no_unique_event'
+	| 'event_filtered'
+	| 'project_attachment_quota'
+	| 'project_attachment_count';
+
+export interface DroppedAttachment {
+	filename: string;
+	reason: AttachmentDropReason;
 }
 
 // API types

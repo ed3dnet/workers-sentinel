@@ -151,13 +151,17 @@ projectRoutes.patch('/:slug', async (c) => {
 		maxEventsPerHour?: number;
 		retentionDays?: number;
 		scrubHeaders?: string[];
+		maxAttachmentBytes?: number;
+		maxAttachmentRows?: number;
 	}>();
 
 	if (
 		body.webhookUrl === undefined &&
 		body.maxEventsPerHour === undefined &&
 		body.retentionDays === undefined &&
-		body.scrubHeaders === undefined
+		body.scrubHeaders === undefined &&
+		body.maxAttachmentBytes === undefined &&
+		body.maxAttachmentRows === undefined
 	) {
 		return c.json({ error: 'no_updates', message: 'No fields to update were provided' }, 400);
 	}
@@ -184,12 +188,15 @@ projectRoutes.patch('/:slug', async (c) => {
 		memberRole?: string;
 	};
 
-	// Security-relevant project config (rate limits, retention, scrubbing)
-	// requires owner/admin, mirroring the webhookUrl gate in AuthState.
+	// Security-relevant project config (rate limits, retention, scrubbing,
+	// attachment budgets) requires owner/admin, mirroring the webhookUrl gate
+	// in AuthState.
 	if (
 		body.maxEventsPerHour !== undefined ||
 		body.retentionDays !== undefined ||
-		body.scrubHeaders !== undefined
+		body.scrubHeaders !== undefined ||
+		body.maxAttachmentBytes !== undefined ||
+		body.maxAttachmentRows !== undefined
 	) {
 		if (projectData.memberRole !== 'owner' && projectData.memberRole !== 'admin') {
 			return c.json(
@@ -236,6 +243,30 @@ projectRoutes.patch('/:slug', async (c) => {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ maxEventsPerHour: body.maxEventsPerHour }),
+			}),
+		);
+
+		const data = (await configResponse.json()) as Record<string, unknown>;
+		if (!configResponse.ok) {
+			return c.json(data, configResponse.status as ContentfulStatusCode);
+		}
+
+		Object.assign(result, data);
+	}
+
+	// Update attachment budget config in ProjectState if provided
+	if (body.maxAttachmentBytes !== undefined || body.maxAttachmentRows !== undefined) {
+		const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
+		const projectState = c.env.PROJECT_STATE.get(projectStateId);
+
+		const configResponse = await projectState.fetch(
+			new Request('http://internal/config/update', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					maxAttachmentBytes: body.maxAttachmentBytes,
+					maxAttachmentRows: body.maxAttachmentRows,
+				}),
 			}),
 		);
 

@@ -274,3 +274,242 @@ test('webhook URL validation rejects non-https targets', async () => {
 	assert.equal(rejected.status, 400);
 	assert.equal(rejected.data.error, 'invalid_url');
 });
+
+// Byte-exact envelope framing helper: length-delimited attachments must not
+// be JSON-serialized (that would quote and escape them into garbage).
+const enc = new TextEncoder();
+
+function frame(parts) {
+	const encoded = parts.map((p) => (typeof p === 'string' ? enc.encode(p) : p));
+	const total = encoded.reduce((n, e) => n + e.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const part of encoded) {
+		out.set(part, offset);
+		offset += part.byteLength;
+	}
+	return out;
+}
+
+function envelopeHeaderLine(project, eventId) {
+	return JSON.stringify({
+		event_id: eventId,
+		dsn: `https://${project.publicKey}@localhost/${project.id}`,
+	});
+}
+
+function eventItemLine(eventId, payload = {}) {
+	return [
+		JSON.stringify({ type: 'event' }),
+		'\n',
+		JSON.stringify({
+			event_id: eventId,
+			timestamp: new Date().toISOString(),
+			platform: 'node',
+			level: 'error',
+			...payload,
+		}),
+		'\n',
+	];
+}
+
+async function postEnvelopeBytes(project, bytes) {
+	const response = await fetch(`${BASE}/api/${project.id}/envelope/`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/x-sentry-envelope',
+			'X-Sentry-Auth': `Sentry sentry_version=7, sentry_key=${project.publicKey}`,
+		},
+		body: bytes,
+		signal: AbortSignal.timeout(30_000),
+	});
+	const text = await response.text();
+	let data = null;
+	try {
+		data = text ? JSON.parse(text) : null;
+	} catch {
+		data = text;
+	}
+	return { status: response.status, data };
+}
+
+test('attachments round-trip byte-identically through the real stack', async () => {
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+	});
+	const token = login.data.token;
+	const project = (
+		await api('/api/projects', {
+			method: 'POST',
+			token,
+			body: { name: `Attach ${runId}`, platform: 'node' },
+		})
+	).data.project;
+
+	// Framing variant A: final trailing newline after the attachment payload
+	const eventIdA = crypto.randomUUID().replaceAll('-', '');
+	const payloadA = 'first\nline\twith tabs — ünïcode 🛡️\nand a final newline\n';
+	const bytesA = enc.encode(payloadA);
+	const withNewline = frame([
+		envelopeHeaderLine(project, eventIdA),
+		'\n',
+		...eventItemLine(eventIdA, { message: 'integration attachment newline' }),
+		JSON.stringify({
+			type: 'attachment',
+			filename: 'with-newline.log',
+			content_type: 'text/plain',
+			length: bytesA.byteLength,
+		}),
+		'\n',
+		bytesA,
+		'\n',
+	]);
+	const resultA = await postEnvelopeBytes(project, withNewline);
+	assert.equal(resultA.status, 200);
+	assert.equal(resultA.data.id, eventIdA);
+	assert.deepEqual(resultA.data.droppedAttachments, []);
+
+	// Framing variant B: the length-delimited payload ends exactly at EOF
+	const eventIdB = crypto.randomUUID().replaceAll('-', '');
+	const payloadB = 'ends at eof without trailing newline';
+	const bytesB = enc.encode(payloadB);
+	const withoutNewline = frame([
+		envelopeHeaderLine(project, eventIdB),
+		'\n',
+		...eventItemLine(eventIdB, { message: 'integration attachment eof' }),
+		JSON.stringify({
+			type: 'attachment',
+			filename: 'eof.log',
+			content_type: 'text/plain',
+			length: bytesB.byteLength,
+		}),
+		'\n',
+		bytesB,
+	]);
+	const resultB = await postEnvelopeBytes(project, withoutNewline);
+	assert.equal(resultB.status, 200);
+	assert.deepEqual(resultB.data.droppedAttachments, []);
+
+	for (const [eventId, filename, payload] of [
+		[eventIdA, 'with-newline.log', payloadA],
+		[eventIdB, 'eof.log', payloadB],
+	]) {
+		const list = await api(`/api/projects/${project.slug}/events/${eventId}/attachments`, {
+			token,
+		});
+		assert.equal(list.status, 200);
+		assert.equal(list.data.attachments.length, 1);
+		assert.equal(list.data.attachments[0].filename, filename);
+
+		const download = await fetch(
+			`${BASE}/api/projects/${project.slug}/attachments/${list.data.attachments[0].id}`,
+			{ headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000) },
+		);
+		assert.equal(download.status, 200);
+		assert.equal(download.headers.get('Content-Type'), 'text/plain');
+		const disposition = download.headers.get('Content-Disposition') ?? '';
+		assert.ok(disposition.includes('attachment'), `unexpected disposition: ${disposition}`);
+		assert.ok(disposition.includes(filename), `filename missing: ${disposition}`);
+		const received = new Uint8Array(await download.arrayBuffer());
+		assert.deepEqual(received, enc.encode(payload));
+	}
+});
+
+test('dashed UUID event ids round-trip normalized with idempotent resends', async () => {
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+	});
+	const token = login.data.token;
+	const project = (
+		await api('/api/projects', {
+			method: 'POST',
+			token,
+			body: { name: `UUID ${runId}`, platform: 'node' },
+		})
+	).data.project;
+
+	const dashed = crypto.randomUUID();
+	const normalized = dashed.replaceAll('-', '');
+	const envelopeText = [
+		JSON.stringify({
+			event_id: dashed,
+			dsn: `https://${project.publicKey}@localhost/${project.id}`,
+		}),
+		'\n',
+		...eventItemLine(dashed, { message: 'integration uuid round-trip' }),
+	].join('');
+
+	const send = async () => postEnvelopeBytes(project, enc.encode(envelopeText));
+
+	const first = await send();
+	assert.equal(first.status, 200);
+	assert.equal(first.data.id, normalized);
+	assert.equal(first.data.duplicate, undefined);
+
+	const resend = await send();
+	assert.equal(resend.status, 200);
+	assert.equal(resend.data.id, normalized);
+	assert.equal(resend.data.duplicate, true);
+
+	const stored = await api(`/api/projects/${project.slug}/events/${normalized}`, { token });
+	assert.equal(stored.status, 200);
+	assert.equal(stored.data.event.event_id, normalized);
+});
+
+test('binary attachments drop non-fatally with a reported reason', async () => {
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+	});
+	const token = login.data.token;
+	const project = (
+		await api('/api/projects', {
+			method: 'POST',
+			token,
+			body: { name: `BinDrop ${runId}`, platform: 'node' },
+		})
+	).data.project;
+
+	const eventId = crypto.randomUUID().replaceAll('-', '');
+	const binary = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe]);
+	const result = await postEnvelopeBytes(
+		project,
+		frame([
+			envelopeHeaderLine(project, eventId),
+			'\n',
+			...eventItemLine(eventId, { message: 'integration binary drop' }),
+			JSON.stringify({
+				type: 'attachment',
+				filename: 'screenshot.png',
+				content_type: 'image/png',
+				length: binary.byteLength,
+			}),
+			'\n',
+			binary,
+			'\n',
+			JSON.stringify({
+				type: 'attachment',
+				filename: 'context.txt',
+				content_type: 'text/plain',
+				length: 7,
+			}),
+			'\n',
+			enc.encode('context'),
+		]),
+	);
+	assert.equal(result.status, 200);
+	assert.equal(result.data.id, eventId);
+	assert.deepEqual(result.data.droppedAttachments, [
+		{ filename: 'screenshot.png', reason: 'binary_unsupported' },
+	]);
+
+	// The event stored; only the text attachment is retrievable
+	const list = await api(`/api/projects/${project.slug}/events/${eventId}/attachments`, {
+		token,
+	});
+	assert.equal(list.status, 200);
+	assert.equal(list.data.attachments.length, 1);
+	assert.equal(list.data.attachments[0].filename, 'context.txt');
+});

@@ -1,6 +1,7 @@
 import { type Context, Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
+	extractAttachments,
 	extractEvents,
 	extractKeyFromAuthHeader,
 	MAX_COMPRESSED_BODY_BYTES,
@@ -8,9 +9,24 @@ import {
 	parseEnvelope,
 } from '../lib/envelope-parser';
 import { buildWebhookPayload, sendWebhook } from '../lib/webhook';
-import type { Env, Project } from '../types';
+import type { DroppedAttachment, Env, ExtractedAttachment, Project, SentryEvent } from '../types';
 
 export const ingestionRoutes = new Hono<{ Bindings: Env }>();
+
+const strictJsonDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/**
+ * True when the body looks like a bare JSON event (legacy store endpoint)
+ * rather than an envelope: an envelope always contains a newline followed by
+ * an item header object, a bare JSON event does not. Byte-level check — the
+ * body is never decoded as one text blob.
+ */
+function looksLikeRawJson(bytes: Uint8Array): boolean {
+	for (let i = 1; i < bytes.length; i++) {
+		if (bytes[i - 1] === 0x0a && bytes[i] === 0x7b) return false;
+	}
+	return true;
+}
 
 // Sentry browser SDKs POST cross-origin without credentials: these endpoints
 // get permissive CORS (wildcard origin, NO credentials). This is the only part
@@ -108,24 +124,26 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 		return c.json({ error: 'payload_too_large', message: 'Envelope exceeds size limit' }, 413);
 	}
 
-	let bodyText: string;
+	let bodyBytes: Uint8Array;
 	try {
-		bodyText = await maybeDecompress(bodyBuffer, contentEncoding);
+		bodyBytes = await maybeDecompress(bodyBuffer, contentEncoding);
 	} catch {
 		return c.json({ error: 'decompression_failed', message: 'Failed to decompress body' }, 400);
 	}
 
 	// Parse envelope or raw event
-	let events;
+	let events: SentryEvent[];
+	let attachmentResult: { attachments: ExtractedAttachment[]; dropped: DroppedAttachment[] };
 	try {
-		if (contentType.includes('application/json') && !bodyText.includes('\n{')) {
+		if (contentType.includes('application/json') && looksLikeRawJson(bodyBytes)) {
 			// Raw JSON event (legacy store endpoint)
-			const event = JSON.parse(bodyText);
-			events = [event];
+			events = [JSON.parse(strictJsonDecoder.decode(bodyBytes)) as SentryEvent];
+			attachmentResult = { attachments: [], dropped: [] };
 		} else {
 			// Envelope format
-			const envelope = parseEnvelope(bodyText);
+			const envelope = parseEnvelope(bodyBytes);
 			events = extractEvents(envelope);
+			attachmentResult = extractAttachments(envelope, events);
 		}
 	} catch {
 		// Do not log attacker-controlled body content
@@ -133,23 +151,37 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 	}
 
 	if (events.length === 0) {
-		return c.json({ id: null, message: 'No events in envelope' });
+		return c.json({
+			id: null,
+			message: 'No events in envelope',
+			droppedAttachments: attachmentResult.dropped,
+		});
 	}
 
 	// Get the ProjectState Durable Object for this project
 	const projectStateId = c.env.PROJECT_STATE.idFromName(project.id);
 	const projectState = c.env.PROJECT_STATE.get(projectStateId);
 
+	// Attachments associate with a single event; extractAttachments already
+	// reported `no_unique_event` drops for the multi-event case.
+	const singleEvent = events.length === 1 ? events[0] : null;
+	const dropped: DroppedAttachment[] = [...attachmentResult.dropped];
+
 	// Ingest each event
 	const results = [];
 	for (const event of events) {
 		try {
 			const response = await projectState.fetch(
-				new Request('http://internal/ingest', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify(event),
-				}),
+				new Request(
+					singleEvent ? 'http://internal/ingest-with-attachments' : 'http://internal/ingest',
+					{
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: singleEvent
+							? JSON.stringify({ event: singleEvent, attachments: attachmentResult.attachments })
+							: JSON.stringify(event),
+					},
+				),
 			);
 
 			if (response.status === 429) {
@@ -163,6 +195,10 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 			if (response.ok) {
 				const result = await response.json();
 				results.push(result);
+				const r = result as { droppedAttachments?: DroppedAttachment[] };
+				if (Array.isArray(r.droppedAttachments)) {
+					dropped.push(...r.droppedAttachments);
+				}
 			} else {
 				// Log status only: response bodies may echo attacker content
 				console.error(`Ingest error: status ${response.status}`);
@@ -206,6 +242,7 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 	return c.json({
 		id: firstResult?.eventId || events[0]?.event_id || null,
 		...(firstResult?.duplicate ? { duplicate: true } : {}),
+		droppedAttachments: dropped,
 	});
 }
 

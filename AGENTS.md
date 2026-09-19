@@ -72,9 +72,10 @@ Dashboard  → /api/auth/* (public) → AuthState
 
 ### Key Modules
 
-- `lib/envelope-parser.ts` - Parses Sentry envelope format (newline-delimited JSON)
+- `lib/envelope-parser.ts` - Parses the Sentry envelope format (byte-level framing with per-slice strict decoding; extracts text attachments)
 - `lib/fingerprint.ts` - Groups events into issues using exception type + message + stack frames
-- `routes/ingestion.ts` - SDK endpoint, supports `?sentry_key=` and `X-Sentry-Auth` header
+- `routes/ingestion.ts` - SDK endpoint, supports `?sentry_key=` and `X-Sentry-Auth` header; forwards event + attachments atomically to ProjectState
+- `routes/attachments.ts` - Fetch-side attachment list + download endpoints (session/API-token auth)
 
 ### DSN Format
 
@@ -87,6 +88,69 @@ The publicKey is validated against AuthState's projects table. ProjectState is a
 ### Service Bindings
 
 Cloudflare Workers can send events via service binding instead of HTTP for lower latency. The ingestion endpoint works identically - service bindings only change transport, not authentication. See README for custom transport setup.
+
+## Native API reference (fetch-side)
+
+The contract for API consumers (dashboard, CLI tooling, agent skills). The management/fetch API is **native JSON**, not Sentry-compatible — only ingestion speaks the Sentry protocol.
+
+### Authentication
+
+| Credential | Where it works | Notes |
+|---|---|---|
+| Session token (`Authorization: Bearer <token>`) | `/api/projects/*`, `/api/auth/*`, `/api/admin/*` | From `POST /api/auth/login`; what the dashboard uses |
+| API token (`Authorization: Bearer wst_…`) | Same protected surface as sessions | Mint via `POST /api/auth/tokens` (session auth required); stored hashed; revocable |
+| DSN public key (`?sentry_key=`, `X-Sentry-Auth`, or basic auth) | **Ingestion only** (`POST /api/{projectId}/envelope|store`) | Cannot read anything; never valid on `/api/projects/*` |
+
+401 vs 404 precedence: auth middleware runs before route matching on protected namespaces, so an **anonymous** request to an unknown `/api/projects/…` path gets `401`, and an **authenticated** one gets a JSON `404`. Unknown `/api/*` paths (any method) return `404 {"error":"not_found"}` JSON — never the SPA HTML. One exception: `OPTIONS /api/*` is answered by the CORS preflight handler with a bare `204` before auth or 404 logic runs.
+
+### Pagination
+
+List endpoints that paginate use keyset pagination:
+
+- `?limit=` — page size, clamped to 1..100. Values below 1 (or non-numeric) fall back to the endpoint default rather than clamping to 1. Default 25 (issue activity: 50).
+- `?cursor=` — pass the previous page's `nextCursor` verbatim.
+- Response shape: `{ <rows>, nextCursor?, hasMore }`. `nextCursor` is the sort key of the last row on the page and is **omitted** when there are no more rows (do not treat an absent cursor as "repeat the last page"). The cursor is per endpoint and follows that endpoint's sort: issues pages by the active `sort` field (`last_seen` by default), issue events by `timestamp` DESC, issue activity by a composite `createdAt|id` key — a cursor from one sort order is not valid for another.
+
+### Endpoints (read side)
+
+- `GET /api/health` — public liveness probe.
+- `GET /api/projects` — projects the caller can access.
+- `GET /api/projects/:slug/issues` — filters: `status`, `level`, `environment`, `query`, `tags=k:v` (≤5), `sort`; paginated.
+- `GET /api/projects/:slug/issues/:issueId` — issue detail + recent stats.
+- `GET /api/projects/:slug/issues/:issueId/events` — paginated (timestamp DESC).
+- `GET /api/projects/:slug/events/latest?limit=` — most recent events across the project.
+- `GET /api/projects/:slug/events/:eventId` — full stored event JSON.
+- `GET /api/projects/:slug/events/:eventId/attachments` — attachment metadata for one event (no payload): `{ issueId, attachments: [{ id, eventId, filename, contentType, size, createdAt }] }`.
+- `GET /api/projects/:slug/attachments/:attachmentId` — download: raw attachment text with the stored `Content-Type` and a sanitized `Content-Disposition: attachment` header (ASCII-safe quoted `filename` plus RFC 5987 `filename*` for non-ASCII names).
+- Also available: `/:slug/summary`, `/:slug/stats`, `/:slug/tags`, `/:slug/tags/:key/values`, `/:slug/environments`, `/:slug/releases[/:version]`, `/:slug/issues/:issueId/comments|activity`, `/:slug/members`, `/:slug/settings`, `/:slug/rate-limit`, `/:slug/filters`, `/:slug/sourcemaps`.
+
+### Attachments (ingested)
+
+Envelopes may carry `attachment` items (text only — see limitations). Per envelope: ≤10 attachments, each ≤100 KiB UTF-8 bytes, filename ≤200 chars, content type ≤100 chars. Ingestion responses include `droppedAttachments: [{ filename, reason }]` reporting anything not stored; an empty array means everything landed. Full drop-reason vocabulary:
+
+| Reason | Meaning |
+|---|---|
+| `too_large` | attachment payload >100 KiB |
+| `too_many` | >10 attachments in one envelope |
+| `binary_unsupported` | payload is not valid UTF-8 text |
+| `no_unique_event` | envelope had zero or multiple events — no unambiguous owner |
+| `event_filtered` | the associated event was dropped by an inbound filter |
+| `project_attachment_quota` | per-project attachment bytes (64 MiB) would be exceeded |
+| `project_attachment_count` | per-project attachment row cap (10,000) would be exceeded |
+
+Budgets bound attachment **rows/payload**, not physical database size — an over-budget project still accepts events, dropping only the new attachments, and never auto-deletes existing data; deleting events/issues reclaims both budgets. Defaults (64 MiB bytes / 10,000 rows) are per-project tunable by owners/admins via `PATCH /api/projects/:slug` with `maxAttachmentBytes` / `maxAttachmentRows`.
+
+Attachment lifecycle follows its event via cascade: retention pruning, issue deletion (single/bulk), merges (attachments stay downloadable under the surviving issue), and project purge all remove them with no orphan path.
+
+**Limitation:** binary attachments are out of scope — stored data is UTF-8 text. A binary item in a mixed envelope drops with `binary_unsupported` while the event still stores.
+
+### Event IDs
+
+Client `event_id`s round-trip: 32-hex values are lowercased, dashed 36-char UUIDs (any hex case) are normalized to 32-hex (dashes stripped, lowercased). Anything else is replaced by a server-minted id. Duplicate detection keys on the normalized id, so resending the same event (dashed or stripped) is an idempotent no-op (`duplicate: true`, no attachment duplication).
+
+### Permalinks
+
+Dashboard permalinks are `/projects/{projectSlug}/issues/{issueId}` (e.g. `https://host/projects/my-project/issues/12345678-…`). The API path space for the same resource is `/api/projects/:slug/issues/:issueId`.
 
 ## Git hooks (lefthook)
 
