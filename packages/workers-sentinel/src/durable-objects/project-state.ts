@@ -151,7 +151,6 @@ CREATE TABLE IF NOT EXISTS attachments (
   FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_event ON attachments(event_id);
-CREATE INDEX IF NOT EXISTS idx_attachments_r2_key ON attachments(r2_key);
 
 CREATE TABLE IF NOT EXISTS attachment_usage (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -300,7 +299,11 @@ export class ProjectState extends DurableObject<Env> {
 				// Migration already applied — safe to ignore
 			}
 		}
+		// Indexes on migration-added columns are created AFTER the migrations:
+		// on a pre-upgrade DO the column does not exist until the ALTER runs,
+		// and a CREATE INDEX inside SCHEMA would throw (SCHEMA runs first).
 		this.sql.exec('CREATE INDEX IF NOT EXISTS idx_issues_snoozed_until ON issues(snoozed_until)');
+		this.sql.exec('CREATE INDEX IF NOT EXISTS idx_attachments_r2_key ON attachments(r2_key)');
 		this.warmRateLimitCounter();
 		this.initialized = true;
 
