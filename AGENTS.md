@@ -218,6 +218,23 @@ just test               # worker test suite (vitest-pool-workers; no supervisor 
 - `dev-down` never signals recorded PIDs. If `dev-up` refuses due to a stale inventory/lock (e.g. after a crash), reconcile manually: confirm nothing listens on the port, then delete `inventory.json` and `lock/` yourself — never `kill` a recorded PID.
 - Demo credentials: `demo@sentinel.local` / `sentinel-demo-password` (project `CLI Feedback`).
 
+## Wrangler R2 CLI trap: `r2 object` defaults to LOCAL storage
+
+`wrangler r2 object put/get/delete` operate on the **local miniflare store** (`.wrangler/state/v3/r2/…`) when run from a directory whose wrangler config declares an `r2_buckets` binding — `packages/workers-sentinel/` does (`ATTACHMENTS`). To touch the production `sentinel-attachments` bucket you must pass **`--remote`**:
+
+```bash
+# Production bucket (what the worker's binding actually reads/writes):
+npx wrangler r2 object get sentinel-attachments/p/<projectId>/... --remote --pipe
+
+# Without --remote you silently read/write a throwaway local copy —
+# symptoms: your own CLI-written keys round-trip fine while every
+# production key "does not exist", even though
+# `wrangler r2 bucket info sentinel-attachments` (control plane, no local
+# mode) shows the real object count/size. This wastes hours if mistaken
+# for a consistency or auth problem. (Also: `r2 object delete` takes no
+# `--force` flag — passing one just prints usage.)
+```
+
 ## Technology Stack
 
 - **Worker**: Hono, Cloudflare Workers, Durable Objects with SQLite
