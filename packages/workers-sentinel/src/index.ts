@@ -10,6 +10,7 @@ import { issueRoutes } from './routes/issues';
 import { memberRoutes } from './routes/members';
 import { projectRoutes } from './routes/projects';
 import { releaseRoutes } from './routes/releases';
+import { sentryCompatErrorTranslator, sentryCompatRoutes } from './routes/sentry-compat';
 import { sourcemapRoutes } from './routes/sourcemaps';
 import type { AuthContext, Env } from './types';
 
@@ -101,6 +102,16 @@ app.route('/api/projects', filterRoutes);
 // Admin routes (session auth required)
 app.use('/api/admin/*', authMiddleware);
 app.route('/api/admin', adminRoutes);
+
+// Sentry /api/0 compatibility (read-only event-attachment surface). The
+// error-shape translator is registered BEFORE authMiddleware: registration
+// order is wrap order in Hono, so the translator's `await next()` wraps
+// auth's early 401 returns and rewrites them to {"detail": …}. Auth still
+// runs before route matching, preserving the /api/projects/* precedence
+// (anonymous probes of unknown /api/0 paths answer 401, not 404).
+app.use('/api/0/*', sentryCompatErrorTranslator);
+app.use('/api/0/*', authMiddleware);
+app.route('/api/0', sentryCompatRoutes);
 
 // Unknown /api/* GETs must not fall through to the SPA: API clients get a
 // JSON 404 instead of the dashboard's HTML (served with a 200). Auth runs

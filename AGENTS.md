@@ -93,7 +93,7 @@ Cloudflare Workers can send events via service binding instead of HTTP for lower
 
 ## Native API reference (fetch-side)
 
-The contract for API consumers (dashboard, CLI tooling, agent skills). The management/fetch API is **native JSON**, not Sentry-compatible — only ingestion speaks the Sentry protocol.
+The contract for API consumers (dashboard, CLI tooling, agent skills). The management/fetch API is **native JSON** — only ingestion speaks the Sentry protocol, with one exception: the read-only Sentry `/api/0` event-attachment compatibility surface documented in its own section below.
 
 ### Authentication
 
@@ -156,6 +156,32 @@ Client `event_id`s round-trip: 32-hex values are lowercased, dashed 36-char UUID
 
 Dashboard permalinks are `/projects/{projectSlug}/issues/{issueId}` (e.g. `https://host/projects/my-project/issues/12345678-…`). The API path space for the same resource is `/api/projects/:slug/issues/:issueId`.
 
+## Sentry `/api/0` compatibility (event attachments)
+
+A read-only mirror of Sentry's event-attachment API surface, additive to the native API above (which is byte-for-byte unchanged). Auth is the same Bearer credential space as `/api/projects/*` — session tokens and `wst_` API tokens both work; DSN public keys do not (they remain ingestion-only). The org path segment is accepted but ignored.
+
+Routes (trailing slash optional on all of them):
+
+- `GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/` — list. `{project}` resolves by slug first, then by project id (both membership-gated).
+- `GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/{attachment_id}/` — metadata: the same nine-field object as the list elements.
+- The detail route with `?download` (any value, including empty) — raw payload bytes: stored `Content-Type`, hardened `Content-Disposition: attachment; filename="…"` (plus RFC 5987 `filename*` for non-ASCII), and `Content-Length` equal to `size` (R2 bodies are piped through `FixedLengthStream` so the runtime emits the exact length). R2 payloads stream directly — no presigned-URL redirects. Inline legacy rows serve from DO storage until the alarm migrates them.
+
+Serializer fields per attachment (exactly these nine): `id`, `event_id`, `type` (`"event.attachment"`), `name`, `mimetype`, `dateCreated` (ISO), `size`, `headers` (`{"Content-Type": mimetype}`), `sha1` (`null` — current Sentry serializer behavior).
+
+**Pagination** follows Sentry's `Link` header convention (not the native `nextCursor` keyset): every page carries `rel="next"` and `rel="previous"` entries, each with `results="true|false"` telling the client whether following it would yield rows. The cursor format is `{id}:{offset}:{isPrev}`; only the offset segment is honored, and malformed cursors read as offset 0. `?limit=` clamps valid integers into 1..100 (default 100; non-integer or absent values fall back to the default). Ordering is by `name`.
+
+**Errors** are Sentry-shaped on this namespace only: non-2xx responses use `{"detail": "…"}` (a namespace-local translator rewrites the native `{error[, message]}` shape, including authMiddleware's 401 bodies). Unknown event, unknown attachment, an attachment scoped under a different event, and non-member/cross-project access (by slug or id) all return `404 {"detail":"not found"}` — indistinguishable by design. Metadata whose R2 blob was deleted still returns 200, while its `?download` returns `404 {"detail":"attachment data missing"}`. Auth precedence matches the native API: anonymous probes of unknown `/api/0/…` paths get 401 (detail-shaped), authenticated ones the 404; `OPTIONS /api/0/*` still answers the global bare 204 preflight before auth.
+
+**Documented deviations from Sentry** (single-tenant constraints):
+
+| Sentry | Here |
+|---|---|
+| Real organization required in the path | Any non-empty `{organization_id_or_slug}` segment accepted (single tenant) |
+| Numeric attachment ids | Opaque `{eventId}:{n}` composites — pass list values back verbatim |
+| Token scopes (`project:read`, …) gate access | Not modeled; any valid session/API token with project membership passes |
+| `sha1` content checksum | Always `null` |
+| Downloads may redirect to presigned storage URLs | Direct stream, never a redirect |
+
 ## Git hooks (lefthook)
 
 Lefthook is mise-pinned (`lefthook = "2.1.14"`) and activated by `just install` (`lefthook install`). Configuration lives in `lefthook.yml`:
@@ -187,7 +213,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 285 across 33 files (`just test`) + 10 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 294 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 

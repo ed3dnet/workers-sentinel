@@ -104,7 +104,7 @@ Workers Sentinel gives you a private, self-hosted error tracking solution with a
 - **⚡ Rate Limiting**: Configurable per-project event quotas to prevent runaway error loops from overwhelming the system
 - **🗑️ Data Retention**: Configurable per-project retention policies with automatic cleanup
 - **🗺️ Source Maps**: Upload source maps per release to resolve minified stack traces back to original source locations
-- **📎 Attachments**: Store attachment payloads up to 21 MiB per envelope in Cloudflare R2 — binary supported, downloads with `Range` support
+- **📎 Attachments**: Store attachment payloads up to 21 MiB per envelope in Cloudflare R2 — binary supported, downloads with `Range` support, and a Sentry-compatible `/api/0` read surface for event attachments
 - **🚫 Inbound Filters**: Drop noisy events before storage with server-side filters (message, exception type, IP address, release, environment)
 
 ## Prerequisites
@@ -171,7 +171,7 @@ The supervisor (in `_devenv/cloudflare/`) is loopback-only, persists Durable Obj
 
 Workers Sentinel accepts events from official Sentry SDKs — it speaks the Sentry **ingestion** protocol (envelope and legacy store endpoints, DSN auth). Simply use your Sentinel DSN instead of a Sentry DSN.
 
-The management/fetch API (`/api/projects/…`) is a native JSON API, **not** a Sentry-compatible one: `sentry-cli` is not supported, and compatibility with Sentry's `/api/0/` REST surface is an explicit non-goal. See AGENTS.md ("Native API reference (fetch-side)") for the real contract — pagination, attachment endpoints and drop reasons, event-id normalization, and auth scopes.
+The management/fetch API (`/api/projects/…`) is a native JSON API, **not** a Sentry-compatible one: `sentry-cli` is not supported. One exception: Sentry's event-attachment read surface is mirrored at `/api/0/projects/{org}/{project}/events/{event_id}/attachments[/…?]` (list, metadata, `?download` byte stream) with Sentry's nine-field serializer, `Link`-header pagination, and `{"detail": …}` errors, so Sentry-speaking clients can fetch stored attachments. See AGENTS.md ("Sentry `/api/0` compatibility") for the exact contract and deviations.
 
 ### Cloudflare Workers (Service Binding with RPC)
 

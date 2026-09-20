@@ -1515,7 +1515,12 @@ export class ProjectState extends DurableObject<Env> {
 	 * cannot strand attachment links.
 	 */
 	private async handleListEventAttachments(request: Request): Promise<Response> {
-		const { eventId } = (await request.json()) as { eventId?: string };
+		const { eventId, orderBy, offset, limit } = (await request.json()) as {
+			eventId?: string;
+			orderBy?: 'name';
+			offset?: number;
+			limit?: number;
+		};
 
 		if (!eventId) {
 			return this.jsonResponse({ error: 'missing_event_id' }, 400);
@@ -1524,6 +1529,41 @@ export class ProjectState extends DurableObject<Env> {
 		const eventRows = this.sql.exec('SELECT issue_id FROM events WHERE id = ?', eventId).toArray();
 		if (eventRows.length === 0) {
 			return this.jsonResponse({ error: 'event_not_found' }, 404);
+		}
+
+		// Compat mode (Sentry /api/0 surface): any of these opts into a paged,
+		// name-ordered window plus a `total` count. The default path (native
+		// route) keeps its exact historical shape: rowid order, no window, no
+		// `total` key.
+		if (orderBy === 'name' || offset !== undefined || limit !== undefined) {
+			const windowLimit =
+				Number.isInteger(limit) && (limit as number) >= 1 ? (limit as number) : 100;
+			const windowOffset =
+				Number.isInteger(offset) && (offset as number) >= 0 ? (offset as number) : 0;
+			const rows = this.sql
+				.exec(
+					`SELECT id, event_id, filename, content_type, size, created_at FROM attachments
+					 WHERE event_id = ? ORDER BY filename LIMIT ? OFFSET ?`,
+					eventId,
+					windowLimit,
+					windowOffset,
+				)
+				.toArray();
+			const totalRows = this.sql
+				.exec('SELECT COUNT(*) as total FROM attachments WHERE event_id = ?', eventId)
+				.toArray();
+			return this.jsonResponse({
+				issueId: eventRows[0].issue_id,
+				attachments: rows.map((row) => ({
+					id: row.id as string,
+					eventId: row.event_id as string,
+					filename: row.filename as string,
+					contentType: (row.content_type as string) ?? 'text/plain',
+					size: row.size as number,
+					createdAt: row.created_at as string,
+				})),
+				total: totalRows[0].total as number,
+			});
 		}
 
 		const rows = this.sql
@@ -1549,7 +1589,10 @@ export class ProjectState extends DurableObject<Env> {
 
 	/** One attachment (metadata + payload location), for the download route. */
 	private async handleGetAttachment(request: Request): Promise<Response> {
-		const { attachmentId } = (await request.json()) as { attachmentId?: string };
+		const { attachmentId, eventId } = (await request.json()) as {
+			attachmentId?: string;
+			eventId?: string;
+		};
 
 		if (!attachmentId) {
 			return this.jsonResponse({ error: 'missing_attachment_id' }, 400);
@@ -1569,6 +1612,12 @@ export class ProjectState extends DurableObject<Env> {
 		}
 
 		const row = rows[0];
+		// Event-scoped access (Sentry /api/0 surface): an attachment that
+		// exists but belongs to a different event is "not found" under the
+		// requested event. Native callers omit `eventId` and are unaffected.
+		if (eventId && (row.event_id as string) !== eventId) {
+			return this.jsonResponse({ error: 'attachment_not_found' }, 404);
+		}
 		const storage = (row.storage as string) ?? 'inline';
 		const isR2 = storage === 'r2' && typeof row.r2_key === 'string';
 		return this.jsonResponse({

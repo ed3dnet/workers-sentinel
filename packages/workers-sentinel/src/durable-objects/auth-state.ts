@@ -706,7 +706,11 @@ export class AuthState extends DurableObject<Env> {
 	}
 
 	private async handleGetProject(request: Request): Promise<Response> {
-		const { slug, userId } = (await request.json()) as { slug?: string; userId?: string };
+		const { slug, userId, alsoTryId } = (await request.json()) as {
+			slug?: string;
+			userId?: string;
+			alsoTryId?: boolean;
+		};
 
 		if (!slug) {
 			return this.jsonResponse({ error: 'missing_slug' }, 400);
@@ -716,16 +720,21 @@ export class AuthState extends DurableObject<Env> {
 			return this.jsonResponse({ error: 'missing_user' }, 400);
 		}
 
-		const rows = this.sql
-			.exec(
-				`SELECT p.id, p.name, p.slug, p.platform, p.public_key, p.webhook_url, p.created_at, p.created_by, pm.role as member_role
+		const select = `SELECT p.id, p.name, p.slug, p.platform, p.public_key, p.webhook_url, p.created_at, p.created_by, pm.role as member_role
        FROM projects p
-       JOIN project_members pm ON p.id = pm.project_id AND pm.user_id = ?
-       WHERE p.slug = ?`,
-				userId,
-				slug,
-			)
-			.toArray();
+       JOIN project_members pm ON p.id = pm.project_id AND pm.user_id = ?`;
+
+		let rows = this.sql.exec(`${select} WHERE p.slug = ?`, userId, slug).toArray();
+
+		// Sentry /api/0 compat surface resolves projects by numeric id as a
+		// fallback (Sentry accepts {project_id_or_slug} path segments). The
+		// slug match takes precedence, and the id retry runs under the same
+		// membership JOIN — a non-member probing by id learns nothing more
+		// than the same uniform 404. The compat route is the only caller
+		// passing alsoTryId; the native slug path is unchanged.
+		if (rows.length === 0 && alsoTryId) {
+			rows = this.sql.exec(`${select} WHERE p.id = ?`, userId, slug).toArray();
+		}
 
 		if (rows.length === 0) {
 			return this.jsonResponse({ error: 'project_not_found' }, 404);

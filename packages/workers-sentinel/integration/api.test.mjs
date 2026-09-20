@@ -3,6 +3,7 @@
 // SETUP_TOKEN arrive via environment. Never point these at a shared stack —
 // they mutate global settings and rely on a pristine user table.
 import { strict as assert } from 'node:assert';
+import { request } from 'node:http';
 import { test } from 'node:test';
 
 const BASE = process.env.SENTINEL_INTEGRATION_URL;
@@ -279,6 +280,27 @@ test('webhook URL validation rejects non-https targets', async () => {
 // be JSON-serialized (that would quote and escape them into garbage).
 const enc = new TextEncoder();
 
+// Raw-wire GET (node:http, no fetch normalization): undici's fetch drops an
+// exposed `Content-Length: 0` for empty bodies even when the server sends
+// it, so Content-Length assertions must read the actual wire headers.
+function rawGet(path, token) {
+	return new Promise((resolve, reject) => {
+		const req = request(
+			`${BASE}${path}`,
+			{ method: 'GET', headers: { Authorization: `Bearer ${token}` } },
+			(res) => {
+				const chunks = [];
+				res.on('data', (c) => chunks.push(c));
+				res.on('end', () =>
+					resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }),
+				);
+			},
+		);
+		req.on('error', reject);
+		req.end();
+	});
+}
+
 function frame(parts) {
 	const encoded = parts.map((p) => (typeof p === 'string' ? enc.encode(p) : p));
 	const total = encoded.reduce((n, e) => n + e.byteLength, 0);
@@ -413,6 +435,117 @@ test('attachments round-trip byte-identically through the real stack', async () 
 		assert.ok(disposition.includes(filename), `filename missing: ${disposition}`);
 		const received = new Uint8Array(await download.arrayBuffer());
 		assert.deepEqual(received, enc.encode(payload));
+	}
+});
+
+test('integration: /api/0 list and download round-trip', async () => {
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+	});
+	const token = login.data.token;
+	const project = (
+		await api('/api/projects', {
+			method: 'POST',
+			token,
+			body: { name: `Compat0 ${runId}`, platform: 'node' },
+		})
+	).data.project;
+
+	// One event, one nonempty R2 payload and one zero-length R2 payload —
+	// both creatable through public ingestion
+	const eventId = crypto.randomUUID().replaceAll('-', '');
+	const nonempty = new Uint8Array(4096);
+	for (let i = 0; i < nonempty.length; i++) nonempty[i] = i % 251;
+	const result = await postEnvelopeBytes(
+		project,
+		frame([
+			envelopeHeaderLine(project, eventId),
+			'\n',
+			...eventItemLine(eventId, { message: 'integration compat round-trip' }),
+			JSON.stringify({
+				type: 'attachment',
+				filename: 'nonempty.bin',
+				content_type: 'application/octet-stream',
+				length: nonempty.byteLength,
+			}),
+			'\n',
+			nonempty,
+			'\n',
+			JSON.stringify({
+				type: 'attachment',
+				filename: 'empty.txt',
+				content_type: 'text/plain',
+				length: 0,
+			}),
+			'\n',
+			new Uint8Array(0),
+			'\n',
+		]),
+	);
+	assert.equal(result.status, 200);
+	assert.deepEqual(result.data.droppedAttachments, []);
+
+	// Compat list: bare nine-field array ordered by name, Link pagination
+	const list = await api(`/api/0/projects/any-org/${project.slug}/events/${eventId}/attachments/`, {
+		token,
+	});
+	assert.equal(list.status, 200);
+	assert.ok(Array.isArray(list.data), `expected bare array, got: ${JSON.stringify(list.data)}`);
+	assert.deepEqual(
+		list.data.map((a) => a.name),
+		['empty.txt', 'nonempty.bin'],
+	);
+	for (const item of list.data) {
+		assert.deepEqual(Object.keys(item).sort(), [
+			'dateCreated',
+			'event_id',
+			'headers',
+			'id',
+			'mimetype',
+			'name',
+			'sha1',
+			'size',
+			'type',
+		]);
+		assert.equal(item.event_id, eventId);
+		assert.equal(item.type, 'event.attachment');
+		assert.equal(item.sha1, null);
+		assert.equal(item.headers['Content-Type'], item.mimetype);
+	}
+	const link = list.headers.get('Link') ?? '';
+	assert.ok(link.includes('rel="next"'), `missing next link: ${link}`);
+	assert.ok(link.includes('rel="previous"'), `missing previous link: ${link}`);
+
+	// Metadata detail matches the list element exactly
+	const meta = await api(
+		`/api/0/projects/any-org/${project.slug}/events/${eventId}/attachments/${list.data[1].id}/`,
+		{ token },
+	);
+	assert.equal(meta.status, 200);
+	assert.deepEqual(meta.data, list.data[1]);
+
+	// Downloads: byte-identical payload with stored content type, disposition,
+	// and Content-Length equal to `size` over the real HTTP stack — including
+	// the zero-length payload (asserted on raw wire headers)
+	const expected = { 'empty.txt': new Uint8Array(0), 'nonempty.bin': nonempty };
+	for (const item of list.data) {
+		const download = await rawGet(
+			`/api/0/projects/any-org/${project.slug}/events/${eventId}/attachments/${item.id}/?download=1`,
+			token,
+		);
+		assert.equal(download.status, 200);
+		assert.equal(download.headers['content-type'], item.mimetype);
+		assert.equal(
+			download.headers['content-length'],
+			String(item.size),
+			`Content-Length must equal size for ${item.name}`,
+		);
+		const disposition = download.headers['content-disposition'] ?? '';
+		assert.ok(disposition.startsWith('attachment;'), `unexpected disposition: ${disposition}`);
+		assert.ok(disposition.includes(item.name), `filename missing: ${disposition}`);
+		assert.equal(download.body.byteLength, item.size);
+		assert.deepEqual(new Uint8Array(download.body), expected[item.name]);
 	}
 });
 
