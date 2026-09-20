@@ -47,7 +47,7 @@ Workers Sentinel is a lightweight, self-hosted error tracking and monitoring sol
 
 ## Overview
 
-Workers Sentinel gives you a private, self-hosted error tracking solution with a modern web dashboard. By leveraging the Cloudflare ecosystem, it offers a cost-effective and scalable alternative to hosted error tracking services. All your data is stored in your own Durable Objects with SQLite storage, giving you complete control and privacy.
+Workers Sentinel gives you a private, self-hosted error tracking solution with a modern web dashboard. By leveraging the Cloudflare ecosystem, it offers a cost-effective and scalable alternative to hosted error tracking services. All your data is stored in your own Durable Objects with SQLite storage (and attachment payloads in your own R2 bucket), giving you complete control and privacy.
 
 ## Why Workers Sentinel?
 
@@ -104,6 +104,7 @@ Workers Sentinel gives you a private, self-hosted error tracking solution with a
 - **⚡ Rate Limiting**: Configurable per-project event quotas to prevent runaway error loops from overwhelming the system
 - **🗑️ Data Retention**: Configurable per-project retention policies with automatic cleanup
 - **🗺️ Source Maps**: Upload source maps per release to resolve minified stack traces back to original source locations
+- **📎 Attachments**: Store attachment payloads up to 21 MiB per envelope in Cloudflare R2 — binary supported, downloads with `Range` support
 - **🚫 Inbound Filters**: Drop noisy events before storage with server-side filters (message, exception type, IP address, release, environment)
 
 ## Prerequisites
@@ -116,6 +117,7 @@ Before deploying Workers Sentinel, make sure you have:
 **Cloudflare Services Used:**
 - Workers (Compute)
 - Durable Objects with SQLite (State management)
+- R2 (Attachment payloads)
 - Workers Assets (Dashboard hosting)
 
 All these services have generous free tiers sufficient for most use cases.

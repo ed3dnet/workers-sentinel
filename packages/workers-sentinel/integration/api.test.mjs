@@ -458,7 +458,7 @@ test('dashed UUID event ids round-trip normalized with idempotent resends', asyn
 	assert.equal(stored.data.event.event_id, normalized);
 });
 
-test('binary attachments drop non-fatally with a reported reason', async () => {
+test('binary attachments store and download byte-identically', async () => {
 	const login = await api('/api/auth/login', {
 		method: 'POST',
 		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
@@ -468,18 +468,18 @@ test('binary attachments drop non-fatally with a reported reason', async () => {
 		await api('/api/projects', {
 			method: 'POST',
 			token,
-			body: { name: `BinDrop ${runId}`, platform: 'node' },
+			body: { name: `BinStore ${runId}`, platform: 'node' },
 		})
 	).data.project;
 
 	const eventId = crypto.randomUUID().replaceAll('-', '');
-	const binary = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe]);
+	const binary = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00]);
 	const result = await postEnvelopeBytes(
 		project,
 		frame([
 			envelopeHeaderLine(project, eventId),
 			'\n',
-			...eventItemLine(eventId, { message: 'integration binary drop' }),
+			...eventItemLine(eventId, { message: 'integration binary round-trip' }),
 			JSON.stringify({
 				type: 'attachment',
 				filename: 'screenshot.png',
@@ -501,15 +501,90 @@ test('binary attachments drop non-fatally with a reported reason', async () => {
 	);
 	assert.equal(result.status, 200);
 	assert.equal(result.data.id, eventId);
-	assert.deepEqual(result.data.droppedAttachments, [
-		{ filename: 'screenshot.png', reason: 'binary_unsupported' },
-	]);
+	assert.deepEqual(result.data.droppedAttachments, []);
 
-	// The event stored; only the text attachment is retrievable
+	// Both attachments stored; the binary downloads byte-identically with
+	// its stored content type
 	const list = await api(`/api/projects/${project.slug}/events/${eventId}/attachments`, {
 		token,
 	});
 	assert.equal(list.status, 200);
-	assert.equal(list.data.attachments.length, 1);
-	assert.equal(list.data.attachments[0].filename, 'context.txt');
+	assert.equal(list.data.attachments.length, 2);
+	const png = list.data.attachments.find((a) => a.filename === 'screenshot.png');
+	const download = await fetch(`${BASE}/api/projects/${project.slug}/attachments/${png.id}`, {
+		headers: { Authorization: `Bearer ${token}` },
+		signal: AbortSignal.timeout(30_000),
+	});
+	assert.equal(download.status, 200);
+	assert.equal(download.headers.get('Content-Type'), 'image/png');
+	const received = new Uint8Array(await download.arrayBuffer());
+	assert.deepEqual(received, binary);
+
+	// Range request returns the exact byte slice with 206
+	const ranged = await fetch(`${BASE}/api/projects/${project.slug}/attachments/${png.id}`, {
+		headers: { Authorization: `Bearer ${token}`, Range: 'bytes=2-5' },
+		signal: AbortSignal.timeout(30_000),
+	});
+	assert.equal(ranged.status, 206);
+	assert.equal(ranged.headers.get('Content-Range'), `bytes 2-5/${binary.byteLength}`);
+	assert.deepEqual(new Uint8Array(await ranged.arrayBuffer()), binary.subarray(2, 6));
+});
+
+test('gzip envelope with a binary attachment round-trips through real HTTP', async () => {
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+	});
+	const token = login.data.token;
+	const project = (
+		await api('/api/projects', {
+			method: 'POST',
+			token,
+			body: { name: `GzBin ${runId}`, platform: 'node' },
+		})
+	).data.project;
+
+	const eventId = crypto.randomUUID().replaceAll('-', '');
+	const payload = new Uint8Array(2048);
+	for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
+	const envelope = frame([
+		envelopeHeaderLine(project, eventId),
+		'\n',
+		...eventItemLine(eventId, { message: 'integration gzip binary' }),
+		JSON.stringify({
+			type: 'attachment',
+			filename: 'dump.bin',
+			content_type: 'application/octet-stream',
+			length: payload.byteLength,
+		}),
+		'\n',
+		payload,
+	]);
+	const compressed = new Response(
+		new Blob([envelope]).stream().pipeThrough(new CompressionStream('gzip')),
+	);
+	const response = await fetch(`${BASE}/api/${project.id}/envelope/`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/x-sentry-envelope',
+			'Content-Encoding': 'gzip',
+			'X-Sentry-Auth': `Sentry sentry_version=7, sentry_key=${project.publicKey}`,
+		},
+		body: compressed.body,
+		duplex: 'half',
+		signal: AbortSignal.timeout(30_000),
+	});
+	assert.equal(response.status, 200);
+	assert.deepEqual((await response.json()).droppedAttachments, []);
+
+	const list = await api(`/api/projects/${project.slug}/events/${eventId}/attachments`, {
+		token,
+	});
+	assert.equal(list.status, 200);
+	const download = await fetch(
+		`${BASE}/api/projects/${project.slug}/attachments/${list.data.attachments[0].id}`,
+		{ headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000) },
+	);
+	assert.equal(download.status, 200);
+	assert.deepEqual(new Uint8Array(await download.arrayBuffer()), payload);
 });

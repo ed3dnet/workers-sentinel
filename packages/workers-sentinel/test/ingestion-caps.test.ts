@@ -40,7 +40,7 @@ async function postEnvelope(
 }
 
 describe('ingestion input caps and validation', () => {
-	it('rejects bodies over the compressed size limit with 413', async () => {
+	it('rejects bodies over the wire size limit with 413', async () => {
 		const user = await createTestUser({
 			email: `caps-${Date.now()}@example.com`,
 			password: 'testpassword123',
@@ -48,7 +48,9 @@ describe('ingestion input caps and validation', () => {
 		});
 		const project = await createTestProject(user.token!, { name: `Caps ${Date.now()}` });
 
-		const bigPayload = 'x'.repeat(1100 * 1024);
+		// 28 MiB exceeds the 27 MiB wire cap: a budget-compliant envelope
+		// (21 MiB attachments + 5 MiB items + framing) is never wire-rejected
+		const bigPayload = 'x'.repeat(28 * 1024 * 1024);
 		const body = envelopeWith(
 			project.publicKey,
 			project.id,

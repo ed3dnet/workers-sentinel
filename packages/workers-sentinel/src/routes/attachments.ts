@@ -107,10 +107,59 @@ attachmentRoutes.get('/:slug/events/:eventId/attachments', async (c) => {
 	return c.json(data);
 });
 
+/** Parsed single-range request (RFC 9110 `bytes=` unit only). */
+interface ByteRange {
+	offset: number;
+	length: number;
+}
+
+/**
+ * Copy into a buffer backed by a plain ArrayBuffer (Hono's body typing
+ * rejects SharedArrayBuffer-backed views).
+ */
+function copyBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(bytes.byteLength);
+	out.set(bytes);
+	return out;
+}
+
+/**
+ * Parse a `Range` header against a known total size. Returns a satisfiable
+ * range, `'unsatisfiable'` (→ 416), or null when the header is absent or
+ * malformed (→ full 200 response, per RFC guidance to ignore bad ranges).
+ * Only a single range is supported; multi-range requests fall back to 200.
+ */
+function parseRange(header: string | undefined, size: number): ByteRange | 'unsatisfiable' | null {
+	if (!header) return null;
+	const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+	if (!match || (match[1] === '' && match[2] === '')) return null;
+	const total = size;
+	if (match[1] === '') {
+		// suffix range: last N bytes
+		const suffix = Number.parseInt(match[2], 10);
+		if (!Number.isInteger(suffix) || suffix <= 0) return 'unsatisfiable';
+		if (suffix >= total) return { offset: 0, length: total };
+		return { offset: total - suffix, length: suffix };
+	}
+	const start = Number.parseInt(match[1], 10);
+	if (!Number.isInteger(start) || start < 0) return null;
+	if (start >= total) return 'unsatisfiable';
+	if (match[2] === '') {
+		return { offset: start, length: total - start };
+	}
+	const end = Number.parseInt(match[2], 10);
+	if (!Number.isInteger(end) || end < start) return null;
+	return { offset: start, length: Math.min(end, total - 1) - start + 1 };
+}
+
 /**
  * Download one attachment (payload bytes, stored content type, safe
  * Content-Disposition). Scoping is inherent: the attachment row lives in the
- * project's own Durable Object.
+ * project's own Durable Object, which also tells the worker where the
+ * payload lives — inline (`data`, legacy rows awaiting migration) or R2
+ * (`r2Key`, streamed from the bucket with `Range` support). Metadata
+ * existing while the blob is gone is reported distinctly (GC/lifecycle race
+ * window) so consumers can tell a deleted attachment from a missing blob.
  * GET /api/projects/:slug/attachments/:attachmentId
  */
 attachmentRoutes.get('/:slug/attachments/:attachmentId', async (c) => {
@@ -144,12 +193,66 @@ attachmentRoutes.get('/:slug/attachments/:attachmentId', async (c) => {
 		attachment: {
 			filename: string;
 			contentType: string;
-			data: string;
+			size: number;
+			storage: 'inline' | 'r2';
+			r2Key?: string;
+			data?: string;
 		};
 	};
+	const attachment = data.attachment;
+	const commonHeaders = {
+		'Content-Type': safeContentType(attachment.contentType),
+		'Content-Disposition': contentDisposition(attachment.filename),
+	};
 
-	return c.body(data.attachment.data, 200, {
-		'Content-Type': safeContentType(data.attachment.contentType),
-		'Content-Disposition': contentDisposition(data.attachment.filename),
-	});
+	if (attachment.storage === 'inline') {
+		const bytes = copyBytes(new TextEncoder().encode(attachment.data ?? ''));
+		const range = parseRange(c.req.header('Range'), bytes.byteLength);
+		if (range === 'unsatisfiable') {
+			return c.body(null, 416, {
+				...commonHeaders,
+				'Content-Range': `bytes */${bytes.byteLength}`,
+			});
+		}
+		if (range) {
+			const slice = bytes.subarray(range.offset, range.offset + range.length);
+			return c.body(slice, 206, {
+				...commonHeaders,
+				'Content-Range': `bytes ${range.offset}-${range.offset + range.length - 1}/${
+					bytes.byteLength
+				}`,
+			});
+		}
+		return c.body(bytes, 200, commonHeaders);
+	}
+
+	// R2-backed payload
+	const key = attachment.r2Key;
+	if (!key) {
+		return c.json({ error: 'attachment_data_missing' }, 404);
+	}
+	const size = attachment.size;
+	const range = parseRange(c.req.header('Range'), size);
+	if (range === 'unsatisfiable') {
+		return c.body(null, 416, {
+			...commonHeaders,
+			'Content-Range': `bytes */${size}`,
+		});
+	}
+
+	const object = await c.env.ATTACHMENTS.get(key, range ? { range } : undefined);
+	if (!object || !('body' in object)) {
+		// Metadata exists but the blob is gone (deleted underneath a listed
+		// attachment). Distinct from `attachment_not_found`.
+		console.error(`Attachment blob missing for ${attachmentId}: R2 key ${key}`);
+		return c.json({ error: 'attachment_data_missing' }, 404);
+	}
+
+	if (range) {
+		return c.body(object.body, 206, {
+			...commonHeaders,
+			'Content-Range': `bytes ${range.offset}-${range.offset + range.length - 1}/${size}`,
+		});
+	}
+	return c.body(object.body, 200, commonHeaders);
 });

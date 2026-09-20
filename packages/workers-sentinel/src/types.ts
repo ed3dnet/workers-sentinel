@@ -1,6 +1,15 @@
 export interface Env {
 	AUTH_STATE: DurableObjectNamespace;
 	PROJECT_STATE: DurableObjectNamespace;
+	/** R2 bucket holding attachment payloads (`sentinel-attachments`). */
+	ATTACHMENTS: R2Bucket;
+	/**
+	 * Test-only: when bound to `'enabled'` (vitest miniflare config), the
+	 * `X-Sentinel-Test-Fault` request header and the internal fault marker
+	 * plumbing become active. Never set in production — the mechanism is
+	 * inert without it.
+	 */
+	ATTACHMENT_FAULT_INJECTION?: string;
 	/** Optional operator secret: when set, the first registration (admin bootstrap) must present it. */
 	SETUP_TOKEN?: string;
 	/** Optional comma-separated list of origins allowed cross-origin access to the dashboard API. */
@@ -239,26 +248,27 @@ export interface ParsedEnvelope {
 }
 
 /**
- * A text attachment extracted from an envelope, validated and bounded, ready
- * to persist alongside its event. `size` is the byte length of the original
- * framed payload slice (UTF-8 bytes, not UTF-16 code units).
+ * An attachment extracted from an envelope, validated and bounded, ready to
+ * persist. The payload lives in R2 under `r2Key` (worker upload path);
+ * `data` remains accepted on the internal ingest boundary for the legacy
+ * inline compat path (rows the alarm later migrates to R2). `size` is the
+ * byte length of the original framed payload slice.
  */
 export interface ExtractedAttachment {
 	filename: string;
 	contentType: string;
-	data: string;
 	size: number;
+	r2Key?: string;
+	data?: string;
 }
 
 /** Why an attachment was not stored. Reported, never fatal to the event. */
 export type AttachmentDropReason =
 	| 'too_large'
 	| 'too_many'
-	| 'binary_unsupported'
 	| 'no_unique_event'
 	| 'event_filtered'
-	| 'project_attachment_quota'
-	| 'project_attachment_count';
+	| 'project_attachment_quota';
 
 export interface DroppedAttachment {
 	filename: string;

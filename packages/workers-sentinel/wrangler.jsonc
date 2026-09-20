@@ -20,6 +20,17 @@
 	"build": {
 		"command": "cd ../dashboard && npm run build"
 	},
+	// Attachment blob storage (metadata rows stay in ProjectState). Miniflare
+	// (`wrangler dev`, vitest-pool-workers, the integration runner) simulates
+	// this bucket from the binding; the production bucket is created at deploy
+	// time with `wrangler r2 bucket create sentinel-attachments`.
+	"r2_buckets": [
+		{
+			"binding": "ATTACHMENTS",
+			"bucket_name": "sentinel-attachments",
+			"preview_bucket_name": "sentinel-attachments"
+		}
+	],
 	// Durable Object bindings
 	"durable_objects": {
 		"bindings": [

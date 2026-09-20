@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { createAttachmentStore, migrationKey, projectPrefix } from '../lib/attachment-store';
 import { sanitizeEvent } from '../lib/envelope-parser';
 import {
 	extractCulprit,
@@ -18,11 +19,20 @@ import type {
 } from '../types';
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** GC alarm cadence floor: an alarm is always scheduled within an hour. */
+const ALARM_INTERVAL_MS = 60 * 60 * 1000;
+/** Orphaned blobs younger than this are never GC'd (in-flight protection). */
+const GC_GRACE_MS = 60 * 60 * 1000;
+/** Per-alarm GC bounds: whichever comes first. */
+const GC_MAX_OBJECTS = 10_000;
+const GC_TIME_BUDGET_MS = 30_000;
+/** Inline→R2 migration batch size per alarm run. */
+const MIGRATION_BATCH = 100;
+/** Purge sweep retry delay when the sweep cannot complete in one run. */
+const PURGE_RETRY_MS = 60 * 1000;
 
-/** Per-project attachment payload budget across all stored rows. */
-export const MAX_PROJECT_ATTACHMENT_BYTES = 64 * 1024 * 1024;
-/** Per-project attachment row cap (zero-byte rows still count). */
-export const MAX_PROJECT_ATTACHMENT_ROWS = 10_000;
+/** Per-project attachment payload budget across all stored rows (R2 bytes). */
+export const MAX_PROJECT_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
 
 /**
  * Clamp a client-supplied page limit. Negative or non-numeric values fall
@@ -135,10 +145,18 @@ CREATE TABLE IF NOT EXISTS attachments (
   size INTEGER NOT NULL DEFAULT 0,
   data TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  r2_key TEXT,
+  storage TEXT NOT NULL DEFAULT 'inline',
   CHECK (length(filename) <= 200),
   FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_event ON attachments(event_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_r2_key ON attachments(r2_key);
+
+CREATE TABLE IF NOT EXISTS attachment_usage (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  bytes INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
@@ -234,6 +252,17 @@ const MIGRATIONS = [
   created_at TEXT NOT NULL,
   FOREIGN KEY (target_issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );`,
+	// Attachment payloads move to R2: ADD COLUMN only (no table rebuild, no
+	// data movement). `data` keeps NOT NULL with '' as the R2-row sentinel;
+	// pre-upgrade inline rows keep their payload until the alarm migrates
+	// them to deterministic `m/{attachmentId}` keys.
+	'ALTER TABLE attachments ADD COLUMN r2_key TEXT;',
+	"ALTER TABLE attachments ADD COLUMN storage TEXT NOT NULL DEFAULT 'inline';",
+	'CREATE INDEX IF NOT EXISTS idx_attachments_r2_key ON attachments(r2_key);',
+	`CREATE TABLE IF NOT EXISTS attachment_usage (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  bytes INTEGER NOT NULL DEFAULT 0
+);`,
 ];
 
 /** Terminal states of the transactional ingest sequence. */
@@ -294,6 +323,8 @@ export class ProjectState extends DurableObject<Env> {
 					return this.handleIngest(request);
 				case '/ingest-with-attachments':
 					return this.handleIngestWithAttachments(request);
+				case '/touch':
+					return this.handleTouch(request);
 				case '/issues':
 					return this.handleGetIssues(request);
 				case '/issue':
@@ -369,12 +400,23 @@ export class ProjectState extends DurableObject<Env> {
 				case '/issues/merge':
 					return this.handleMergeIssues(request);
 				case '/purge':
-					return this.handlePurge();
+					return this.handlePurge(request);
+				case '/attachment/r2-probe':
+					// Test-only DO↔R2 binding probe (inert without the test
+					// fault-injection binding)
+					if (this.env.ATTACHMENT_FAULT_INJECTION === 'enabled') {
+						return this.handleR2Probe();
+					}
+					return this.notFound();
+				case '/migration-flip-arm':
+					// Test-only one-shot marker consumed by the next alarm
+					// migration run (alarms carry no headers)
+					if (this.env.ATTACHMENT_FAULT_INJECTION === 'enabled') {
+						return this.handleMigrationFlipArm();
+					}
+					return this.notFound();
 				default:
-					return new Response(JSON.stringify({ error: 'not_found' }), {
-						status: 404,
-						headers: { 'Content-Type': 'application/json' },
-					});
+					return this.notFound();
 			}
 		} catch (error) {
 			console.error('ProjectState error:', error);
@@ -388,15 +430,198 @@ export class ProjectState extends DurableObject<Env> {
 		}
 	}
 
-	private async handlePurge(): Promise<Response> {
-		// Drop every table row and all KV storage in this Durable Object.
-		// Called when a project is deleted so tenant data does not outlive it.
+	private notFound(): Response {
+		return new Response(JSON.stringify({ error: 'not_found' }), {
+			status: 404,
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
+
+	/**
+	 * Project id for R2 key prefixes (`p/{projectId}/…`). Persisted in
+	 * `project_config` by the lazy /touch (which precedes every upload), the
+	 * purge route, and the ingest-with-attachments boundary.
+	 */
+	private getProjectId(): string | null {
+		return this.getConfigValue('project_id');
+	}
+
+	private persistProjectId(projectId: unknown): void {
+		if (typeof projectId === 'string' && projectId.length > 0) {
+			this.setConfigValue('project_id', projectId);
+		}
+	}
+
+	/**
+	 * Idempotent usage-counter seed: safe to run inside any transaction, so
+	 * retention deletes arriving before any post-upgrade ingest cannot drift
+	 * the counter.
+	 */
+	private seedAttachmentUsage(): void {
+		this.sql.exec(`INSERT INTO attachment_usage (id, bytes)
+			SELECT 1, COALESCE((SELECT SUM(size) FROM attachments), 0)
+			WHERE NOT EXISTS (SELECT 1 FROM attachment_usage)`);
+	}
+
+	private attachmentUsageBytes(): number {
+		this.seedAttachmentUsage();
+		const rows = this.sql.exec('SELECT bytes FROM attachment_usage WHERE id = 1').toArray();
+		return rows.length > 0 ? (rows[0].bytes as number) : 0;
+	}
+
+	/** Best-effort blob deletion after SQL commit; GC is the backstop. */
+	private async deleteAttachmentBlobs(keys: string[]): Promise<void> {
+		if (keys.length === 0) return;
+		try {
+			await createAttachmentStore(this.env, null).deleteKeys(keys);
+		} catch (error) {
+			console.error(
+				'Attachment blob delete failed (GC will reclaim):',
+				error instanceof Error ? error.message.slice(0, 120) : 'unknown',
+			);
+		}
+	}
+
+	/**
+	 * Lazy touch from the ingestion route at the first storable attachment:
+	 * ensures schema + alarm (GC coverage for any blob the request may
+	 * orphan) and returns the rate-limit snapshot so a limited project can
+	 * be rejected before uploading up to 21 MiB of otherwise-doomed blobs.
+	 */
+	private async handleTouch(request: Request): Promise<Response> {
+		// ensureSchema (including alarm guarantee) already ran in fetch()
+		try {
+			const body = (await request.json()) as { projectId?: string };
+			this.persistProjectId(body.projectId);
+		} catch {
+			// No/invalid body — rate snapshot still served
+		}
+		return this.jsonResponse({
+			maxEventsPerHour: Number.parseInt(this.getConfigValue('max_events_per_hour') || '0', 10),
+			currentHourCount: this.currentRateCount(),
+			isLimited: this.isRateLimited(),
+			retryAfterSeconds: this.retryAfterSeconds() || 3600,
+		});
+	}
+
+	/**
+	 * Test-only DO↔R2 binding probe: drives put/head/get/list/delete through
+	 * the real store factory from inside the DO. Proves the DO can operate
+	 * the bucket directly (the design assumption for lifecycle deletes,
+	 * purge sweeps, GC and inline migration).
+	 */
+	private async handleR2Probe(): Promise<Response> {
+		try {
+			const projectId = this.getProjectId() ?? 'probe';
+			const key = `p/${projectId}/probe/${crypto.randomUUID()}`;
+			const payload = new TextEncoder().encode('probe');
+			const store = createAttachmentStore(this.env, null);
+			await store.uploadAttachment(key, payload, payload.byteLength);
+			const head = await this.env.ATTACHMENTS.head(key);
+			const got = await this.env.ATTACHMENTS.get(key);
+			const bytes = got ? new Uint8Array(await got.arrayBuffer()) : null;
+			const listed = await store.listPage(`p/${projectId}/probe/`, null);
+			await store.deleteKeys([key]);
+			const after = await this.env.ATTACHMENTS.head(key);
+			return this.jsonResponse({
+				ok:
+					head !== null &&
+					bytes !== null &&
+					bytes.byteLength === payload.byteLength &&
+					listed.objects.some((o) => o.key === key) &&
+					after === null,
+				resolvedProjectId: projectId,
+			});
+		} catch (error) {
+			return this.jsonResponse(
+				{ ok: false, error: error instanceof Error ? error.message.slice(0, 200) : 'unknown' },
+				500,
+			);
+		}
+	}
+
+	/** Test-only: arm the one-shot migration-flip fault for the next alarm. */
+	private handleMigrationFlipArm(): Response {
+		this.setConfigValue('migration_flip_fault', '1');
+		return this.jsonResponse({ armed: true });
+	}
+
+	/**
+	 * Purge: drop every table row and all KV storage in this Durable Object.
+	 * Called when a project is deleted so tenant data does not outlive it.
+	 *
+	 * Saga: blobs are swept from R2 FIRST (prefix list + batched deletes,
+	 * continuation persisted per page), and only once the prefix is empty is
+	 * the DO state wiped. While `purge_pending` is set, ingest routes reject
+	 * with 503 so a concurrent in-flight ingest cannot recreate state under
+	 * the sweep. If the sweep cannot complete in one run it retries on
+	 * subsequent alarms.
+	 */
+	private async handlePurge(request: Request): Promise<Response> {
+		let projectId: string | null = null;
+		let sweepFault = false;
+		try {
+			const body = (await request.json()) as { projectId?: string; fault?: string };
+			projectId = typeof body.projectId === 'string' ? body.projectId : null;
+			// Test fault forwarding (purge-sweep) — only honored under the
+			// test binding
+			sweepFault =
+				this.env.ATTACHMENT_FAULT_INJECTION === 'enabled' && body.fault === 'purge-sweep';
+		} catch {
+			// No/invalid body — legacy purge callers
+		}
+		if (projectId) this.persistProjectId(projectId);
+
+		if (this.getConfigValue('purge_pending') !== '1') {
+			this.setConfigValue('purge_pending', '1');
+			this.setConfigValue('purge_cursor', '');
+		}
+
+		const complete = await this.runPurgeSweep(sweepFault);
+		if (!complete) {
+			// Sweep failed mid-way: continuation is persisted; the alarm
+			// retries until the prefix is empty. DO state survives until then.
+			await this.scheduleNextAlarm();
+			return this.jsonResponse({ purged: false, pending: true });
+		}
+
 		await this.ctx.storage.deleteAll();
 		// Allow the schema to be recreated lazily on the next request
 		this.initialized = false;
-		return new Response(JSON.stringify({ purged: true }), {
-			headers: { 'Content-Type': 'application/json' },
-		});
+		return this.jsonResponse({ purged: true });
+	}
+
+	/**
+	 * One purge sweep pass. Returns true when the project prefix is empty
+	 * (safe to wipe DO state); false when the sweep must resume later.
+	 */
+	private async runPurgeSweep(sweepFault: boolean): Promise<boolean> {
+		const projectId = this.getProjectId();
+		if (!projectId) {
+			// No persisted project id means no R2 object can exist for this
+			// project (the touch that persists it precedes every upload).
+			return true;
+		}
+		const store = createAttachmentStore(this.env, sweepFault ? 'purge-sweep' : null);
+		const prefix = projectPrefix(projectId);
+		let cursor = this.getConfigValue('purge_cursor') || null;
+		try {
+			for (;;) {
+				const page = await store.listPage(prefix, cursor);
+				if (page.objects.length > 0) {
+					await store.deleteKeys(page.objects.map((o) => o.key));
+				}
+				cursor = page.cursor;
+				this.setConfigValue('purge_cursor', cursor ?? '');
+				if (!cursor) return true;
+			}
+		} catch (error) {
+			console.error(
+				'Purge sweep incomplete; will retry on next alarm:',
+				error instanceof Error ? error.message.slice(0, 120) : 'unknown',
+			);
+			return false;
+		}
 	}
 
 	private async handleIngest(request: Request): Promise<Response> {
@@ -406,14 +631,19 @@ export class ProjectState extends DurableObject<Env> {
 
 	/**
 	 * Internal ingest boundary for the worker's envelope route: accepts the
-	 * already-validated event plus its extracted attachments. Same semantics
-	 * as `/ingest` (bare event) for callers that have no attachments.
+	 * already-validated event plus its extracted attachments (payload in R2
+	 * via `r2Key`, or legacy inline `data`). Same semantics as `/ingest`
+	 * (bare event) for callers that have no attachments. The worker also
+	 * passes the project id so alarm-driven R2 work (GC, migration) knows
+	 * its key prefix even if this DO was never touched.
 	 */
 	private async handleIngestWithAttachments(request: Request): Promise<Response> {
-		const { event, attachments } = (await request.json()) as {
+		const { event, attachments, projectId } = (await request.json()) as {
 			event: SentryEvent;
 			attachments?: ExtractedAttachment[];
+			projectId?: string;
 		};
+		this.persistProjectId(projectId);
 		return this.ingestEvent(event, Array.isArray(attachments) ? attachments : []);
 	}
 
@@ -435,6 +665,15 @@ export class ProjectState extends DurableObject<Env> {
 		rawEvent: SentryEvent,
 		attachments: ExtractedAttachment[] = [],
 	): Promise<Response> {
+		// A purge in progress is deleting this project's state; accepting an
+		// ingest now could recreate rows/blobs under the sweep.
+		if (this.getConfigValue('purge_pending') === '1') {
+			return new Response(
+				JSON.stringify({ error: 'purge_pending', message: 'Project purge in progress' }),
+				{ status: 503, headers: { 'Content-Type': 'application/json' } },
+			);
+		}
+
 		// Check rate limit before processing
 		const rateCheck = this.checkRateLimit();
 		if (!rateCheck.allowed) {
@@ -526,6 +765,15 @@ export class ProjectState extends DurableObject<Env> {
 			level: outcome.level,
 			culprit: outcome.culprit,
 			...(hasAttachments ? { droppedAttachments: dropped } : {}),
+			// R2 keys whose metadata rows committed — the worker deletes any
+			// uploaded key not in this list (saga hygiene).
+			...(hasAttachments
+				? {
+						storedR2Keys: storable
+							.map((a) => a.r2Key)
+							.filter((key): key is string => typeof key === 'string'),
+					}
+				: {}),
 		});
 	}
 
@@ -806,20 +1054,32 @@ export class ProjectState extends DurableObject<Env> {
 		// Store attachments. The deterministic id (eventId:index) plus the
 		// narrow ON CONFLICT scope make replays idempotent while CHECK and
 		// FK violations still throw and roll back the whole transaction.
+		// R2-backed attachments keep only ~200 bytes of metadata here
+		// (`data=''` sentinel); the legacy `data` payload remains accepted
+		// for inline rows, which the alarm migrates to R2.
+		let insertedBytes = 0;
 		for (let i = 0; i < attachments.length; i++) {
 			const attachment = attachments[i];
+			const isR2 = typeof attachment.r2Key === 'string' && attachment.r2Key.length > 0;
 			this.sql.exec(
-				`INSERT INTO attachments (id, event_id, filename, content_type, size, data, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO attachments (id, event_id, filename, content_type, size, data, created_at, r2_key, storage)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT(id) DO NOTHING`,
 				`${eventId}:${i}`,
 				eventId,
 				attachment.filename,
 				attachment.contentType,
 				attachment.size,
-				attachment.data,
+				isR2 ? '' : (attachment.data ?? ''),
 				now,
+				isR2 ? attachment.r2Key : null,
+				isR2 ? 'r2' : 'inline',
 			);
+			insertedBytes += attachment.size;
+		}
+		if (attachments.length > 0) {
+			this.seedAttachmentUsage();
+			this.sql.exec('UPDATE attachment_usage SET bytes = bytes + ? WHERE id = 1', insertedBytes);
 		}
 
 		return {
@@ -833,11 +1093,12 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	/**
-	 * Apply the per-project attachment budgets (payload bytes and row count)
-	 * to a batch of extracted attachments. Decided before the transaction and
-	 * reported as drops; existing data is never auto-deleted to make room.
-	 * Defaults (64 MiB / 10,000 rows) can be tuned per project via config
-	 * (`maxAttachmentBytes` / `maxAttachmentRows`).
+	 * Apply the per-project attachment byte budget to a batch of extracted
+	 * attachments. Decided before the transaction and reported as drops;
+	 * existing data is never auto-deleted to make room. The budget bounds R2
+	 * usage, not the DO (metadata rows are uncounted). Default 10 GiB,
+	 * tunable via config (`maxAttachmentBytes`); "unlimited" is a very large
+	 * value. Usage is read from the persisted counter (seeded idempotently).
 	 */
 	private applyAttachmentBudgets(attachments: ExtractedAttachment[]): {
 		storable: ExtractedAttachment[];
@@ -850,30 +1111,18 @@ export class ProjectState extends DurableObject<Env> {
 			this.getConfigValue('max_attachment_total_bytes') || '',
 			10,
 		);
-		const rowsConfig = Number.parseInt(this.getConfigValue('max_attachment_count') || '', 10);
 		const maxBytes =
 			Number.isInteger(bytesConfig) && bytesConfig > 0 ? bytesConfig : MAX_PROJECT_ATTACHMENT_BYTES;
-		const maxRows =
-			Number.isInteger(rowsConfig) && rowsConfig > 0 ? rowsConfig : MAX_PROJECT_ATTACHMENT_ROWS;
 
-		const usage = this.sql
-			.exec('SELECT COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS total FROM attachments')
-			.one();
-		let rows = (usage?.cnt as number) || 0;
-		let bytes = (usage?.total as number) || 0;
+		let bytes = this.attachmentUsageBytes();
 		const storable: ExtractedAttachment[] = [];
 		const dropped: DroppedAttachment[] = [];
 		for (const attachment of attachments) {
-			if (rows + 1 > maxRows) {
-				dropped.push({ filename: attachment.filename, reason: 'project_attachment_count' });
-				continue;
-			}
 			if (bytes + attachment.size > maxBytes) {
 				dropped.push({ filename: attachment.filename, reason: 'project_attachment_quota' });
 				continue;
 			}
 			storable.push(attachment);
-			rows += 1;
 			bytes += attachment.size;
 		}
 		return { storable, dropped };
@@ -1063,10 +1312,45 @@ export class ProjectState extends DurableObject<Env> {
 			return this.jsonResponse({ error: 'missing_issue_id' }, 400);
 		}
 
-		// Delete cascade handles events, stats, users
-		this.sql.exec('DELETE FROM issues WHERE id = ?', issueId);
+		// Collect blob keys/sizes before the cascade delete, then delete rows
+		// and decrement the usage counter in one transaction; blobs go after
+		// the commit (best-effort, GC backstop).
+		const doomed = this.sql
+			.exec(
+				`SELECT r2_key, size FROM attachments
+				 WHERE storage = 'r2' AND r2_key IS NOT NULL
+				   AND event_id IN (SELECT id FROM events WHERE issue_id = ?)`,
+				issueId,
+			)
+			.toArray();
+		const totalBytes = this.sumAttachmentBytes(
+			this.sql
+				.exec(
+					`SELECT COALESCE(SUM(size), 0) AS total FROM attachments
+					 WHERE event_id IN (SELECT id FROM events WHERE issue_id = ?)`,
+					issueId,
+				)
+				.toArray(),
+		);
+
+		this.ctx.storage.transactionSync(() => {
+			// Delete cascade handles events, stats, users
+			this.sql.exec('DELETE FROM issues WHERE id = ?', issueId);
+			this.seedAttachmentUsage();
+			this.sql.exec(
+				'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
+				totalBytes,
+			);
+		});
+
+		await this.deleteAttachmentBlobs(doomed.map((row) => row.r2_key as string));
 
 		return this.jsonResponse({ success: true });
+	}
+
+	/** Sum a `SELECT ... AS total` single-row result safely. */
+	private sumAttachmentBytes(rows: Array<Record<string, SqlStorageValue>>): number {
+		return rows.length > 0 ? Number(rows[0].total ?? 0) || 0 : 0;
 	}
 
 	private async handleBulkUpdateIssues(request: Request): Promise<Response> {
@@ -1095,8 +1379,40 @@ export class ProjectState extends DurableObject<Env> {
 		const placeholders = issueIds.map(() => '?').join(', ');
 
 		if (action === 'delete') {
-			const cursor = this.sql.exec(`DELETE FROM issues WHERE id IN (${placeholders})`, ...issueIds);
-			return this.jsonResponse({ success: true, affected: cursor.rowsWritten });
+			// Blob keys/sizes before the cascade, then transactional delete +
+			// usage decrement, then best-effort blob deletion after commit.
+			const doomed = this.sql
+				.exec(
+					`SELECT r2_key FROM attachments
+					 WHERE storage = 'r2' AND r2_key IS NOT NULL
+					   AND event_id IN (SELECT id FROM events WHERE issue_id IN (${placeholders}))`,
+					...issueIds,
+				)
+				.toArray();
+			const totalBytes = this.sumAttachmentBytes(
+				this.sql
+					.exec(
+						`SELECT COALESCE(SUM(size), 0) AS total FROM attachments
+						 WHERE event_id IN (SELECT id FROM events WHERE issue_id IN (${placeholders}))`,
+						...issueIds,
+					)
+					.toArray(),
+			);
+			let affected = 0;
+			this.ctx.storage.transactionSync(() => {
+				const cursor = this.sql.exec(
+					`DELETE FROM issues WHERE id IN (${placeholders})`,
+					...issueIds,
+				);
+				affected = cursor.rowsWritten;
+				this.seedAttachmentUsage();
+				this.sql.exec(
+					'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
+					totalBytes,
+				);
+			});
+			await this.deleteAttachmentBlobs(doomed.map((row) => row.r2_key as string));
+			return this.jsonResponse({ success: true, affected });
 		}
 
 		if (status) {
@@ -1203,7 +1519,7 @@ export class ProjectState extends DurableObject<Env> {
 		});
 	}
 
-	/** One attachment with payload data, for the authenticated download route. */
+	/** One attachment (metadata + payload location), for the download route. */
 	private async handleGetAttachment(request: Request): Promise<Response> {
 		const { attachmentId } = (await request.json()) as { attachmentId?: string };
 
@@ -1214,7 +1530,7 @@ export class ProjectState extends DurableObject<Env> {
 		// `.one()` throws on zero rows; a missing attachment is a 404, not a 500
 		const rows = this.sql
 			.exec(
-				`SELECT id, event_id, filename, content_type, size, data, created_at
+				`SELECT id, event_id, filename, content_type, size, data, created_at, storage, r2_key
 				 FROM attachments WHERE id = ?`,
 				attachmentId,
 			)
@@ -1225,6 +1541,8 @@ export class ProjectState extends DurableObject<Env> {
 		}
 
 		const row = rows[0];
+		const storage = (row.storage as string) ?? 'inline';
+		const isR2 = storage === 'r2' && typeof row.r2_key === 'string';
 		return this.jsonResponse({
 			attachment: {
 				id: row.id as string,
@@ -1232,8 +1550,12 @@ export class ProjectState extends DurableObject<Env> {
 				filename: row.filename as string,
 				contentType: (row.content_type as string) ?? 'text/plain',
 				size: row.size as number,
-				data: row.data as string,
 				createdAt: row.created_at as string,
+				// Dual-read: inline rows serve their stored payload (online,
+				// restartable migration); R2 rows point at the bucket.
+				...(isR2
+					? { storage: 'r2' as const, r2Key: row.r2_key as string }
+					: { storage: 'inline' as const, data: (row.data as string) ?? '' }),
 			},
 		});
 	}
@@ -1679,13 +2001,21 @@ export class ProjectState extends DurableObject<Env> {
 		return this.jsonResponse({ activity, nextCursor, hasMore });
 	}
 
+	/**
+	 * Schedule the next alarm as the earliest of: one hour from now (hourly
+	 * GC cadence, independent of retention settings), the next retention
+	 * candidate, the earliest pending snooze expiry, a purge-sweep retry,
+	 * and any alarm that is already scheduled (an earlier existing alarm is
+	 * never delayed). Clamped to the future.
+	 */
 	private async scheduleNextAlarm(): Promise<void> {
-		const candidates: number[] = [];
+		const now = Date.now();
+		const candidates: number[] = [now + ALARM_INTERVAL_MS];
 
 		// Consider retention schedule if enabled
 		const retentionDays = this.getRetentionDays();
 		if (retentionDays > 0) {
-			candidates.push(Date.now() + MS_PER_DAY);
+			candidates.push(now + MS_PER_DAY);
 		}
 
 		// Consider earliest pending snooze expiry
@@ -1701,9 +2031,19 @@ export class ProjectState extends DurableObject<Env> {
 			candidates.push(new Date(next).getTime());
 		}
 
-		if (candidates.length > 0) {
-			await this.ctx.storage.setAlarm(Math.min(...candidates));
+		// A purge sweep that could not complete retries soon
+		if (this.getConfigValue('purge_pending') === '1') {
+			candidates.push(now + PURGE_RETRY_MS);
 		}
+
+		// Never delay an earlier already-scheduled alarm
+		const current = await this.ctx.storage.getAlarm();
+		if (current !== null && current > now) {
+			candidates.push(current);
+		}
+
+		const target = Math.min(...candidates);
+		await this.ctx.storage.setAlarm(Math.max(now + 1000, target));
 	}
 
 	private async handleSnoozeIssue(request: Request): Promise<Response> {
@@ -2070,23 +2410,18 @@ export class ProjectState extends DurableObject<Env> {
 		const maxAttachmentBytes =
 			Number.parseInt(this.getConfigValue('max_attachment_total_bytes') || '', 10) ||
 			MAX_PROJECT_ATTACHMENT_BYTES;
-		const maxAttachmentRows =
-			Number.parseInt(this.getConfigValue('max_attachment_count') || '', 10) ||
-			MAX_PROJECT_ATTACHMENT_ROWS;
 		return this.jsonResponse({
 			config: {
 				maxEventsPerHour: Number.parseInt(maxEventsPerHour, 10),
 				maxAttachmentBytes,
-				maxAttachmentRows,
 			},
 		});
 	}
 
 	private async handleUpdateConfig(request: Request): Promise<Response> {
-		const { maxEventsPerHour, maxAttachmentBytes, maxAttachmentRows } = (await request.json()) as {
+		const { maxEventsPerHour, maxAttachmentBytes } = (await request.json()) as {
 			maxEventsPerHour?: number;
 			maxAttachmentBytes?: number;
-			maxAttachmentRows?: number;
 		};
 		if (maxEventsPerHour !== undefined) {
 			if (typeof maxEventsPerHour !== 'number' || maxEventsPerHour < 0) {
@@ -2113,20 +2448,13 @@ export class ProjectState extends DurableObject<Env> {
 			}
 			this.setConfigValue('max_attachment_total_bytes', String(maxAttachmentBytes));
 		}
-		if (maxAttachmentRows !== undefined) {
-			if (
-				typeof maxAttachmentRows !== 'number' ||
-				!Number.isInteger(maxAttachmentRows) ||
-				maxAttachmentRows <= 0
-			) {
-				return this.jsonResponse(
-					{ error: 'invalid_value', message: 'maxAttachmentRows must be a positive integer' },
-					400,
-				);
-			}
-			this.setConfigValue('max_attachment_count', String(maxAttachmentRows));
-		}
 		return this.handleGetConfig();
+	}
+
+	/** True when the project's hourly event quota is exhausted. */
+	private isRateLimited(): boolean {
+		const maxPerHour = Number.parseInt(this.getConfigValue('max_events_per_hour') || '0', 10);
+		return maxPerHour > 0 && this.currentRateCount() >= maxPerHour;
 	}
 
 	private handleRateLimitStatus(): Response {
@@ -2143,6 +2471,20 @@ export class ProjectState extends DurableObject<Env> {
 
 	async alarm(): Promise<void> {
 		await this.ensureSchema();
+
+		// A purge that could not finish its R2 sweep resumes here; while it
+		// is pending, no other maintenance runs (the state is going away).
+		if (this.getConfigValue('purge_pending') === '1') {
+			const complete = await this.runPurgeSweep(false);
+			if (!complete) {
+				await this.scheduleNextAlarm();
+				return;
+			}
+			await this.ctx.storage.deleteAll();
+			this.initialized = false;
+			return;
+		}
+
 		const now = new Date().toISOString();
 
 		// Un-snooze all issues whose snooze has expired
@@ -2156,38 +2498,210 @@ export class ProjectState extends DurableObject<Env> {
 		if (retentionDays > 0) {
 			const cutoffDate = new Date(Date.now() - retentionDays * MS_PER_DAY).toISOString();
 
-			// Delete old events
-			this.sql.exec('DELETE FROM events WHERE received_at < ?', cutoffDate);
-
-			// Delete old issue_stats buckets
-			this.sql.exec('DELETE FROM issue_stats WHERE bucket < ?', cutoffDate);
-
-			// Clean up issue_users whose last activity is before the cutoff
-			this.sql.exec('DELETE FROM issue_users WHERE last_seen < ?', cutoffDate);
-
-			// Recalculate issue counts from remaining events
-			this.sql.exec(`
-				UPDATE issues SET count = (
-					SELECT COUNT(*) FROM events WHERE events.issue_id = issues.id
+			// Attachment blobs of the events being deleted are collected
+			// BEFORE the cascade, inside the same transaction as the row
+			// deletes and the usage decrement.
+			const doomedRows = this.sql
+				.exec(
+					`SELECT r2_key FROM attachments
+					 WHERE storage = 'r2' AND r2_key IS NOT NULL
+					   AND event_id IN (SELECT id FROM events WHERE received_at < ?)`,
+					cutoffDate,
 				)
-			`);
+				.toArray();
+			const totalBytes = this.sumAttachmentBytes(
+				this.sql
+					.exec(
+						`SELECT COALESCE(SUM(size), 0) AS total FROM attachments
+						 WHERE event_id IN (SELECT id FROM events WHERE received_at < ?)`,
+						cutoffDate,
+					)
+					.toArray(),
+			);
 
-			// Recalculate user counts from remaining issue_users
-			this.sql.exec(`
-				UPDATE issues SET user_count = (
-					SELECT COUNT(*) FROM issue_users WHERE issue_users.issue_id = issues.id
-				)
-			`);
+			this.ctx.storage.transactionSync(() => {
+				// Delete old events (attachment rows cascade)
+				this.sql.exec('DELETE FROM events WHERE received_at < ?', cutoffDate);
 
-			// Delete issues with no remaining events
-			this.sql.exec('DELETE FROM issues WHERE count = 0');
+				// Delete old issue_stats buckets
+				this.sql.exec('DELETE FROM issue_stats WHERE bucket < ?', cutoffDate);
 
-			// Clean up orphaned issue_users for deleted issues
-			this.sql.exec('DELETE FROM issue_users WHERE issue_id NOT IN (SELECT id FROM issues)');
+				// Clean up issue_users whose last activity is before the cutoff
+				this.sql.exec('DELETE FROM issue_users WHERE last_seen < ?', cutoffDate);
+
+				// Recalculate issue counts from remaining events
+				this.sql.exec(`
+					UPDATE issues SET count = (
+						SELECT COUNT(*) FROM events WHERE events.issue_id = issues.id
+					)
+				`);
+
+				// Recalculate user counts from remaining issue_users
+				this.sql.exec(`
+					UPDATE issues SET user_count = (
+						SELECT COUNT(*) FROM issue_users WHERE issue_users.issue_id = issues.id
+					)
+				`);
+
+				// Delete issues with no remaining events
+				this.sql.exec('DELETE FROM issues WHERE count = 0');
+
+				// Clean up orphaned issue_users for deleted issues
+				this.sql.exec('DELETE FROM issue_users WHERE issue_id NOT IN (SELECT id FROM issues)');
+
+				this.seedAttachmentUsage();
+				this.sql.exec(
+					'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
+					totalBytes,
+				);
+			});
+
+			await this.deleteAttachmentBlobs(doomedRows.map((row) => row.r2_key as string));
 		}
 
-		// Schedule next alarm (earliest of next retention run or next snooze expiry)
+		// Correct usage-counter drift from SUM(size) at most once per day
+		this.maybeRecomputeAttachmentUsage();
+
+		// Reclaim orphaned blobs (uploaded but never committed by any row)
+		await this.runGcSweep();
+
+		// Migrate legacy inline attachment payloads to R2 (online, restartable)
+		await this.migrateInlineAttachments();
+
+		// Schedule next alarm (earliest of next retention run, next snooze
+		// expiry, or the hourly GC cadence floor)
 		await this.scheduleNextAlarm();
+	}
+
+	/**
+	 * Recompute the usage counter from `SUM(size)` at most once per alarm-day
+	 * (gated by a `project_config` timestamp) to correct drift.
+	 */
+	private maybeRecomputeAttachmentUsage(): void {
+		const last = Number(this.getConfigValue('attachment_usage_recomputed_at') || '0');
+		const now = Date.now();
+		if (Number.isFinite(last) && now - last < MS_PER_DAY) {
+			return;
+		}
+		this.setConfigValue('attachment_usage_recomputed_at', String(now));
+		this.seedAttachmentUsage();
+		this.sql.exec(
+			'UPDATE attachment_usage SET bytes = (SELECT COALESCE(SUM(size), 0) FROM attachments) WHERE id = 1',
+		);
+	}
+
+	/**
+	 * GC (orphan sweep): list the project prefix page by page (continuation
+	 * cursor persisted across runs, so the whole prefix is scanned over
+	 * multiple hourly runs regardless of live object count), deleting objects
+	 * past the 1-hour grace whose key has no `attachments.r2_key` match
+	 * (indexed point lookup). Bounded per run by max 10,000 objects or a
+	 * 30-second time budget, whichever comes first. The reclaim window for a
+	 * fresh orphan therefore scales with live object count (~10k objects per
+	 * hour): roughly 4 hours at ~40k live objects, 1–2 days near the 10 GiB
+	 * budget with ~100 KiB blobs.
+	 */
+	private async runGcSweep(): Promise<void> {
+		const projectId = this.getProjectId();
+		if (!projectId) return; // no prefix can exist without a persisted id
+
+		const store = createAttachmentStore(this.env, null);
+		const prefix = projectPrefix(projectId);
+		const deadline = Date.now() + GC_TIME_BUDGET_MS;
+		const now = Date.now();
+		let cursor: string | null = this.getConfigValue('gc_cursor') || null;
+		let scanned = 0;
+		const doomed: string[] = [];
+
+		try {
+			for (;;) {
+				const page = await store.listPage(prefix, cursor);
+				scanned += page.objects.length;
+				for (const object of page.objects) {
+					if (now - object.uploaded.getTime() <= GC_GRACE_MS) continue;
+					const referenced = this.sql
+						.exec('SELECT 1 FROM attachments WHERE r2_key = ?', object.key)
+						.toArray();
+					if (referenced.length === 0) {
+						doomed.push(object.key);
+					}
+				}
+				cursor = page.cursor;
+				if (!cursor || scanned >= GC_MAX_OBJECTS || Date.now() > deadline) break;
+			}
+			this.setConfigValue('gc_cursor', cursor ?? '');
+		} catch (error) {
+			// Cursor stays persisted for the next run
+			console.error(
+				'GC sweep incomplete; will resume:',
+				error instanceof Error ? error.message.slice(0, 120) : 'unknown',
+			);
+		}
+
+		if (doomed.length > 0) {
+			await this.deleteAttachmentBlobs(doomed);
+		}
+	}
+
+	/**
+	 * Migrate legacy inline attachment payloads to R2: upload each row's
+	 * `data` to its deterministic `m/{attachmentId}` key, then flip
+	 * conditionally — zero rows changed means the row was deleted mid-flight
+	 * (a fetch can interleave during the upload await), so the just-uploaded
+	 * blob is deleted. Reads dual-read meanwhile, so migration is online and
+	 * restartable: a crash between upload and flip leaves the row inline and
+	 * the next run re-uploads the same deterministic key. Byte-neutral for
+	 * the usage counter.
+	 */
+	private async migrateInlineAttachments(): Promise<void> {
+		const projectId = this.getProjectId();
+		if (!projectId) return; // inline rows keep serving; no prefix to use
+
+		const rows = this.sql
+			.exec(
+				`SELECT id, data FROM attachments
+				 WHERE storage = 'inline' AND data != ''
+				 ORDER BY rowid LIMIT ${MIGRATION_BATCH}`,
+			)
+			.toArray();
+		if (rows.length === 0) return;
+
+		// One-shot test fault (armed via the internal route; alarms carry no
+		// headers): force the first row's flip to miss, exercising the
+		// delete-during-put cleanup branch deterministically.
+		let forceFlipMiss = false;
+		if (this.getConfigValue('migration_flip_fault') === '1') {
+			forceFlipMiss = true;
+			this.setConfigValue('migration_flip_fault', '');
+		}
+
+		const store = createAttachmentStore(this.env, null);
+		const encoder = new TextEncoder();
+		for (const row of rows) {
+			const id = row.id as string;
+			const data = row.data as string;
+			const key = migrationKey(projectId, id);
+			await store.uploadAttachment(key, encoder.encode(data), data.length);
+			let flipped = false;
+			if (forceFlipMiss) {
+				// Simulated delete-during-put: the row vanished between the
+				// SELECT and the flip — do not touch it, just remove the
+				// just-uploaded blob.
+				forceFlipMiss = false;
+			} else {
+				const cursor = this.sql.exec(
+					`UPDATE attachments SET r2_key = ?, storage = 'r2', data = ''
+					 WHERE id = ? AND storage = 'inline'`,
+					key,
+					id,
+				);
+				flipped = cursor.rowsWritten > 0;
+			}
+			if (!flipped) {
+				// Row was deleted between SELECT and flip: remove the blob.
+				await this.deleteAttachmentBlobs([key]);
+			}
+		}
 	}
 
 	private getRetentionDays(): number {

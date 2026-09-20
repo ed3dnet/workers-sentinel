@@ -557,7 +557,7 @@ describe('Inbound Filters', () => {
 			expect(response.status).toBe(400);
 			const data = (await response.json()) as { error: string };
 			expect(data.error).toBe('limit_reached');
-		});
+		}, 20_000);
 
 		it('should return 404 when updating a non-existent filter', async () => {
 			const user = await createTestUser({

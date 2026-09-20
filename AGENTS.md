@@ -56,7 +56,7 @@ Two SQLite-backed Durable Objects handle all state:
 - All requests go through `http://internal/*` fetch pattern
 
 **ProjectState** (per-project, named by project ID):
-- `issues`, `events`, `issue_stats`, `issue_users` tables
+- `issues`, `events`, `issue_stats`, `issue_users` tables; `attachments` holds only ~200-byte metadata rows (payloads live in R2 under `p/{projectId}/…` keys)
 - Handles event ingestion, issue grouping, statistics
 - Each project has isolated storage
 
@@ -72,10 +72,12 @@ Dashboard  → /api/auth/* (public) → AuthState
 
 ### Key Modules
 
-- `lib/envelope-parser.ts` - Parses the Sentry envelope format (byte-level framing with per-slice strict decoding; extracts text attachments)
+- `lib/envelope-framer.ts` - Incremental Sentry envelope framing state machine: feed decompressed chunks, get envelope/item header and payload-chunk events. One framing implementation shared by the streaming ingest route and the `parseEnvelope` collector.
+- `lib/envelope-parser.ts` - `parseEnvelope` (collector over the framer), DSN/auth-header parsing, event sanitization
+- `lib/attachment-store.ts` - R2 storage contract: key layout (`p/{projectId}/u/{nonce}/{index}` uploads, `p/{projectId}/m/{attachmentId}` migrated rows), all ingestion caps, the per-request store factory, and the test-only fault-injection vocabulary
 - `lib/fingerprint.ts` - Groups events into issues using exception type + message + stack frames
-- `routes/ingestion.ts` - SDK endpoint, supports `?sentry_key=` and `X-Sentry-Auth` header; forwards event + attachments atomically to ProjectState
-- `routes/attachments.ts` - Fetch-side attachment list + download endpoints (session/API-token auth)
+- `routes/ingestion.ts` - SDK endpoint, supports `?sentry_key=` and `X-Sentry-Auth` header; streams the request body end-to-end (never buffers whole envelopes), uploads attachment payloads to R2 as they arrive, decides envelope attachment cardinality in the worker, and forwards event + attachment metadata atomically to ProjectState
+- `routes/attachments.ts` - Fetch-side attachment list + download endpoints (session/API-token auth; downloads stream from R2 with `Range` support)
 
 ### DSN Format
 
@@ -121,28 +123,30 @@ List endpoints that paginate use keyset pagination:
 - `GET /api/projects/:slug/events/latest?limit=` — most recent events across the project.
 - `GET /api/projects/:slug/events/:eventId` — full stored event JSON.
 - `GET /api/projects/:slug/events/:eventId/attachments` — attachment metadata for one event (no payload): `{ issueId, attachments: [{ id, eventId, filename, contentType, size, createdAt }] }`.
-- `GET /api/projects/:slug/attachments/:attachmentId` — download: raw attachment text with the stored `Content-Type` and a sanitized `Content-Disposition: attachment` header (ASCII-safe quoted `filename` plus RFC 5987 `filename*` for non-ASCII names).
+- `GET /api/projects/:slug/attachments/:attachmentId` — download: raw attachment bytes with the stored `Content-Type` and a sanitized `Content-Disposition: attachment` header (ASCII-safe quoted `filename` plus RFC 5987 `filename*` for non-ASCII names). Binary payloads stream from R2; single-range `Range` requests return `206` with `Content-Range`, unsatisfiable ranges return `416`, and metadata whose blob is missing returns `404 {"error":"attachment_data_missing"}`.
 - Also available: `/:slug/summary`, `/:slug/stats`, `/:slug/tags`, `/:slug/tags/:key/values`, `/:slug/environments`, `/:slug/releases[/:version]`, `/:slug/issues/:issueId/comments|activity`, `/:slug/members`, `/:slug/settings`, `/:slug/rate-limit`, `/:slug/filters`, `/:slug/sourcemaps`.
 
 ### Attachments (ingested)
 
-Envelopes may carry `attachment` items (text only — see limitations). Per envelope: ≤10 attachments, each ≤100 KiB UTF-8 bytes, filename ≤200 chars, content type ≤100 chars. Ingestion responses include `droppedAttachments: [{ filename, reason }]` reporting anything not stored; an empty array means everything landed. Full drop-reason vocabulary:
+Envelopes may carry `attachment` items — **binary is supported**. Attachment payloads live in R2 (the `ATTACHMENTS` bucket binding, key layout `p/{projectId}/u/{nonce}/{index}` for fresh uploads and `p/{projectId}/m/{attachmentId}` for rows migrated from legacy inline storage); ProjectState keeps only ~200-byte metadata rows. Attachment items **SHOULD declare `length`**: length-less payloads are newline-delimited by protocol, so binary without `length` truncates at the first newline (deterministic 400/misparse) and is capped at 1 MiB.
+
+Per envelope: ≤10 attachments, total attachment payload ≤21 MiB measured on the **bytes as received/stored** (exact: 22,020,096). A client that zstd-compresses individual payloads is bounded on the compressed bytes it sends — the server stores and serves those bytes **verbatim** (no server-side zstd decode; consumers detect compression via the stored content type, e.g. `application/zstd`). Filename ≤200 chars, content type ≤100 chars. Ingestion responses include `droppedAttachments: [{ filename, reason }]`; an empty array means everything landed. Full drop-reason vocabulary:
 
 | Reason | Meaning |
 |---|---|
-| `too_large` | attachment payload >100 KiB |
+| `too_large` | attachment payload would exceed the 21 MiB per-envelope budget (as received) |
 | `too_many` | >10 attachments in one envelope |
-| `binary_unsupported` | payload is not valid UTF-8 text |
 | `no_unique_event` | envelope had zero or multiple events — no unambiguous owner |
 | `event_filtered` | the associated event was dropped by an inbound filter |
-| `project_attachment_quota` | per-project attachment bytes (64 MiB) would be exceeded |
-| `project_attachment_count` | per-project attachment row cap (10,000) would be exceeded |
+| `project_attachment_quota` | per-project attachment bytes (10 GiB default) would be exceeded |
 
-Budgets bound attachment **rows/payload**, not physical database size — an over-budget project still accepts events, dropping only the new attachments, and never auto-deletes existing data; deleting events/issues reclaims both budgets. Defaults (64 MiB bytes / 10,000 rows) are per-project tunable by owners/admins via `PATCH /api/projects/:slug` with `maxAttachmentBytes` / `maxAttachmentRows`.
+Request-body limits: wire (pre-decompression) body ≤27 MiB — sized so a fully budget-compliant envelope sent **uncompressed** (21 MiB attachments + 5 MiB of event/transaction payloads + framing) is never wire-rejected; decompressed body ≤64 MiB hard ceiling counting every byte (kept payloads, drained/oversized discarded attachments, and separator junk alike); envelope-header and item-header lines each ≤64 KiB. Over-wire/over-decompressed → `413`; framing/UTF-8/JSON violations → `400`; gzip stream errors mid-body → `400`.
 
-Attachment lifecycle follows its event via cascade: retention pruning, issue deletion (single/bulk), merges (attachments stay downloadable under the surviving issue), and project purge all remove them with no orphan path.
+If the R2 bucket itself fails during an attachment upload, the whole envelope fails with `503 {"error":"attachment_storage_failed"}` + `Retry-After: 5` — no event and no metadata are stored, and blobs already uploaded for earlier items are reclaimed by GC. **Retry behavior is client/transport-dependent**: the official sentry-javascript transports make one attempt and log non-2xx responses without auto-resending, so attachment-bearing events sent during an R2 outage may be dropped client-side unless the client's transport retries.
 
-**Limitation:** binary attachments are out of scope — stored data is UTF-8 text. A binary item in a mixed envelope drops with `binary_unsupported` while the event still stores.
+The byte budget (default 10 GiB, tunable per project by owners/admins via `PATCH /api/projects/:slug` with `maxAttachmentBytes`; a very large value ≈ unlimited) bounds **R2 usage**, not the Durable Object — there is no row cap. An over-budget project still accepts events, dropping only the new attachments, and never auto-deletes existing data; deleting events/issues reclaims the budget. A persisted usage counter (seeded idempotently, recomputed from `SUM(size)` at most daily by the DO alarm) enforces it.
+
+Attachment lifecycle follows its event via cascade: retention pruning, issue deletion (single/bulk), merges (attachments stay downloadable under the surviving issue), and project purge all remove blobs as well as metadata rows. There is no cross-service transaction between DO SQLite and R2: blobs upload before metadata commits, so a brief window exists where a listed attachment 404s its blob, and orphaned blobs (uploaded but never committed — e.g. duplicate resends, filtered events, aborted envelopes) are reclaimed by an hourly GC sweep after a 1-hour grace. The reclaim window scales with live object count (~10k objects scanned per hour: roughly 4 hours at ~40k live objects, 1–2 days near the 10 GiB budget with ~100 KiB blobs).
 
 ### Event IDs
 
@@ -171,9 +175,10 @@ Full remediation of the findings in `security-analysis/reports/` (see INDEX.md).
 - **Accounts**: admin can disable/enable users (`PATCH /api/admin/users/:id`) — disables kill sessions and return uniform login errors (no disable oracle).
 - **CORS**: same-origin by default; cross-origin dashboard API access only for origins in the `CORS_ORIGINS` env (comma-separated). Only SDK ingestion endpoints (`/:projectId/envelope|store|security`) serve wildcard CORS — without credentials.
 - **Headers/CSP**: hardening headers on all worker responses + strict CSP and friends via `packages/dashboard/public/_headers` for asset-served pages (the assets layer bypasses the worker for non-`run_worker_first` paths).
-- **Ingestion**: 1MiB compressed / 5MiB decompressed caps (gzip bombs rejected), ≤20 envelope items, strict malformed-item handling; `sanitizeEvent` validates/replaces client-controlled `event_id`/`timestamp`/`level`, truncates fields, caps tag/frame/breadcrumb cardinality (applied inside ProjectState so RPC ingestion is covered); duplicate `event_id` is an idempotent no-op, not a 500.
+- **Ingestion**: streaming body parse with 27MiB wire / 64MiB decompressed caps (gzip bombs rejected), ≤20 envelope items, ≤64KiB header lines, strict malformed-item handling; attachment payloads stream to R2 under per-request nonce keys (21MiB/envelope budget, 10 GiB/project default) with storage failures surfaced as 503 and orphaned blobs reclaimed by an hourly GC sweep; `sanitizeEvent` validates/replaces client-controlled `event_id`/`timestamp`/`level`, truncates fields, caps tag/frame/breadcrumb cardinality (applied inside ProjectState so RPC ingestion is covered); duplicate `event_id` is an idempotent no-op, not a 500.
 - **Redaction**: `authorization`/`cookie`/`set-cookie`/`x-api-key`/etc. request headers, cookies, env dicts and secret-ish query params are scrubbed before storage; per-project `scrubHeaders` via `PATCH /api/projects/:slug` (owner/admin); `GET /api/{projectId}/security` reflects the real config.
-- **Tenancy**: project security config (retentionDays, maxEventsPerHour, scrubHeaders, webhookUrl) and inbound filters require owner/admin; project deletion purges the ProjectState DO entirely (`storage.deleteAll`); `get-project` has no unscoped branch.
+- **Tenancy**: project security config (retentionDays, maxEventsPerHour, scrubHeaders, webhookUrl) and inbound filters require owner/admin; project deletion purges the ProjectState DO entirely (R2 blobs swept first — the purge retries on the DO alarm if the sweep cannot finish, and ingests are rejected with 503 while it is pending); `get-project` has no unscoped branch.
+- **Attachment storage**: blobs live in the project's own R2 key prefix (`p/{projectId}/…`); upload keys embed a per-request random nonce (unguessable but not treated as secret); downloads remain membership-gated through the worker, which checks project access before any bucket read.
 - **Storage/DoS**: all list endpoints clamp `limit` (1..100; negative fell through to SQLite `LIMIT -1` = unlimited); sourcemap uploads capped 5MiB/200-per-project; merge lists capped at 100; stats bucket by server receipt time (client timestamps can no longer outlive retention); fingerprints use SHA-256, not 32-bit djb2.
 - **Webhooks**: https-only, no credentials-in-URL, private/loopback hosts rejected, redirects refused, 10s timeout, target response bodies never logged; webhook URLs hidden from plain members.
 - **Route hygiene**: `/api/projects/:slug/events/latest` registered before `/:eventId` (was shadowed); auth header parsing case-insensitive and trim-tolerant; attacker-controlled content is not logged.
@@ -182,7 +187,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 248 across 30 files (`just test`). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 285 across 33 files (`just test`) + 10 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 

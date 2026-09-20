@@ -196,55 +196,7 @@ describe('Attachments', () => {
 		expect(list.attachments[1].contentType).toBe('application/json');
 	});
 
-	it('drop reasons: too_large / too_many / binary_unsupported / no_unique_event / event_filtered / project_attachment_quota / project_attachment_count', async () => {
-		// too_large: byte length over 100 KiB (plain ASCII and the multibyte
-		// case where UTF-16 length stays under the byte cap)
-		{
-			const project = await createTestProject(testUser.token!, {
-				name: `Drop Big ${Date.now()}`,
-			});
-			const eventId = crypto.randomUUID().replace(/-/g, '');
-			const result = await postEnvelope(
-				project,
-				envelopeBytes([
-					envelopeHeader(project, eventId),
-					'\n',
-					...eventItem(baseEvent(eventId, 'too large ascii')),
-					...attachmentItem('big.txt', 'a'.repeat(100 * 1024 + 1)),
-				]),
-			);
-			expect(result.status).toBe(200);
-			expect(result.data.droppedAttachments).toEqual([
-				{ filename: 'big.txt', reason: 'too_large' },
-			]);
-			// Event still stored
-			const event = await authFetch(
-				testUser.token!,
-				`http://localhost/api/projects/${project.slug}/events/${eventId}`,
-			);
-			expect(event.status).toBe(200);
-		}
-		{
-			const project = await createTestProject(testUser.token!, {
-				name: `Drop Big Uni ${Date.now()}`,
-			});
-			const eventId = crypto.randomUUID().replace(/-/g, '');
-			const multibyte = '🛡️'.repeat(26_000); // 26k UTF-16 units, 104k UTF-8 bytes
-			const result = await postEnvelope(
-				project,
-				envelopeBytes([
-					envelopeHeader(project, eventId),
-					'\n',
-					...eventItem(baseEvent(eventId, 'too large multibyte')),
-					...attachmentItem('uni.txt', multibyte),
-				]),
-			);
-			expect(result.status).toBe(200);
-			expect(result.data.droppedAttachments).toEqual([
-				{ filename: 'uni.txt', reason: 'too_large' },
-			]);
-		}
-
+	it('drop reasons: too_many / no_unique_event / event_filtered / project_attachment_quota', async () => {
 		// too_many: the 11th attachment drops, the first ten store
 		{
 			const project = await createTestProject(testUser.token!, {
@@ -266,33 +218,6 @@ describe('Attachments', () => {
 			]);
 			const list = await listAttachments(testUser.token!, project.slug, eventId);
 			expect(list.attachments).toHaveLength(10);
-		}
-
-		// binary_unsupported: invalid UTF-8 payload drops, the event in the
-		// same mixed envelope still stores
-		{
-			const project = await createTestProject(testUser.token!, {
-				name: `Drop Bin ${Date.now()}`,
-			});
-			const eventId = crypto.randomUUID().replace(/-/g, '');
-			const binary = new Uint8Array([0x68, 0x65, 0x6c, 0x6c, 0x6f, 0xff, 0xfe, 0x00, 0x80]);
-			const result = await postEnvelope(
-				project,
-				envelopeBytes([
-					envelopeHeader(project, eventId),
-					'\n',
-					...eventItem(baseEvent(eventId, 'mixed binary envelope')),
-					...attachmentItem('screenshot.png', binary, 'image/png'),
-					...attachmentItem('notes.txt', 'kept'),
-				]),
-			);
-			expect(result.status).toBe(200);
-			expect(result.data.droppedAttachments).toEqual([
-				{ filename: 'screenshot.png', reason: 'binary_unsupported' },
-			]);
-			const list = await listAttachments(testUser.token!, project.slug, eventId);
-			expect(list.attachments).toHaveLength(1);
-			expect(list.attachments[0].filename).toBe('notes.txt');
 		}
 
 		// no_unique_event: envelope with two events cannot associate the
@@ -363,8 +288,8 @@ describe('Attachments', () => {
 			expect(list.status).toBe(404);
 		}
 
-		// project_attachment_quota / project_attachment_count: per-project
-		// budgets drop non-fatally and never touch stored data
+		// project_attachment_quota: per-project byte budget drops
+		// non-fatally and never touches stored data
 		{
 			const project = await createTestProject(testUser.token!, {
 				name: `Drop Quota ${Date.now()}`,
@@ -412,38 +337,6 @@ describe('Attachments', () => {
 			);
 			expect(new TextDecoder().decode(download.bytes!)).toBe('12345');
 		}
-		{
-			const project = await createTestProject(testUser.token!, {
-				name: `Drop Count ${Date.now()}`,
-			});
-			await setProjectConfig(testUser.token!, project.slug, { maxAttachmentRows: 1 });
-
-			const firstId = crypto.randomUUID().replace(/-/g, '');
-			await postEnvelope(
-				project,
-				envelopeBytes([
-					envelopeHeader(project, firstId),
-					'\n',
-					...eventItem(baseEvent(firstId, 'count first')),
-					// Zero-byte attachment: consumes a row, no bytes
-					...attachmentItem('zero.txt', ''),
-				]),
-			);
-			const secondId = crypto.randomUUID().replace(/-/g, '');
-			const second = await postEnvelope(
-				project,
-				envelopeBytes([
-					envelopeHeader(project, secondId),
-					'\n',
-					...eventItem(baseEvent(secondId, 'count second')),
-					...attachmentItem('over-row-cap.txt', ''),
-				]),
-			);
-			expect(second.status).toBe(200);
-			expect(second.data.droppedAttachments).toEqual([
-				{ filename: 'over-row-cap.txt', reason: 'project_attachment_count' },
-			]);
-		}
 	});
 
 	it('budget boundaries: exact-limit accepted, over-limit dropped with reason, event still stored, existing attachments untouched', async () => {
@@ -485,33 +378,6 @@ describe('Attachments', () => {
 			`http://localhost/api/projects/${project.slug}/events/${overId}`,
 		);
 		expect(overEvent.status).toBe(200);
-
-		// Row boundary: exact rows accepted, next row dropped
-		await setProjectConfig(testUser.token!, project.slug, { maxAttachmentRows: 2 });
-		const rowExactId = crypto.randomUUID().replace(/-/g, '');
-		const rowExact = await postEnvelope(
-			project,
-			envelopeBytes([
-				envelopeHeader(project, rowExactId),
-				'\n',
-				...eventItem(baseEvent(rowExactId, 'row exact')),
-				...attachmentItem('row-a.txt', ''),
-			]),
-		);
-		expect(rowExact.data.droppedAttachments).toEqual([]);
-		const rowOverId = crypto.randomUUID().replace(/-/g, '');
-		const rowOver = await postEnvelope(
-			project,
-			envelopeBytes([
-				envelopeHeader(project, rowOverId),
-				'\n',
-				...eventItem(baseEvent(rowOverId, 'row over')),
-				...attachmentItem('row-b.txt', ''),
-			]),
-		);
-		expect(rowOver.data.droppedAttachments).toEqual([
-			{ filename: 'row-b.txt', reason: 'project_attachment_count' },
-		]);
 	});
 
 	it('replay does not increase attachment count', async () => {
@@ -741,13 +607,12 @@ describe('Attachments', () => {
 		expect(download.status).toBe(404);
 	});
 
-	it('quota reclamation: deletion frees byte+row budget', async () => {
+	it('quota reclamation: deletion frees byte budget', async () => {
 		const project = await createTestProject(testUser.token!, {
 			name: `Reclaim ${Date.now()}`,
 		});
 		await setProjectConfig(testUser.token!, project.slug, {
 			maxAttachmentBytes: 10,
-			maxAttachmentRows: 1,
 		});
 
 		const firstId = crypto.randomUUID().replace(/-/g, '');
@@ -761,7 +626,7 @@ describe('Attachments', () => {
 			]),
 		);
 
-		// Both budgets are exhausted for new attachments
+		// The budget is exhausted for new attachments
 		const blockedId = crypto.randomUUID().replace(/-/g, '');
 		const blocked = await postEnvelope(
 			project,
@@ -769,14 +634,14 @@ describe('Attachments', () => {
 				envelopeHeader(project, blockedId),
 				'\n',
 				...eventItem(baseEvent(blockedId, 'reclaim blocked')),
-				...attachmentItem('blocked.txt', ''),
+				...attachmentItem('blocked.txt', 'x'),
 			]),
 		);
 		expect(blocked.data.droppedAttachments).toEqual([
-			{ filename: 'blocked.txt', reason: 'project_attachment_count' },
+			{ filename: 'blocked.txt', reason: 'project_attachment_quota' },
 		]);
 
-		// Deleting the issue that owns the stored attachment reclaims row and
+		// Deleting the issue that owns the stored attachment reclaims the
 		// byte budget (the two events fingerprint to separate issues)
 		const firstEvent = await authFetch(
 			testUser.token!,

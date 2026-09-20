@@ -152,7 +152,6 @@ projectRoutes.patch('/:slug', async (c) => {
 		retentionDays?: number;
 		scrubHeaders?: string[];
 		maxAttachmentBytes?: number;
-		maxAttachmentRows?: number;
 	}>();
 
 	if (
@@ -160,8 +159,7 @@ projectRoutes.patch('/:slug', async (c) => {
 		body.maxEventsPerHour === undefined &&
 		body.retentionDays === undefined &&
 		body.scrubHeaders === undefined &&
-		body.maxAttachmentBytes === undefined &&
-		body.maxAttachmentRows === undefined
+		body.maxAttachmentBytes === undefined
 	) {
 		return c.json({ error: 'no_updates', message: 'No fields to update were provided' }, 400);
 	}
@@ -189,14 +187,13 @@ projectRoutes.patch('/:slug', async (c) => {
 	};
 
 	// Security-relevant project config (rate limits, retention, scrubbing,
-	// attachment budgets) requires owner/admin, mirroring the webhookUrl gate
+	// attachment budget) requires owner/admin, mirroring the webhookUrl gate
 	// in AuthState.
 	if (
 		body.maxEventsPerHour !== undefined ||
 		body.retentionDays !== undefined ||
 		body.scrubHeaders !== undefined ||
-		body.maxAttachmentBytes !== undefined ||
-		body.maxAttachmentRows !== undefined
+		body.maxAttachmentBytes !== undefined
 	) {
 		if (projectData.memberRole !== 'owner' && projectData.memberRole !== 'admin') {
 			return c.json(
@@ -255,7 +252,7 @@ projectRoutes.patch('/:slug', async (c) => {
 	}
 
 	// Update attachment budget config in ProjectState if provided
-	if (body.maxAttachmentBytes !== undefined || body.maxAttachmentRows !== undefined) {
+	if (body.maxAttachmentBytes !== undefined) {
 		const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
 		const projectState = c.env.PROJECT_STATE.get(projectStateId);
 
@@ -265,7 +262,6 @@ projectRoutes.patch('/:slug', async (c) => {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					maxAttachmentBytes: body.maxAttachmentBytes,
-					maxAttachmentRows: body.maxAttachmentRows,
 				}),
 			}),
 		);
@@ -447,10 +443,25 @@ projectRoutes.delete('/:slug', async (c) => {
 	}
 
 	// Purge the ProjectState Durable Object so events, source maps, comments
-	// and stats do not outlive the deleted project
+	// and stats do not outlive the deleted project. The DO sweeps the R2
+	// attachment prefix first (saga; retries on its alarm if the sweep
+	// cannot finish) and only then wipes its own state. Under the test
+	// fault-injection binding, a `purge-sweep` fault header is forwarded so
+	// tests can exercise the sweep-retry path; inert in production.
+	const purgeFault =
+		c.env.ATTACHMENT_FAULT_INJECTION === 'enabled' &&
+		c.req.header('X-Sentinel-Test-Fault') === 'purge-sweep'
+			? { fault: 'purge-sweep' as const }
+			: {};
 	const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
 	const projectState = c.env.PROJECT_STATE.get(projectStateId);
-	await projectState.fetch(new Request('http://internal/purge', { method: 'POST' }));
+	await projectState.fetch(
+		new Request('http://internal/purge', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ projectId: projectData.project.id, ...purgeFault }),
+		}),
+	);
 
 	const data = await deleteResponse.json();
 	return c.json(data, deleteResponse.status as ContentfulStatusCode);

@@ -14,7 +14,14 @@ export default defineWorkersConfig({
 				main: './test/entry.ts',
 				wrangler: { configPath: './wrangler.jsonc' },
 				miniflare: {
-					bindings: { SETUP_TOKEN: 'test-setup-token' },
+					bindings: {
+						SETUP_TOKEN: 'test-setup-token',
+						// Test-only fault-injection switch: enables the
+						// X-Sentinel-Test-Fault header and internal fault
+						// markers. Never bound in wrangler.jsonc, so the
+						// mechanism is inert in dev/prod/integration runs.
+						ATTACHMENT_FAULT_INJECTION: 'enabled',
+					},
 				},
 			},
 		},
