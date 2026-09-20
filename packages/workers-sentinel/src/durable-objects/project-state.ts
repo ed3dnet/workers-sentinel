@@ -2617,9 +2617,34 @@ export class ProjectState extends DurableObject<Env> {
 
 		// One summary line per alarm run: this path has no API surface, so
 		// the log is the only way to see GC/migration liveness in production.
+		const projectId = this.getProjectId();
+		const inlineRows = projectId
+			? (this.sql
+					.exec(
+						`SELECT COUNT(*) AS n,
+						        COALESCE(SUM(storage IS NOT 'r2' AND data != ''), 0) AS eligible,
+						        COALESCE(SUM(storage IS NULL), 0) AS nullStorage
+						 FROM attachments`,
+					)
+					.one() as { n: number; eligible: number; nullStorage?: number } | undefined)
+			: undefined;
+		const sample = projectId
+			? this.sql
+					.exec(
+						`SELECT id, storage, r2_key, length(data) AS dataLen FROM attachments
+						 WHERE storage IS NOT 'r2' OR data != '' ORDER BY rowid LIMIT 3`,
+					)
+					.toArray()
+					.map((r) => `${r.id}|${r.storage ?? 'NULL'}|${r.r2_key ?? '-'}|${r.dataLen}`)
+			: [];
 		console.log(
 			`ProjectState alarm: gcRemoved=${gcRemoved} migratedInline=${migrated}` +
-				(retentionDays > 0 ? ' retention=ran' : ''),
+				(retentionDays > 0 ? ' retention=ran' : '') +
+				` projectId=${projectId ? 'set' : 'MISSING'}` +
+				(inlineRows
+					? ` attachmentRows=${inlineRows.n} eligibleInline=${inlineRows.eligible} nullStorage=${inlineRows.nullStorage ?? 0}`
+					: '') +
+				` sample=[${sample.join(' ; ')}]`,
 		);
 
 		// The alarm wrapper reschedules (earliest of next retention run,
@@ -2712,10 +2737,16 @@ export class ProjectState extends DurableObject<Env> {
 		const projectId = this.getProjectId();
 		if (!projectId) return 0; // inline rows keep serving; no prefix to use
 
+		// NULL-safe eligibility: pre-upgrade rows can carry a NULL `storage`
+		// (the ADD COLUMN DEFAULT does not materialize for rows that existed
+		// before the migration on real deployments) — `= 'inline'` would
+		// never match them, and the flip's zero-row miss would then delete
+		// the just-uploaded blob. Anything not already 'r2' with data is
+		// migratable.
 		const rows = this.sql
 			.exec(
 				`SELECT id, data FROM attachments
-				 WHERE storage = 'inline' AND data != ''
+				 WHERE storage IS NOT 'r2' AND data != ''
 				 ORDER BY rowid LIMIT ${MIGRATION_BATCH}`,
 			)
 			.toArray();
@@ -2747,7 +2778,7 @@ export class ProjectState extends DurableObject<Env> {
 			} else {
 				const cursor = this.sql.exec(
 					`UPDATE attachments SET r2_key = ?, storage = 'r2', data = ''
-					 WHERE id = ? AND storage = 'inline'`,
+					 WHERE id = ? AND storage IS NOT 'r2'`,
 					key,
 					id,
 				);
