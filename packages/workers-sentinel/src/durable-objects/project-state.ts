@@ -307,16 +307,20 @@ export class ProjectState extends DurableObject<Env> {
 		this.sql.exec('CREATE INDEX IF NOT EXISTS idx_attachments_r2_key ON attachments(r2_key)');
 		this.warmRateLimitCounter();
 		this.initialized = true;
-
-		// Schedule alarm if none exists (retention or pending snoozes)
-		const alarm = await this.ctx.storage.getAlarm();
-		if (!alarm) {
-			await this.scheduleNextAlarm();
-		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
 		await this.ensureSchema();
+
+		// Alarm liveness guarantee, independent of isolate warmth: a fired
+		// alarm that failed (and exhausted its retries) leaves nothing
+		// scheduled, and ensureSchema early-returns on warm isolates — so
+		// GC/migration/purge-retry coverage is re-armed on every request.
+		// (Cheap: one getAlarm storage read; scheduleNextAlarm never delays
+		// an earlier existing alarm.)
+		if ((await this.ctx.storage.getAlarm()) === null) {
+			await this.scheduleNextAlarm();
+		}
 
 		const url = new URL(request.url);
 		const path = url.pathname;
@@ -2491,7 +2495,25 @@ export class ProjectState extends DurableObject<Env> {
 		});
 	}
 
+	/**
+	 * Alarm entry point. The body runs inside a try/finally so an exception
+	 * mid-alarm (e.g. a transient R2 failure during migration) never leaves
+	 * the DO without a future alarm: GC/migration/purge-retry would stall
+	 * until the next fetch otherwise. A wiped DO is NOT rescheduled
+	 * (deleteAll cancelled its alarms; the state is gone).
+	 */
 	async alarm(): Promise<void> {
+		let wiped = false;
+		try {
+			wiped = await this.runAlarmWork();
+		} finally {
+			if (!wiped) {
+				await this.scheduleNextAlarm().catch(() => {});
+			}
+		}
+	}
+
+	private async runAlarmWork(): Promise<boolean> {
 		await this.ensureSchema();
 
 		// A purge that could not finish its R2 sweep resumes here; while it
@@ -2499,12 +2521,11 @@ export class ProjectState extends DurableObject<Env> {
 		if (this.getConfigValue('purge_pending') === '1') {
 			const complete = await this.runPurgeSweep(false);
 			if (!complete) {
-				await this.scheduleNextAlarm();
-				return;
+				return false; // the alarm wrapper reschedules the retry
 			}
 			await this.ctx.storage.deleteAll();
 			this.initialized = false;
-			return;
+			return true; // wiped: do not reschedule
 		}
 
 		const now = new Date().toISOString();
@@ -2592,9 +2613,9 @@ export class ProjectState extends DurableObject<Env> {
 		// Migrate legacy inline attachment payloads to R2 (online, restartable)
 		await this.migrateInlineAttachments();
 
-		// Schedule next alarm (earliest of next retention run, next snooze
-		// expiry, or the hourly GC cadence floor)
-		await this.scheduleNextAlarm();
+		// The alarm wrapper reschedules (earliest of next retention run,
+		// next snooze expiry, or the hourly GC cadence floor)
+		return false;
 	}
 
 	/**
