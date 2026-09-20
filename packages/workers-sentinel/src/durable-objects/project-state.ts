@@ -2608,10 +2608,17 @@ export class ProjectState extends DurableObject<Env> {
 		this.maybeRecomputeAttachmentUsage();
 
 		// Reclaim orphaned blobs (uploaded but never committed by any row)
-		await this.runGcSweep();
+		const gcRemoved = await this.runGcSweep();
 
 		// Migrate legacy inline attachment payloads to R2 (online, restartable)
-		await this.migrateInlineAttachments();
+		const migrated = await this.migrateInlineAttachments();
+
+		// One summary line per alarm run: this path has no API surface, so
+		// the log is the only way to see GC/migration liveness in production.
+		console.log(
+			`ProjectState alarm: gcRemoved=${gcRemoved} migratedInline=${migrated}` +
+				(retentionDays > 0 ? ' retention=ran' : ''),
+		);
 
 		// The alarm wrapper reschedules (earliest of next retention run,
 		// next snooze expiry, or the hourly GC cadence floor)
@@ -2646,9 +2653,9 @@ export class ProjectState extends DurableObject<Env> {
 	 * hour): roughly 4 hours at ~40k live objects, 1–2 days near the 10 GiB
 	 * budget with ~100 KiB blobs.
 	 */
-	private async runGcSweep(): Promise<void> {
+	private async runGcSweep(): Promise<number> {
 		const projectId = this.getProjectId();
-		if (!projectId) return; // no prefix can exist without a persisted id
+		if (!projectId) return 0; // no prefix can exist without a persisted id
 
 		const store = createAttachmentStore(this.env, null);
 		const prefix = projectPrefix(projectId);
@@ -2686,6 +2693,7 @@ export class ProjectState extends DurableObject<Env> {
 		if (doomed.length > 0) {
 			await this.deleteAttachmentBlobs(doomed);
 		}
+		return doomed.length;
 	}
 
 	/**
@@ -2698,9 +2706,9 @@ export class ProjectState extends DurableObject<Env> {
 	 * the next run re-uploads the same deterministic key. Byte-neutral for
 	 * the usage counter.
 	 */
-	private async migrateInlineAttachments(): Promise<void> {
+	private async migrateInlineAttachments(): Promise<number> {
 		const projectId = this.getProjectId();
-		if (!projectId) return; // inline rows keep serving; no prefix to use
+		if (!projectId) return 0; // inline rows keep serving; no prefix to use
 
 		const rows = this.sql
 			.exec(
@@ -2709,7 +2717,8 @@ export class ProjectState extends DurableObject<Env> {
 				 ORDER BY rowid LIMIT ${MIGRATION_BATCH}`,
 			)
 			.toArray();
-		if (rows.length === 0) return;
+		if (rows.length === 0) return 0;
+		let migrated = 0;
 
 		// One-shot test fault (armed via the internal route; alarms carry no
 		// headers): force the first row's flip to miss, exercising the
@@ -2745,8 +2754,11 @@ export class ProjectState extends DurableObject<Env> {
 			if (!flipped) {
 				// Row was deleted between SELECT and flip: remove the blob.
 				await this.deleteAttachmentBlobs([key]);
+			} else {
+				migrated++;
 			}
 		}
+		return migrated;
 	}
 
 	private getRetentionDays(): number {
