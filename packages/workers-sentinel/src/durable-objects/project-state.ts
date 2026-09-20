@@ -1236,9 +1236,14 @@ export class ProjectState extends DurableObject<Env> {
 		const hasMore = rows.length > pageLimit;
 		const issues = rows.slice(0, pageLimit).map((row) => this.rowToIssue(row));
 
+		// Cursor = the sort-key value of the last row ON the page. It must be
+		// read from the raw SQL row: `sortField` names the snake_case column
+		// (`last_seen`, …), which does not exist on the camelCase Issue
+		// objects — indexing those silently yielded undefined for the default
+		// sort and dropped every continuation cursor.
 		const nextCursor =
 			hasMore && issues.length > 0
-				? (issues[issues.length - 1] as Issue)[sortField as keyof Issue]
+				? ((rows[issues.length - 1] as Record<string, unknown>)[sortField] as string | number)
 				: undefined;
 
 		return this.jsonResponse({

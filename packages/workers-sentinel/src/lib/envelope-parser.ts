@@ -174,9 +174,14 @@ export function extractEvents(envelope: ParsedEnvelope): SentryEvent[] {
 		if (item.type === 'event' || item.type === 'transaction') {
 			const event = item.payload as SentryEvent;
 
-			// Ensure event_id
+			// Ensure event_id. A payload without one falls back to the
+			// envelope-level id (allowed by the envelope spec) before a
+			// server id is minted; sanitizeEvent validates either way.
 			if (!event.event_id) {
-				event.event_id = crypto.randomUUID().replace(/-/g, '');
+				event.event_id =
+					typeof envelope.header.event_id === 'string' && envelope.header.event_id.length > 0
+						? envelope.header.event_id
+						: crypto.randomUUID().replace(/-/g, '');
 			}
 
 			// Ensure timestamp

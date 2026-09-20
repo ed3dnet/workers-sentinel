@@ -150,7 +150,7 @@ Attachment lifecycle follows its event via cascade: retention pruning, issue del
 
 ### Event IDs
 
-Client `event_id`s round-trip: 32-hex values are lowercased, dashed 36-char UUIDs (any hex case) are normalized to 32-hex (dashes stripped, lowercased). Anything else is replaced by a server-minted id. Duplicate detection keys on the normalized id, so resending the same event (dashed or stripped) is an idempotent no-op (`duplicate: true`, no attachment duplication).
+Client `event_id`s round-trip: 32-hex values are lowercased, dashed 36-char UUIDs (any hex case) are normalized to 32-hex (dashes stripped, lowercased). Anything else is replaced by a server-minted id. An event payload without an `event_id` falls back to the envelope header's `event_id` (if present) before a server id is minted. Duplicate detection keys on the normalized id, so resending the same event (dashed or stripped) is an idempotent no-op (`duplicate: true`, no attachment duplication).
 
 ### Permalinks
 
@@ -213,7 +213,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 294 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 297 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 

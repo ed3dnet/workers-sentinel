@@ -228,4 +228,60 @@ describe('Ingestion Routes', () => {
 			expect(response.status).toBe(200);
 		});
 	});
+
+	describe('envelope-header event_id fallback', () => {
+		function headerOnlyEnvelope(headerEventId: unknown, message: string): string {
+			return [
+				JSON.stringify({
+					event_id: headerEventId,
+					dsn: `https://${testProject.publicKey}@localhost/${testProject.id}`,
+				}),
+				JSON.stringify({ type: 'event' }),
+				JSON.stringify({
+					timestamp: new Date().toISOString(),
+					platform: 'javascript',
+					level: 'error',
+					message,
+				}),
+			].join('\n');
+		}
+
+		async function postEnvelope(body: string): Promise<Response> {
+			return SELF.fetch(`http://localhost/api/${testProject.id}/envelope/`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-sentry-envelope',
+					'X-Sentry-Auth': `Sentry sentry_version=7, sentry_key=${testProject.publicKey}`,
+				},
+				body,
+			});
+		}
+
+		it('echoes the envelope-level event_id when the payload omits one', async () => {
+			const headerId = crypto.randomUUID();
+			const normalized = headerId.replace(/-/g, '');
+			const response = await postEnvelope(headerOnlyEnvelope(headerId, 'header id fallback probe'));
+			expect(response.status).toBe(200);
+			const data = (await response.json()) as { id: string };
+			expect(data.id).toBe(normalized);
+
+			const stored = await authFetch(
+				testUser.token!,
+				`http://localhost/api/projects/${testProject.slug}/events/${normalized}`,
+			);
+			expect(stored.ok).toBe(true);
+			const storedData = (await stored.json()) as { event: { event_id: string } };
+			expect(storedData.event.event_id).toBe(normalized);
+		});
+
+		it('still mints a server id when the envelope-level id is not id-shaped', async () => {
+			const response = await postEnvelope(
+				headerOnlyEnvelope('not-a-valid-event-id', 'garbage header id probe'),
+			);
+			expect(response.status).toBe(200);
+			const data = (await response.json()) as { id: string };
+			expect(data.id).toMatch(/^[0-9a-f]{32}$/);
+			expect(data.id).not.toBe('not-a-valid-event-id');
+		});
+	});
 });

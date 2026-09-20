@@ -217,6 +217,9 @@ class StreamingIngest {
 	 */
 	private failure: unknown = null;
 
+	/** Envelope-level `event_id`, if the client declared one in the header. */
+	private headerEventId: string | null = null;
+
 	get failed(): boolean {
 		return this.failure !== null;
 	}
@@ -280,6 +283,13 @@ class StreamingIngest {
 	private async onEvent(event: EnvelopeFramerEvent): Promise<void> {
 		switch (event.kind) {
 			case 'envelope-header':
+				// Remember the envelope-level event_id: a client that declares
+				// its id only in the header (allowed by the envelope spec)
+				// still gets it echoed after sanitizeEvent's validation,
+				// instead of a server-minted id.
+				if (typeof event.header.event_id === 'string' && event.header.event_id.length > 0) {
+					this.headerEventId = event.header.event_id;
+				}
 				return;
 			case 'item-header':
 				return this.onItemHeader(event.header);
@@ -454,7 +464,11 @@ class StreamingIngest {
 					);
 					return;
 				}
-				this.events.push(parsed as SentryEvent);
+				const parsedEvent = parsed as SentryEvent;
+				if (!parsedEvent.event_id && this.headerEventId !== null) {
+					parsedEvent.event_id = this.headerEventId;
+				}
+				this.events.push(parsedEvent);
 				return;
 			}
 			case 'attachment-stream': {
