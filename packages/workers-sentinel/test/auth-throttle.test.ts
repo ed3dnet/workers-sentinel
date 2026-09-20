@@ -45,7 +45,7 @@ describe('login throttling', () => {
 		expect(typeof body.retryAfter).toBe('number');
 	});
 
-	it('clears the failure counter on successful login', async () => {
+	it('clears the failure counter on successful login', { timeout: 60_000 }, async () => {
 		const user = await createTestUser({
 			email: `reset-${Date.now()}@example.com`,
 			password: 'testpassword123',

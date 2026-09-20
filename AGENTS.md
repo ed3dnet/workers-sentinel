@@ -93,7 +93,7 @@ Cloudflare Workers can send events via service binding instead of HTTP for lower
 
 ## Native API reference (fetch-side)
 
-The contract for API consumers (dashboard, CLI tooling, agent skills). The management/fetch API is **native JSON** — only ingestion speaks the Sentry protocol, with one exception: the read-only Sentry `/api/0` event-attachment compatibility surface documented in its own section below.
+The contract for API consumers (dashboard, CLI tooling, agent skills). Two surfaces: the **native JSON API** documented below, and the **Sentry-shaped `/api/0` API** (its own section) — the primary surface for agentic triage, including issue resolution.
 
 ### Authentication
 
@@ -111,7 +111,7 @@ List endpoints that paginate use keyset pagination:
 
 - `?limit=` — page size, clamped to 1..100. Values below 1 (or non-numeric) fall back to the endpoint default rather than clamping to 1. Default 25 (issue activity: 50).
 - `?cursor=` — pass the previous page's `nextCursor` verbatim.
-- Response shape: `{ <rows>, nextCursor?, hasMore }`. `nextCursor` is the sort key of the last row on the page and is **omitted** when there are no more rows (do not treat an absent cursor as "repeat the last page"). The cursor is per endpoint and follows that endpoint's sort: issues pages by the active `sort` field (`last_seen` by default), issue events by `timestamp` DESC, issue activity by a composite `createdAt|id` key — a cursor from one sort order is not valid for another.
+- Response shape: `{ <rows>, nextCursor?, hasMore }`. `nextCursor` is **omitted** when there are no more rows (do not treat an absent cursor as "repeat the last page"). The cursor is per endpoint and follows that endpoint's sort **with an id tie-break** (composite `<sortValue>|<id>`): issues pages by the active `sort` field (`last_seen` by default), issue events by `timestamp` DESC — a cursor from one sort order is not valid for another.
 
 ### Endpoints (read side)
 
@@ -156,31 +156,51 @@ Client `event_id`s round-trip: 32-hex values are lowercased, dashed 36-char UUID
 
 Dashboard permalinks are `/projects/{projectSlug}/issues/{issueId}` (e.g. `https://host/projects/my-project/issues/12345678-…`). The API path space for the same resource is `/api/projects/:slug/issues/:issueId`.
 
-## Sentry `/api/0` compatibility (event attachments)
+## The `/api/0` API (Sentry-shaped)
 
-A read-only mirror of Sentry's event-attachment API surface, additive to the native API above (which is byte-for-byte unchanged). Auth is the same Bearer credential space as `/api/projects/*` — session tokens and `wst_` API tokens both work; DSN public keys do not (they remain ingestion-only). The org path segment is accepted but ignored.
+The Sentry-compatible API under `/api/0` — the primary surface for agentic consumers (triage bots, the feedback skill). Wire contract follows docs.sentry.io/api: Bearer auth (session and `wst_` API tokens both work; DSN keys never), `Link`-header cursor pagination, bare-array list responses, and `{"detail": …}` error bodies. The native dashboard API (`/api/projects/*`) remains unchanged alongside it. Org path segments accept any non-empty value (single tenant; `GET /api/0/organizations/` reports the synthetic `sentinel` org).
 
-Routes (trailing slash optional on all of them):
+### Discovery
 
-- `GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/` — list. `{project}` resolves by slug first, then by project id (both membership-gated).
-- `GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/{attachment_id}/` — metadata: the same nine-field object as the list elements.
-- The detail route with `?download` (any value, including empty) — raw payload bytes: stored `Content-Type`, hardened `Content-Disposition: attachment; filename="…"` (plus RFC 5987 `filename*` for non-ASCII), and `Content-Length` equal to `size` (R2 bodies are piped through `FixedLengthStream` so the runtime emits the exact length). R2 payloads stream directly — no presigned-URL redirects. Inline legacy rows serve from DO storage until the alarm migrates them.
+- `GET /api/0/organizations/` — the synthetic organization (`id`, `slug`, `name`, `status`).
+- `GET /api/0/organizations/{org}/projects/` — the caller's member projects (Sentry Project serializer subset: `id`, `slug`, `name`, `platform`, `dateCreated`, flags). `?query=` filters by name/slug; `per_page`/`cursor` paginate.
 
-Serializer fields per attachment (exactly these nine): `id`, `event_id`, `type` (`"event.attachment"`), `name`, `mimetype`, `dateCreated` (ISO), `size`, `headers` (`{"Content-Type": mimetype}`), `sha1` (`null` — current Sentry serializer behavior).
+### Issues
 
-**Pagination** follows Sentry's `Link` header convention (not the native `nextCursor` keyset): every page carries `rel="next"` and `rel="previous"` entries, each with `results="true|false"` telling the client whether following it would yield rows. The cursor format is `{id}:{offset}:{isPrev}`; only the offset segment is honored, and malformed cursors read as offset 0. `?limit=` clamps valid integers into 1..100 (default 100; non-integer or absent values fall back to the default). Ordering is by `name`.
+- `GET /api/0/organizations/{org}/issues/` and `GET /api/0/projects/{org}/{project}/issues/` — list of Sentry Group objects. `?query=` supports `is:unresolved` (default), `is:resolved`, `is:ignored`; an explicit empty `query=` means all statuses. `sort`: `date` (default), `new`, `freq`, `user`. `limit` (1..100, default 25), `cursor` (Link header). Org lists accept repeatable `?project=` filters (slug or id; `-1` = all).
+- `GET /api/0/organizations/{org}/issues/{issue_id}/` (alias `GET /api/0/issues/{issue_id}/`) — detail: the Group plus `activity`, `seenBy`, `participants`, `tags` (currently zero/empty), `firstRelease`/`lastRelease`, and `stats["24h"]` from the stored hourly series.
+- `PUT` on the same paths — triage: body `{"status": "resolved" | "unresolved" | "ignored"}` (Sentry's `resolvedInNextRelease` and `muted` are accepted and mapped to `resolved`/`ignored`). Returns the updated Group. Invalid status → `400 {"detail": …}`. **This is how agents mark issues complete.**
+- `DELETE` on the same paths — `202 Accepted` (deletion is actually immediate here; the status matches Sentry's contract).
 
-**Errors** are Sentry-shaped on this namespace only: non-2xx responses use `{"detail": "…"}` (a namespace-local translator rewrites the native `{error[, message]}` shape, including authMiddleware's 401 bodies). Unknown event, unknown attachment, an attachment scoped under a different event, and non-member/cross-project access (by slug or id) all return `404 {"detail":"not found"}` — indistinguishable by design. Metadata whose R2 blob was deleted still returns 200, while its `?download` returns `404 {"detail":"attachment data missing"}`. Auth precedence matches the native API: anonymous probes of unknown `/api/0/…` paths get 401 (detail-shaped), authenticated ones the 404; `OPTIONS /api/0/*` still answers the global bare 204 preflight before auth.
+Group serializer fields: `id` (UUID string), `shortId` (null), `shareId` (null), `title`, `culprit`, `permalink` (dashboard URL), `logger` (null), `level`, `status`, `statusDetails` ({}), `substatus` (null), `isPublic`, `platform`, `project {id,name,slug,platform}`, `type`/`issueType`/`issueCategory` ("error"), `metadata`, `numComments`, `assignedTo` (null), `isBookmarked`, `isSubscribed`, `subscriptionDetails`, `hasSeen`, `annotations`, `count` (**string**), `userCount` (number), `firstSeen`, `lastSeen`, `stats`.
 
-**Documented deviations from Sentry** (single-tenant constraints):
+### Events
 
-| Sentry | Here |
-|---|---|
-| Real organization required in the path | Any non-empty `{organization_id_or_slug}` segment accepted (single tenant) |
-| Numeric attachment ids | Opaque `{eventId}:{n}` composites — pass list values back verbatim |
-| Token scopes (`project:read`, …) gate access | Not modeled; any valid session/API token with project membership passes |
-| `sha1` content checksum | Always `null` |
-| Downloads may redirect to presigned storage URLs | Direct stream, never a redirect |
+- `GET /api/0/organizations/{org}/eventids/{event_id}/` — event-id → issue lookup: `{event, eventId, groupId, organizationSlug, projectSlug}` (Sentry's exact envelope).
+- `GET /api/0/organizations/{org}/issues/{issue_id}/events/` and `GET /api/0/projects/{org}/{project}/issues/{issue_id}/events/` — the issue's events (newest first) as Event objects; `per_page` (1..100, default 100)/`cursor`.
+- `GET …/issues/{issue_id}/events/{event_id}/` (org + project paths) — `{event_id}` may be a concrete 32-hex id, `latest`, or `oldest`.
+- `GET /api/0/projects/{org}/{project}/events/{event_id}/` — project event detail.
+
+Event serializer subset: `id`/`eventID` (32-hex), `groupID`, `projectID`, `message`, `title`, `culprit`, `platform`, `type`, `metadata`, `tags [{key,value}]`, `dateCreated`/`dateReceived`, `user`, `contexts`, `sdk`, `environment`, `release`, `fingerprint`, `entries` ([]), `occurrence`, `previousEventID`/`nextEventID` (null).
+
+### Comments (notes)
+
+- `GET /api/0/organizations/{org}/issues/{issue_id}/comments/` — array of `{id, issueId, projectId, text, data, dateCreated, user {id,name,username}}`.
+- `POST` the same path with `{"text": "…"}` → `201` with the created note.
+- `DELETE …/comments/{comment_id}/` → `204` (authors only; others get `403`).
+
+### Attachments
+
+- `GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/` — list: bare array of nine-field objects (`id`, `event_id`, `type: "event.attachment"`, `name`, `mimetype`, `dateCreated` ISO, `size`, `headers {"Content-Type": mimetype}`, `sha1` null), ordered by `name`, `Link` pagination (`limit` 1..100 default 100). `{project}` resolves by slug then id, both membership-gated.
+- `GET …/attachments/{attachment_id}/` — metadata (same nine fields); with `?download` (any value) — raw bytes: stored `Content-Type`, hardened `Content-Disposition: attachment; filename="…"` (+ RFC 5987 `filename*`), and `Content-Length` equal to `size` (R2 bodies pipe through `FixedLengthStream`). Direct stream, no presigned redirects; inline legacy rows serve from DO storage until migrated. Attachment ids are opaque `{eventId}:{n}` composites — pass them back verbatim.
+
+The dashboard renders attachments on the issue and event views with inline previews (text/json/yaml/md/log, png/jpeg/gif/webp) and client-side auto-decompression for `.gz`/`.zst` double-suffixes (native DecompressionStream + fzstd), capped at 2 MiB decompressed / 8 MiB stored per preview.
+
+### Errors, pagination, and deviations
+
+- Non-2xx responses on this namespace use `{"detail": …}` (a namespace-local translator rewrites the native `{error[, message]}` shape, including auth 401s; unexpected non-JSON failures become a generic detail body). Unknown routes → `404 {"detail":"not found"}`; anonymous probes → 401. `OPTIONS /api/0/*` still answers the global bare 204 preflight.
+- Cursor format `{id}:{offset}:{isPrev}` (exactly three segments; only the offset is honored; malformed → 0).
+- Deviations from Sentry (single-tenant constraints, deliberate): synthetic `sentinel` organization (any org segment accepted); UUID issue/event ids where Sentry serializes numeric ids as strings; `shortId` null; token scopes not modeled (any valid token with membership passes); `assignedTo` accepted but ignored (no assignment store); `numComments` is a placeholder `0`; stats carry an empty series in lists and the 7-day hourly series under the requested period key in detail; issue and event lists walk DO keyset pages and expose at most the first 1000 rows per project (Link marks that horizon exhausted; rows beyond it are not exposed); issue/event search grammar supports only `is:` tokens (the first recognized token wins); `resolvedInNextRelease`→`resolved` and `muted`→`ignored` mappings; DELETE is immediate but answers 202; the Event serializer is a subset; org-scoped lookups fan out across the caller's member projects.
 
 ## Git hooks (lefthook)
 
@@ -213,7 +233,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 297 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 306 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 

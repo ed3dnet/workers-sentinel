@@ -169,9 +169,7 @@ The supervisor (in `_devenv/cloudflare/`) is loopback-only, persists Durable Obj
 
 ## SDK Configuration
 
-Workers Sentinel accepts events from official Sentry SDKs — it speaks the Sentry **ingestion** protocol (envelope and legacy store endpoints, DSN auth). Simply use your Sentinel DSN instead of a Sentry DSN.
-
-The management/fetch API (`/api/projects/…`) is a native JSON API, **not** a Sentry-compatible one: `sentry-cli` is not supported. One exception: Sentry's event-attachment read surface is mirrored at `/api/0/projects/{org}/{project}/events/{event_id}/attachments[/…?]` (list, metadata, `?download` byte stream) with Sentry's nine-field serializer, `Link`-header pagination, and `{"detail": …}` errors, so Sentry-speaking clients can fetch stored attachments. See AGENTS.md ("Sentry `/api/0` compatibility") for the exact contract and deviations.
+Workers Sentinel speaks the Sentry **ingestion** protocol (envelope and legacy store endpoints, DSN auth) — use your Sentinel DSN wherever a Sentry DSN works. The fetch side has two surfaces: a native JSON API (`/api/projects/…`) for the dashboard, and a Sentry-shaped `/api/0` API for agents and Sentry-speaking clients — project/issue discovery, issue triage (`PUT {"status":"resolved"}` marks complete), events, event-id lookup, comments, and event attachments (list/metadata/`?download` byte stream) with Sentry's serializers, `Link` pagination, and `{"detail": …}` errors. `sentry-cli` is not supported. See AGENTS.md ("The `/api/0` API") for the exact contract and deviations.
 
 ### Cloudflare Workers (Service Binding with RPC)
 

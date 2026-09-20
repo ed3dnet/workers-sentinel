@@ -38,9 +38,10 @@ describe('issues cursor pagination', () => {
 			expect(data1.issues).toHaveLength(2);
 			expect(data1.hasMore).toBe(true);
 			// The bug this pins: snake_case sort field read from camelCase
-			// objects made nextCursor vanish on the default sort
+			// objects made nextCursor vanish on the default sort. The cursor
+			// is now a composite `<sortValue>|<id>` (id tie-break).
 			expect(typeof data1.nextCursor).toBe('string');
-			expect(data1.nextCursor).toBe(data1.issues[1].lastSeen);
+			expect(data1.nextCursor).toBe(`${data1.issues[1].lastSeen}|${data1.issues[1].id}`);
 
 			const page2 = await authFetch(
 				user.token!,

@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { api } from '../api/client';
+import AttachmentList from '../components/AttachmentList.vue';
 
 const route = useRoute();
 const slug = computed(() => route.params.slug as string);
@@ -65,6 +66,8 @@ onMounted(() => loadEvent());
 			<div class="card p-4">
 				<pre class="text-xs font-mono overflow-x-auto whitespace-pre-wrap text-gray-900 dark:text-gray-100">{{ JSON.stringify(event, null, 2) }}</pre>
 			</div>
+
+			<AttachmentList :slug="slug" :event-id="eventId" class="mt-4 block" />
 		</div>
 	</div>
 </template>

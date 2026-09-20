@@ -1225,26 +1225,33 @@ export class ProjectState extends DurableObject<Env> {
 		}
 
 		if (cursor) {
-			sql += ` AND ${sortField} < ?`;
-			params.push(cursor);
+			// Composite keyset cursor `<sortValue>|<id>`: the id tie-break
+			// keeps rows sharing a sort value from being skipped at page
+			// boundaries. Split at the LAST '|' (values may contain it; ids
+			// are UUIDs and never do).
+			const splitAt = cursor.lastIndexOf('|');
+			const cursorValue = splitAt === -1 ? cursor : cursor.slice(0, splitAt);
+			const cursorId = splitAt === -1 ? '' : cursor.slice(splitAt + 1);
+			sql += ` AND (${sortField} < ? OR (${sortField} = ? AND id < ?))`;
+			params.push(cursorValue, cursorValue, cursorId);
 		}
 
-		sql += ` ORDER BY ${sortField} ${sortOrder} LIMIT ?`;
+		sql += ` ORDER BY ${sortField} ${sortOrder}, id DESC LIMIT ?`;
 		params.push(pageLimit + 1);
 
 		const rows = this.sql.exec(sql, ...params).toArray();
 		const hasMore = rows.length > pageLimit;
-		const issues = rows.slice(0, pageLimit).map((row) => this.rowToIssue(row));
+		const pageRows = rows.slice(0, pageLimit);
+		const issues = pageRows.map((row) => this.rowToIssue(row));
 
-		// Cursor = the sort-key value of the last row ON the page. It must be
-		// read from the raw SQL row: `sortField` names the snake_case column
-		// (`last_seen`, …), which does not exist on the camelCase Issue
-		// objects — indexing those silently yielded undefined for the default
-		// sort and dropped every continuation cursor.
-		const nextCursor =
-			hasMore && issues.length > 0
-				? ((rows[issues.length - 1] as Record<string, unknown>)[sortField] as string | number)
-				: undefined;
+		// Cursor = sort value + id of the last row ON the page, read from the
+		// raw SQL row (sortField names the snake_case column, which does not
+		// exist on the camelCase Issue objects).
+		let nextCursor: string | undefined;
+		if (hasMore && pageRows.length > 0) {
+			const last = pageRows[pageRows.length - 1] as Record<string, unknown>;
+			nextCursor = `${String(last[sortField])}|${String(last.id)}`;
+		}
 
 		return this.jsonResponse({
 			issues,
@@ -1463,33 +1470,46 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	private async handleGetIssueEvents(request: Request): Promise<Response> {
-		const { issueId, cursor, limit } = (await request.json()) as {
+		const { issueId, cursor, limit, order } = (await request.json()) as {
 			issueId: string;
 			cursor?: string;
 			limit?: number;
+			order?: 'asc' | 'desc';
 		};
 
 		const pageLimit = clampLimit(limit, 25);
+		// Ascending order backs the /api/0 `oldest` selector; native callers
+		// omit `order` and keep the historical newest-first default.
+		const ascending = order === 'asc';
 
 		let sql = 'SELECT * FROM events WHERE issue_id = ?';
 		const params: (string | number)[] = [issueId];
 
 		if (cursor) {
-			sql += ' AND timestamp < ?';
-			params.push(cursor);
+			// Composite keyset cursor `<timestamp>|<id>` with an id
+			// tie-break: events sharing a timestamp are never skipped at a
+			// page boundary. Split at the LAST '|' (ids are UUIDs).
+			const splitAt = cursor.lastIndexOf('|');
+			const cursorValue = splitAt === -1 ? cursor : cursor.slice(0, splitAt);
+			const cursorId = splitAt === -1 ? '' : cursor.slice(splitAt + 1);
+			const cmp = ascending ? '>' : '<';
+			sql += ` AND (timestamp ${cmp} ? OR (timestamp = ? AND id ${cmp} ?))`;
+			params.push(cursorValue, cursorValue, cursorId);
 		}
 
-		sql += ' ORDER BY timestamp DESC LIMIT ?';
+		sql += ` ORDER BY timestamp ${ascending ? 'ASC' : 'DESC'}, id ${ascending ? 'ASC' : 'DESC'} LIMIT ?`;
 		params.push(pageLimit + 1);
 
 		const rows = this.sql.exec(sql, ...params).toArray();
 		const hasMore = rows.length > pageLimit;
-		const events = rows.slice(0, pageLimit).map((row) => JSON.parse(row.data as string));
+		const pageRows = rows.slice(0, pageLimit);
+		const events = pageRows.map((row) => JSON.parse(row.data as string));
 
-		const nextCursor =
-			hasMore && events.length > 0
-				? (events[events.length - 1] as SentryEvent).timestamp
-				: undefined;
+		let nextCursor: string | undefined;
+		if (hasMore && pageRows.length > 0) {
+			const last = pageRows[pageRows.length - 1] as Record<string, unknown>;
+			nextCursor = `${String(last.timestamp)}|${String(last.id)}`;
+		}
 
 		return this.jsonResponse({
 			events,
@@ -2018,7 +2038,9 @@ export class ProjectState extends DurableObject<Env> {
 			issueId: string;
 		};
 
-		const rows = this.sql.exec('SELECT * FROM issue_comments WHERE id = ?', commentId).toArray();
+		const rows = this.sql
+			.exec('SELECT * FROM issue_comments WHERE id = ? AND issue_id = ?', commentId, issueId)
+			.toArray();
 
 		if (rows.length === 0) {
 			return this.jsonResponse({ error: 'comment_not_found' }, 404);

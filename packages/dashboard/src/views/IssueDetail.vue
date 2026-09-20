@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { api } from '../api/client';
+import AttachmentList from '../components/AttachmentList.vue';
 import { type ResolvedFrame, resolveFrame } from '../lib/sourcemap-resolver';
 import { useAuthStore } from '../stores/auth';
 
@@ -514,6 +515,16 @@ onBeforeUnmount(() => {
 									<pre class="text-xs font-mono overflow-x-auto"><template v-if="frame.pre_context"><code v-for="(line, i) in frame.pre_context" :key="'pre-'+i" class="block text-gray-500">{{ (frame.lineno || 0) - frame.pre_context.length + i }} {{ line }}</code></template><code v-if="frame.context_line" class="block text-white bg-error-900/50 -mx-4 px-4">{{ frame.lineno }} {{ frame.context_line }}</code><template v-if="frame.post_context"><code v-for="(line, i) in frame.post_context" :key="'post-'+i" class="block text-gray-500">{{ (frame.lineno || 0) + i + 1 }} {{ line }}</code></template></pre>
 								</div>
 							</div>
+						</div>
+					</div>
+
+					<!-- Attachments (per selected event) -->
+					<div v-if="selectedEvent.event_id" class="card">
+						<div class="p-4 border-b border-gray-200 dark:border-gray-700">
+							<h2 class="font-semibold text-gray-900 dark:text-white">Attachments</h2>
+						</div>
+						<div class="p-4">
+							<AttachmentList :slug="slug" :event-id="selectedEvent.event_id" />
 						</div>
 					</div>
 

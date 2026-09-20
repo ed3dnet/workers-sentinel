@@ -4,7 +4,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { Hono } from 'hono';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { sentryCompatErrorTranslator } from '../src/routes/sentry-compat';
+import { api0ErrorTranslator } from '../src/routes/api0';
 import type { AuthContext, Env } from '../src/types';
 import { authFetch, createTestProject, createTestUser } from './utils';
 
@@ -95,13 +95,29 @@ function compatBase(org: string, project: string, eventId: string): string {
 async function compatFetch(
 	token: string | undefined,
 	url: string,
-	headers: Record<string, string> = {},
+	options: { method?: string; headers?: Record<string, string>; body?: string } = {},
 ): Promise<Response> {
 	return SELF.fetch(url, {
+		method: options.method ?? 'GET',
+		body: options.body,
 		headers: {
 			...(token ? { Authorization: `Bearer ${token}` } : {}),
-			...headers,
+			...(options.headers ?? {}),
 		},
+	});
+}
+
+/** JSON mutation helper for the /api/0 surface (PUT/POST/DELETE). */
+function api0Send(
+	token: string | undefined,
+	url: string,
+	method: 'PUT' | 'POST' | 'DELETE',
+	body?: unknown,
+): Promise<Response> {
+	return compatFetch(token, url, {
+		method,
+		headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 }
 
@@ -508,14 +524,14 @@ describe('Sentry /api/0 attachment compatibility', () => {
 			},
 			{
 				name: 'authenticated unknown compat path',
-				url: 'http://localhost/api/0/organizations/',
+				url: 'http://localhost/api/0/monitors/',
 				token: owner.token,
 				status: 404,
 				body: { detail: 'not found' },
 			},
 			{
 				name: 'anonymous unknown compat path',
-				url: 'http://localhost/api/0/organizations/',
+				url: 'http://localhost/api/0/monitors/',
 				status: 401,
 				body: { detail: 'Missing or invalid authorization header' },
 			},
@@ -606,23 +622,19 @@ describe('Sentry /api/0 attachment compatibility', () => {
 		// bodies (thrown-exception text 500s, JSON null, invalid JSON) that
 		// the happy-path matrix cannot produce through real routes.
 		const probe = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>();
-		probe.get('/text-error', sentryCompatErrorTranslator, (c) =>
-			c.text('Internal Server Error', 500),
-		);
-		probe.get('/json-null', sentryCompatErrorTranslator, (c) => c.json(null, 500));
+		probe.get('/text-error', api0ErrorTranslator, (c) => c.text('Internal Server Error', 500));
+		probe.get('/json-null', api0ErrorTranslator, (c) => c.json(null, 500));
 		probe.get(
 			'/bad-json',
-			sentryCompatErrorTranslator,
+			api0ErrorTranslator,
 			() =>
 				new Response('{not json', {
 					status: 500,
 					headers: { 'Content-Type': 'application/json' },
 				}),
 		);
-		probe.get('/already-detail', sentryCompatErrorTranslator, (c) =>
-			c.json({ detail: 'not found' }, 404),
-		);
-		probe.get('/ok', sentryCompatErrorTranslator, (c) => c.text('fine'));
+		probe.get('/already-detail', api0ErrorTranslator, (c) => c.json({ detail: 'not found' }, 404));
+		probe.get('/ok', api0ErrorTranslator, (c) => c.text('fine'));
 
 		// Non-JSON 5xx (Hono's default thrown-exception shape) becomes a
 		// generic detail body without echoing exception details
@@ -917,4 +929,609 @@ describe('Sentry /api/0 attachment compatibility', () => {
 			expect(attachment.eventId).toBe(eventId);
 		}
 	}, 60_000);
+});
+
+describe('api0 issue management and discovery', () => {
+	let owner: Awaited<ReturnType<typeof createTestUser>>;
+	let outsider: Awaited<ReturnType<typeof createTestUser>>;
+	let projectA: TestProject;
+	let projectB: TestProject;
+
+	const api0Get = (token: string | undefined, path: string) =>
+		compatFetch(token, `http://localhost/api/0${path}`);
+
+	beforeAll(async () => {
+		owner = await createTestUser({
+			email: `api0-mgmt-${Date.now()}@example.com`,
+			password: 'testpassword123',
+			name: 'Api0 Manager',
+		});
+		outsider = await createTestUser({
+			email: `api0-out-${Date.now()}@example.com`,
+			password: 'testpassword123',
+			name: 'Api0 Outsider',
+		});
+		projectA = await createTestProject(owner.token!, { name: `Api0 A ${Date.now()}` });
+		projectB = await createTestProject(owner.token!, { name: `Api0 B ${Date.now()}` });
+	}, 120_000);
+
+	it('lists the synthetic organization and member projects', async () => {
+		const orgs = await api0Get(owner.token, '/organizations/');
+		expect(orgs.status).toBe(200);
+		const orgList = (await orgs.json()) as Array<Record<string, unknown>>;
+		expect(orgList).toHaveLength(1);
+		expect(orgList[0].slug).toBe('sentinel');
+		expect(orgList[0].status).toBe('active');
+
+		const projects = await api0Get(owner.token, '/organizations/any-org/projects/');
+		expect(projects.status).toBe(200);
+		const list = (await projects.json()) as Array<Record<string, unknown>>;
+		const slugs = list.map((p) => p.slug);
+		expect(slugs).toContain(projectA.slug);
+		expect(slugs).toContain(projectB.slug);
+		const a = list.find((p) => p.slug === projectA.slug)!;
+		expect(a.id).toBe(projectA.id);
+		expect(a.name).toBe(projectA.name);
+		expect(a.platform).toBe('javascript');
+		expect(a.isMember).toBe(true);
+		expect((projects.headers.get('Link') ?? '').includes('rel="next"')).toBe(true);
+
+		const filtered = await api0Get(
+			owner.token,
+			`/organizations/o/projects/?query=${encodeURIComponent(projectB.slug)}`,
+		);
+		expect(((await filtered.json()) as Array<Record<string, unknown>>).map((p) => p.slug)).toEqual([
+			projectB.slug,
+		]);
+
+		// Outsider sees none of the owner's projects
+		const outside = await api0Get(outsider.token, '/organizations/o/projects/');
+		expect(outside.status).toBe(200);
+		expect(await outside.json()).toEqual([]);
+	}, 60_000);
+
+	it('lists and filters issues with the Sentry Group shape', async () => {
+		// Two issues in A (one will be resolved), one in B
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 list issue one'),
+			]),
+		);
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 list issue two'),
+			]),
+		);
+		await postEnvelope(
+			projectB,
+			frame([
+				envelopeHeader(projectB, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 list issue three'),
+			]),
+		);
+		const nativeA = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectA.slug}/issues`,
+		);
+		const nativeIssues = (
+			(await nativeA.json()) as { issues: Array<{ id: string; title: string }> }
+		).issues;
+		expect(nativeIssues.length).toBeGreaterThanOrEqual(2);
+		const toResolve = nativeIssues.find((i) => i.title.includes('issue one'))!;
+
+		// Default query = is:unresolved
+		const listRes = await api0Get(owner.token, '/organizations/any/issues/?sort=new');
+		expect(listRes.status).toBe(200);
+		const groups = (await listRes.json()) as Array<Record<string, unknown>>;
+		expect(groups.length).toBeGreaterThanOrEqual(3);
+		const group = groups.find((g) => g.id === toResolve.id)!;
+		expect(group.status).toBe('unresolved');
+		expect(typeof group.count).toBe('string');
+		expect(typeof group.userCount).toBe('number');
+		expect((group.project as Record<string, unknown>).slug).toBe(projectA.slug);
+		expect(String(group.permalink)).toContain(`/projects/${projectA.slug}/issues/${toResolve.id}`);
+		expect(group.shortId).toBeNull();
+		expect(group.assignedTo).toBeNull();
+		expect((group.stats as Record<string, unknown>)['24h']).toEqual([]);
+
+		// Resolve one natively, then query is:resolved / empty query
+		const resolve = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectA.slug}/issues/${toResolve.id}`,
+			{ method: 'PUT', body: JSON.stringify({ status: 'resolved' }) },
+		);
+		expect(resolve.status).toBe(200);
+
+		const resolvedOnly = await api0Get(owner.token, '/organizations/o/issues/?query=is:resolved');
+		const resolvedIds = ((await resolvedOnly.json()) as Array<Record<string, unknown>>).map(
+			(g) => g.id,
+		);
+		expect(resolvedIds).toContain(toResolve.id);
+		expect(resolvedIds.length).toBe(1);
+
+		const all = await api0Get(owner.token, '/organizations/o/issues/?query=');
+		expect(((await all.json()) as unknown[]).length).toBeGreaterThanOrEqual(3);
+
+		// Project-scoped list
+		const projectList = await api0Get(owner.token, `/projects/o/${projectB.slug}/issues/`);
+		const bGroups = (await projectList.json()) as Array<Record<string, unknown>>;
+		expect(bGroups.length).toBeGreaterThanOrEqual(1);
+		for (const g of bGroups) {
+			expect((g.project as Record<string, unknown>).slug).toBe(projectB.slug);
+		}
+		// Project filter param on org list
+		const filteredOrg = await api0Get(
+			owner.token,
+			`/organizations/o/issues/?project=${projectB.slug}`,
+		);
+		for (const g of (await filteredOrg.json()) as Array<Record<string, unknown>>) {
+			expect((g.project as Record<string, unknown>).slug).toBe(projectB.slug);
+		}
+		// Unknown project → 404 detail
+		const missing = await api0Get(owner.token, '/projects/o/no-such/issues/');
+		expect(missing.status).toBe(404);
+		expect(await missing.json()).toEqual({ detail: 'not found' });
+	}, 120_000);
+
+	it('issue detail, update, and delete round-trip', async () => {
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 mgmt roundtrip'),
+			]),
+		);
+		const native = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectA.slug}/issues`,
+		);
+		const issue = (
+			(await native.json()) as { issues: Array<{ id: string; title: string }> }
+		).issues.find((i) => i.title.includes('api0 mgmt roundtrip'))!;
+		expect(issue).toBeDefined();
+
+		const detail = await api0Get(owner.token, `/organizations/o/issues/${issue.id}/`);
+		expect(detail.status).toBe(200);
+		const group = (await detail.json()) as Record<string, unknown>;
+		expect(group.id).toBe(issue.id);
+		expect(group.status).toBe('unresolved');
+		expect(Array.isArray(group.activity)).toBe(true);
+
+		// Alias path without org segment
+		const alias = await api0Get(owner.token, `/issues/${issue.id}`);
+		expect(alias.status).toBe(200);
+
+		// PUT resolve (mark complete) — with assignedTo tolerated
+		const put = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${issue.id}/`,
+			'PUT',
+			{
+				status: 'resolved',
+				assignedTo: 'user:1',
+			},
+		);
+		expect(put.status).toBe(200);
+		expect(((await put.json()) as Record<string, unknown>).status).toBe('resolved');
+
+		// Detail reflects it; ignored via muted mapping; invalid status 400
+		const after = await api0Get(owner.token, `/issues/${issue.id}/`);
+		expect(((await after.json()) as Record<string, unknown>).status).toBe('resolved');
+
+		const muted = await api0Send(owner.token, `http://localhost/api/0/issues/${issue.id}/`, 'PUT', {
+			status: 'muted',
+		});
+		expect(muted.status).toBe(200);
+		expect(((await muted.json()) as Record<string, unknown>).status).toBe('ignored');
+
+		const invalid = await api0Send(
+			owner.token,
+			`http://localhost/api/0/issues/${issue.id}/`,
+			'PUT',
+			{
+				status: 'wat',
+			},
+		);
+		expect(invalid.status).toBe(400);
+		const invalidBody = (await invalid.json()) as { detail: string };
+		expect(invalidBody.detail.includes('invalid status')).toBe(true);
+
+		const unknown = await api0Send(
+			owner.token,
+			'http://localhost/api/0/issues/00000000-0000-0000-0000-000000000000/',
+			'PUT',
+			{ status: 'resolved' },
+		);
+		expect(unknown.status).toBe(404);
+		expect(await unknown.json()).toEqual({ detail: 'not found' });
+
+		// Outsider cannot update or even see the issue
+		const outsidePut = await api0Send(
+			outsider.token,
+			`http://localhost/api/0/issues/${issue.id}/`,
+			'PUT',
+			{
+				status: 'resolved',
+			},
+		);
+		expect(outsidePut.status).toBe(404);
+		expect(await outsidePut.json()).toEqual({ detail: 'not found' });
+
+		// DELETE → 202, then gone
+		const del = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${issue.id}/`,
+			'DELETE',
+		);
+		expect(del.status).toBe(202);
+		const gone = await api0Get(owner.token, `/issues/${issue.id}/`);
+		expect(gone.status).toBe(404);
+	}, 120_000);
+
+	it('eventids lookup, issue events, latest selector, and project event detail', async () => {
+		const firstEvent = hexId();
+		const secondEvent = hexId();
+		// Same exception type groups both events into one issue
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, firstEvent),
+				'\n',
+				...eventItem(firstEvent, 'api0 events probe'),
+				...attachmentItem('trace.txt', 'trace payload'),
+			]),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 4));
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, secondEvent),
+				'\n',
+				...eventItem(secondEvent, 'api0 events probe'),
+			]),
+		);
+
+		const lookup = await api0Get(owner.token, `/organizations/o/eventids/${secondEvent}/`);
+		expect(lookup.status).toBe(200);
+		const resolved = (await lookup.json()) as {
+			eventId: string;
+			groupId: string;
+			projectSlug: string;
+			organizationSlug: string;
+			event: Record<string, unknown>;
+		};
+		expect(resolved.eventId).toBe(secondEvent);
+		expect(resolved.projectSlug).toBe(projectA.slug);
+		expect(resolved.organizationSlug).toBe('sentinel');
+		expect(resolved.event.eventID).toBe(secondEvent);
+		expect(resolved.event.groupID).toBe(resolved.groupId);
+		const missing = await api0Get(owner.token, `/organizations/o/eventids/${hexId()}/`);
+		expect(missing.status).toBe(404);
+		expect(await missing.json()).toEqual({ detail: 'not found' });
+
+		const issueId = resolved.groupId;
+		const events = await api0Get(owner.token, `/organizations/o/issues/${issueId}/events/`);
+		expect(events.status).toBe(200);
+		const eventList = (await events.json()) as Array<Record<string, unknown>>;
+		expect(eventList.map((e) => e.eventID)).toEqual([secondEvent, firstEvent]);
+
+		// per_page window + Link
+		const paged = await api0Get(
+			owner.token,
+			`/organizations/o/issues/${issueId}/events/?per_page=1`,
+		);
+		const pageOne = (await paged.json()) as Array<Record<string, unknown>>;
+		expect(pageOne.map((e) => e.eventID)).toEqual([secondEvent]);
+		expect((paged.headers.get('Link') ?? '').includes('rel="next"')).toBe(true);
+
+		// latest / oldest / concrete selectors (org + project paths)
+		const latest = await api0Get(owner.token, `/organizations/o/issues/${issueId}/events/latest/`);
+		expect(((await latest.json()) as Record<string, unknown>).eventID).toBe(secondEvent);
+		const oldest = await api0Get(
+			owner.token,
+			`/projects/o/${projectA.slug}/issues/${issueId}/events/oldest/`,
+		);
+		expect(((await oldest.json()) as Record<string, unknown>).eventID).toBe(firstEvent);
+		const concrete = await api0Get(
+			owner.token,
+			`/organizations/o/issues/${issueId}/events/${firstEvent}/`,
+		);
+		expect(((await concrete.json()) as Record<string, unknown>).eventID).toBe(firstEvent);
+		const noEvent = await api0Get(
+			owner.token,
+			`/organizations/o/issues/${issueId}/events/${hexId()}/`,
+		);
+		expect(noEvent.status).toBe(404);
+
+		// Project event detail route (attachments sibling)
+		const detail = await api0Get(owner.token, `/projects/o/${projectA.slug}/events/${firstEvent}/`);
+		expect(detail.status).toBe(200);
+		const detailEvent = (await detail.json()) as Record<string, unknown>;
+		expect(detailEvent.eventID).toBe(firstEvent);
+		expect(detailEvent.groupID).toBe(issueId);
+	}, 120_000);
+
+	it('comments round-trip with Sentry note shapes', async () => {
+		await postEnvelope(
+			projectB,
+			frame([
+				envelopeHeader(projectB, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 comments probe'),
+			]),
+		);
+		const native = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectB.slug}/issues`,
+		);
+		const issueId = ((await native.json()) as { issues: Array<{ id: string }> }).issues[0].id;
+
+		const created = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${issueId}/comments/`,
+			'POST',
+			{ text: 'agent triage note' },
+		);
+		expect(created.status).toBe(201);
+		const comment = (await created.json()) as Record<string, unknown>;
+		expect(comment.text).toBe('agent triage note');
+		expect(comment.issueId).toBe(issueId);
+		expect((comment.user as Record<string, unknown>).name).toBe('Api0 Manager');
+
+		const list = await api0Get(owner.token, `/organizations/o/issues/${issueId}/comments/`);
+		expect(list.status).toBe(200);
+		const comments = (await list.json()) as Array<Record<string, unknown>>;
+		expect(comments).toHaveLength(1);
+		expect(comments[0].id).toBe(comment.id);
+
+		const empty = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${issueId}/comments/`,
+			'POST',
+			{ text: '   ' },
+		);
+		expect(empty.status).toBe(400);
+		expect(((await empty.json()) as { detail: string }).detail.includes('text')).toBe(true);
+
+		const del = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${issueId}/comments/${comment.id}/`,
+			'DELETE',
+		);
+		expect(del.status).toBe(204);
+		const after = await api0Get(owner.token, `/organizations/o/issues/${issueId}/comments/`);
+		expect(await after.json()).toEqual([]);
+	}, 120_000);
+
+	it('rejects malformed and inherited-key request bodies', async () => {
+		await postEnvelope(
+			projectA,
+			frame([
+				envelopeHeader(projectA, hexId()),
+				'\n',
+				...eventItem(hexId(), 'api0 validation probe'),
+			]),
+		);
+		const native = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectA.slug}/issues`,
+		);
+		const issue = (
+			(await native.json()) as { issues: Array<{ id: string; title: string }> }
+		).issues.find((i) => i.title.includes('api0 validation probe'))!;
+
+		// null / array / scalar bodies and inherited status names → 400, never 500
+		for (const [label, raw] of [
+			['null body', 'null'],
+			['array body', '[{"status":"resolved"}]'],
+			['scalar body', '"resolved"'],
+			['inherited key toString', '{"status":"toString"}'],
+			['inherited key constructor', '{"status":"constructor"}'],
+			['inherited key __proto__', '{"status":"__proto__"}'],
+		] as const) {
+			const res = await compatFetch(owner.token, `http://localhost/api/0/issues/${issue.id}/`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: raw,
+			});
+			expect(res.status, label).toBe(400);
+			const body = (await res.json()) as { detail: string };
+			expect(typeof body.detail, label).toBe('string');
+		}
+
+		for (const [label, raw] of [
+			['null body', 'null'],
+			['array body', '["note"]'],
+			['null text', '{"text":null}'],
+		] as const) {
+			const res = await compatFetch(
+				owner.token,
+				`http://localhost/api/0/organizations/o/issues/${issue.id}/comments/`,
+				{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw },
+			);
+			expect(res.status, label).toBe(400);
+		}
+	}, 120_000);
+
+	it('comment deletion is issue-scoped', async () => {
+		// Two issues in the same project, comment lives on the second
+		await postEnvelope(
+			projectA,
+			frame([envelopeHeader(projectA, hexId()), '\n', ...eventItem(hexId(), 'api0 scope alpha')]),
+		);
+		await postEnvelope(
+			projectA,
+			frame([envelopeHeader(projectA, hexId()), '\n', ...eventItem(hexId(), 'api0 scope beta')]),
+		);
+		const native = await authFetch(
+			owner.token!,
+			`http://localhost/api/projects/${projectA.slug}/issues`,
+		);
+		const issues = ((await native.json()) as { issues: Array<{ id: string; title: string }> })
+			.issues;
+		const alpha = issues.find((i) => i.title.includes('scope alpha'))!;
+		const beta = issues.find((i) => i.title.includes('scope beta'))!;
+
+		const created = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${beta.id}/comments/`,
+			'POST',
+			{ text: 'beta-only note' },
+		);
+		expect(created.status).toBe(201);
+		const commentId = ((await created.json()) as { id: string }).id;
+
+		// Deleting via ANOTHER issue's URL fails — even for the author
+		const wrongIssue = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${alpha.id}/comments/${commentId}/`,
+			'DELETE',
+		);
+		expect(wrongIssue.status).toBe(404);
+		expect(await wrongIssue.json()).toEqual({ detail: 'not found' });
+
+		// The comment survives; the correct URL deletes it
+		const stillThere = await api0Get(owner.token, `/organizations/o/issues/${beta.id}/comments/`);
+		expect((await stillThere.json()) as unknown[]).toHaveLength(1);
+		const correct = await api0Send(
+			owner.token,
+			`http://localhost/api/0/organizations/o/issues/${beta.id}/comments/${commentId}/`,
+			'DELETE',
+		);
+		expect(correct.status).toBe(204);
+	}, 120_000);
+
+	it('issue events paginate past 100 with a truthful Link and exact selectors', async () => {
+		const message = 'api0 long tail probe';
+		const firstEvent = hexId();
+		const lastEvent = hexId();
+		// 105 events on ONE issue, ALL sharing one fixed client timestamp
+		// (sanitize passes it through within ±1 day): every row ties on the
+		// sort key, so only the composite `<timestamp>|<id>` cursor keeps
+		// page 2 from skipping rows.
+		const tied = new Date(Date.now() - 60_000).toISOString();
+		const tiedEnvelope = (id: string) =>
+			frame([
+				envelopeHeader(projectA, id),
+				'\n',
+				JSON.stringify({ type: 'event' }),
+				'\n',
+				JSON.stringify({
+					event_id: id,
+					timestamp: tied,
+					platform: 'javascript',
+					level: 'error',
+					message,
+				}),
+				'\n',
+			]);
+		await postEnvelope(projectA, tiedEnvelope(firstEvent));
+		const allIds = [firstEvent];
+		for (let i = 0; i < 103; i++) {
+			const id = hexId();
+			allIds.push(id);
+			await postEnvelope(projectA, tiedEnvelope(id));
+		}
+		allIds.push(lastEvent);
+		await postEnvelope(projectA, tiedEnvelope(lastEvent));
+
+		const lookup = await api0Get(owner.token, `/organizations/o/eventids/${firstEvent}/`);
+		const issueId = ((await lookup.json()) as { groupId: string }).groupId;
+
+		// Page 1: 100 events, Link promises more — all with the same timestamp
+		const page1 = await api0Get(
+			owner.token,
+			`/organizations/o/issues/${issueId}/events/?per_page=100`,
+		);
+		expect(page1.status).toBe(200);
+		const first = (await page1.json()) as Array<Record<string, unknown>>;
+		expect(first).toHaveLength(100);
+		for (const event of first) {
+			expect(event.dateCreated).toBe(tied);
+		}
+		const links1 = parseLinkHeader(page1.headers.get('Link'));
+		expect(links1.next?.results).toBe('true');
+
+		// Page 2 via the emitted cursor: the remaining 5 tied rows survive
+		const page2 = await compatFetch(owner.token, links1.next!.url);
+		expect(page2.status).toBe(200);
+		const second = (await page2.json()) as Array<Record<string, unknown>>;
+		expect(second).toHaveLength(5);
+		expect(parseLinkHeader(page2.headers.get('Link')).next?.results).toBe('false');
+
+		const seen = new Set([...first, ...second].map((e) => e.eventID));
+		expect(seen.size).toBe(105);
+		expect(seen.has(firstEvent)).toBe(true);
+		expect(seen.has(lastEvent)).toBe(true);
+
+		// Exact selectors beyond the first page resolve via point lookup.
+		// With every timestamp tied, oldest/latest fall to the id tie-break:
+		// lexicographically smallest / largest event ids.
+		const expectedOldest = [...seen].sort()[0];
+		const expectedLatest = [...seen].sort()[seen.size - 1];
+		const oldest = await api0Get(owner.token, `/organizations/o/issues/${issueId}/events/oldest/`);
+		expect(((await oldest.json()) as Record<string, unknown>).eventID).toBe(expectedOldest);
+		const latest = await api0Get(owner.token, `/organizations/o/issues/${issueId}/events/latest/`);
+		expect(((await latest.json()) as Record<string, unknown>).eventID).toBe(expectedLatest);
+		const concrete = await api0Get(
+			owner.token,
+			`/organizations/o/issues/${issueId}/events/${firstEvent}/`,
+		);
+		expect(((await concrete.json()) as Record<string, unknown>).eventID).toBe(firstEvent);
+	}, 240_000);
+
+	it('project issue list paginates past 100 with a truthful Link', async () => {
+		// 105 distinct issues in a fresh project
+		const project = await createTestProject(owner.token!, { name: `Api0 Page ${Date.now()}` });
+		for (let i = 0; i < 105; i++) {
+			await postEnvelope(
+				project,
+				frame([
+					envelopeHeader(project, hexId()),
+					'\n',
+					...eventItem(hexId(), `api0 paging issue ${String(i).padStart(3, '0')}`),
+				]),
+			);
+		}
+
+		const page1 = await api0Get(owner.token, `/projects/o/${project.slug}/issues/?limit=100`);
+		expect(page1.status).toBe(200);
+		const first = (await page1.json()) as Array<Record<string, unknown>>;
+		expect(first).toHaveLength(100);
+		const links1 = parseLinkHeader(page1.headers.get('Link'));
+		expect(links1.next?.results).toBe('true');
+
+		const page2 = await compatFetch(owner.token, links1.next!.url);
+		expect(page2.status).toBe(200);
+		const second = (await page2.json()) as Array<Record<string, unknown>>;
+		expect(second).toHaveLength(5);
+		expect(parseLinkHeader(page2.headers.get('Link')).next?.results).toBe('false');
+
+		const seen = new Set([...first, ...second].map((g) => g.id));
+		expect(seen.size).toBe(105);
+
+		// Equal-count ties (every issue has count 1) under sort=freq: the
+		// composite `<count>|<id>` cursor must still page all 105 rows.
+		const freqPage1 = await api0Get(
+			owner.token,
+			`/projects/o/${project.slug}/issues/?limit=100&sort=freq`,
+		);
+		const freqFirst = (await freqPage1.json()) as Array<Record<string, unknown>>;
+		expect(freqFirst).toHaveLength(100);
+		const freqLinks = parseLinkHeader(freqPage1.headers.get('Link'));
+		expect(freqLinks.next?.results).toBe('true');
+		const freqPage2 = await compatFetch(owner.token, freqLinks.next!.url);
+		const freqSecond = (await freqPage2.json()) as Array<Record<string, unknown>>;
+		expect(freqSecond).toHaveLength(5);
+		const freqSeen = new Set([...freqFirst, ...freqSecond].map((g) => g.id));
+		expect(freqSeen.size).toBe(105);
+	}, 240_000);
 });
