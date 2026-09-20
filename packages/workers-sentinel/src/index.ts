@@ -57,7 +57,7 @@ app.use('/api/*', async (c, next) => {
 
 // Security headers for every response (API and dashboard assets alike)
 const CSP =
-	"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+	"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
 app.use('*', async (c, next) => {
 	await next();
 	const headers = new Headers(c.res.headers);
