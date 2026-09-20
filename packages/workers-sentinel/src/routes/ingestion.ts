@@ -370,12 +370,14 @@ class StreamingIngest {
 		const fixed = new FixedLengthStream(size);
 		const writer = fixed.writable.getWriter();
 		const upload = this.store.uploadAttachment(key, fixed.readable, size);
-		// If the upload rejects before consuming the stream (e.g. a faulted
-		// put), abort the writer so payload writes fail fast instead of
-		// blocking on backpressure forever. The true upload error is recorded
-		// first so the writer's abort error cannot mask it.
+		// If the upload rejects, abort the writer so payload writes fail
+		// fast instead of blocking on backpressure forever. The upload's own
+		// error is AUTHORITATIVE and overwrites any earlier failure: when a
+		// put fails mid-stream, the writer's abort artifact (a generic
+		// TypeError) can be recorded first and would otherwise mis-map a
+		// bucket failure (503) as a client parse error (400).
 		upload.catch((error: unknown) => {
-			this.recordFailure(error);
+			this.failure = error instanceof Error ? error : new Error(String(error));
 			void writer.abort(new Error('attachment upload failed')).catch(() => {});
 		});
 		this.sink = { kind: 'attachment-stream', writer, key, upload, filename, contentType, size };
@@ -886,7 +888,13 @@ function mapIngestError(
 		// Mid-body gzip stream error
 		return c.json({ error: 'decompression_failed', message: 'Failed to decompress body' }, 400);
 	}
-	// Framing/JSON/UTF-8 violations (EnvelopeFormatError) and stream errors
+	// Framing/JSON/UTF-8 violations (EnvelopeFormatError) and stream errors.
+	// Server-side detail for diagnosis; the response stays generic (the
+	// error message may echo attacker-controlled content).
+	console.error(
+		'Ingest stream error:',
+		error instanceof Error ? `${error.name}: ${error.message.slice(0, 200)}` : String(error),
+	);
 	return c.json({ error: 'parse_failed', message: 'Failed to parse envelope' }, 400);
 }
 
