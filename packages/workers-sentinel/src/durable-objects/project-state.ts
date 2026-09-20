@@ -313,12 +313,14 @@ export class ProjectState extends DurableObject<Env> {
 		await this.ensureSchema();
 
 		// Alarm liveness guarantee, independent of isolate warmth: a fired
-		// alarm that failed (and exhausted its retries) leaves nothing
-		// scheduled, and ensureSchema early-returns on warm isolates — so
-		// GC/migration/purge-retry coverage is re-armed on every request.
-		// (Cheap: one getAlarm storage read; scheduleNextAlarm never delays
-		// an earlier existing alarm.)
-		if ((await this.ctx.storage.getAlarm()) === null) {
+		// alarm that failed (and exhausted its retries) can leave nothing
+		// scheduled — or worse, a wedged overdue timestamp that the runtime
+		// never delivers — and ensureSchema early-returns on warm isolates.
+		// Re-arm whenever no FUTURE alarm exists, so GC/migration/purge-retry
+		// coverage survives both states. (Cheap: one getAlarm storage read;
+		// scheduleNextAlarm never delays a future alarm.)
+		const alarm = await this.ctx.storage.getAlarm();
+		if (alarm === null || alarm <= Date.now()) {
 			await this.scheduleNextAlarm();
 		}
 
