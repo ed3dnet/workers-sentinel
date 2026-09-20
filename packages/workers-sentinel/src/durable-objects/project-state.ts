@@ -2622,29 +2622,16 @@ export class ProjectState extends DurableObject<Env> {
 			? (this.sql
 					.exec(
 						`SELECT COUNT(*) AS n,
-						        COALESCE(SUM(storage IS NOT 'r2' AND data != ''), 0) AS eligible,
-						        COALESCE(SUM(storage IS NULL), 0) AS nullStorage
+						        COALESCE(SUM(storage IS NOT 'r2' AND data != ''), 0) AS eligible
 						 FROM attachments`,
 					)
-					.one() as { n: number; eligible: number; nullStorage?: number } | undefined)
+					.one() as { n: number; eligible: number } | undefined)
 			: undefined;
-		const sample = projectId
-			? this.sql
-					.exec(
-						`SELECT id, storage, r2_key, length(data) AS dataLen FROM attachments
-						 WHERE storage IS NOT 'r2' OR data != '' ORDER BY rowid LIMIT 3`,
-					)
-					.toArray()
-					.map((r) => `${r.id}|${r.storage ?? 'NULL'}|${r.r2_key ?? '-'}|${r.dataLen}`)
-			: [];
 		console.log(
 			`ProjectState alarm: gcRemoved=${gcRemoved} migratedInline=${migrated}` +
 				(retentionDays > 0 ? ' retention=ran' : '') +
 				` projectId=${projectId ? 'set' : 'MISSING'}` +
-				(inlineRows
-					? ` attachmentRows=${inlineRows.n} eligibleInline=${inlineRows.eligible} nullStorage=${inlineRows.nullStorage ?? 0}`
-					: '') +
-				` sample=[${sample.join(' ; ')}]`,
+				(inlineRows ? ` attachmentRows=${inlineRows.n} eligibleInline=${inlineRows.eligible}` : ''),
 		);
 
 		// The alarm wrapper reschedules (earliest of next retention run,
