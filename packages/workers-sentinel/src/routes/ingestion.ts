@@ -60,6 +60,23 @@ class EarlyRateLimitError extends Error {
 	}
 }
 
+/**
+ * Internal-service failure while setting up attachment ingestion (the lazy
+ * DO touch): server-side, not a client framing error and not a bucket
+ * failure — surfaced as its own 503 so clients and logs can tell them
+ * apart.
+ */
+class TouchUnavailableError extends Error {
+	constructor(cause: unknown) {
+		super(
+			`attachment touch failed: ${
+				cause instanceof Error ? cause.message.slice(0, 120) : 'unknown'
+			}`,
+		);
+		this.name = 'TouchUnavailableError';
+	}
+}
+
 /** Decompressed request body passed the hard 64 MiB ceiling. */
 class DecompressedTooLargeError extends Error {
 	constructor() {
@@ -116,6 +133,8 @@ class StreamingIngest {
 	private readonly framer: EnvelopeFramer;
 	private readonly nonce = crypto.randomUUID().replace(/-/g, '');
 	private runningBytes = 0;
+	/** Request-wide buffered non-attachment payload bytes (shared 5 MiB budget). */
+	private nonAttachmentBytes = 0;
 	private storableCount = 0;
 	private ordinal = 0;
 	private touched = false;
@@ -164,6 +183,32 @@ class StreamingIngest {
 	}
 
 	/**
+	 * Push that prefers an already-recorded handler failure: after a storage
+	 * failure the framer keeps framing the remaining bytes and may throw a
+	 * framing error first, which would otherwise mis-map a 503 as a 400
+	 * depending on chunk boundaries.
+	 */
+	async pushGuarded(chunk: Uint8Array): Promise<void> {
+		try {
+			await this.framer.push(chunk);
+		} catch (error) {
+			if (this.failure !== null) throw this.failure;
+			throw error;
+		}
+		this.raiseIfFailed();
+	}
+
+	async finishGuarded(): Promise<void> {
+		try {
+			await this.framer.end();
+		} catch (error) {
+			if (this.failure !== null) throw this.failure;
+			throw error;
+		}
+		this.raiseIfFailed();
+	}
+
+	/**
 	 * First handler failure, if any. Event handlers never throw across the
 	 * framer boundary (workerd flags such rejections as unhandled even when
 	 * awaited): failures are recorded here and re-raised from the caller's
@@ -208,20 +253,28 @@ class StreamingIngest {
 	private async ensureTouched(): Promise<void> {
 		if (this.touched) return;
 		this.touched = true;
-		const response = await this.projectState.fetch(
-			new Request('http://internal/touch', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ projectId: this.projectId }),
-			}),
-		);
-		if (response.ok) {
-			const data = (await response.json()) as { isLimited?: boolean; retryAfterSeconds?: number };
-			if (data.isLimited) {
-				throw new EarlyRateLimitError(String(data.retryAfterSeconds ?? 3600));
-			}
+		let response: Response;
+		try {
+			response = await this.projectState.fetch(
+				new Request('http://internal/touch', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ projectId: this.projectId }),
+				}),
+			);
+		} catch (error) {
+			// Fail closed: without the touch there is no GC coverage
+			// guarantee for any blob this request would upload.
+			throw new TouchUnavailableError(error);
 		}
-		// Non-ok touch: fall through — the ingest call surfaces real errors.
+		if (!response.ok) {
+			// Same fail-closed rule for error responses (e.g. a DO 500).
+			throw new TouchUnavailableError(new Error(`touch status ${response.status}`));
+		}
+		const data = (await response.json()) as { isLimited?: boolean; retryAfterSeconds?: number };
+		if (data.isLimited) {
+			throw new EarlyRateLimitError(String(data.retryAfterSeconds ?? 3600));
+		}
 	}
 
 	private async onEvent(event: EnvelopeFramerEvent): Promise<void> {
@@ -339,7 +392,12 @@ class StreamingIngest {
 			case 'event-buffer': {
 				sink.chunks.push(chunk);
 				sink.bytes += chunk.byteLength;
-				if (sink.bytes > MAX_NONATTACHMENT_ITEM_BYTES) {
+				// Shared request-wide budget across ALL non-attachment items:
+				// each item's counter resets, this one never does, so many
+				// individually-small events cannot exhaust the decompressed
+				// allowance as buffered JSON.
+				this.nonAttachmentBytes += chunk.byteLength;
+				if (this.nonAttachmentBytes > MAX_NONATTACHMENT_ITEM_BYTES) {
 					this.recordFailure(new EnvelopeFormatError('Invalid envelope: item payload too large'));
 				}
 				return;
@@ -608,13 +666,11 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 					rawDecision = 'envelope';
 				}
 				for (const part of rawPrefix) {
-					await ingest.push(part);
-					ingest.raiseIfFailed();
+					await ingest.pushGuarded(part);
 				}
 				rawPrefix = [];
 			}
-			await ingest.push(value);
-			ingest.raiseIfFailed();
+			await ingest.pushGuarded(value);
 		}
 
 		if (rawDecision === 'undecided') {
@@ -627,8 +683,7 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 				return c.json({ error: 'parse_failed', message: 'Failed to parse envelope' }, 400);
 			}
 		} else {
-			await ingest.finish();
-			ingest.raiseIfFailed();
+			await ingest.finishGuarded();
 		}
 	} catch (error) {
 		ingest.abort();
@@ -699,6 +754,22 @@ async function handleIngestion(c: Context<{ Bindings: Env }>): Promise<Response>
 					{ error: 'rate_limited', message: 'Project event quota exceeded' },
 					{ status: 429, headers: { 'Retry-After': retryAfter } },
 				);
+			}
+
+			if (response.status === 503) {
+				const body = (await response.json().catch(() => null)) as { error?: string } | null;
+				if (body?.error === 'purge_pending') {
+					// The purge guard must reach the client, never an ack:
+					// drop any uploaded blobs (the sweep may already have
+					// passed their keys) and surface the 503.
+					if (singleEvent) {
+						await bestEffortDelete(store, ingest.uploadedKeys);
+					}
+					return c.json(
+						{ error: 'purge_pending', message: 'Project purge in progress' },
+						{ status: 503, headers: { 'Retry-After': '60' } },
+					);
+				}
 			}
 
 			if (response.ok) {
@@ -785,6 +856,14 @@ function mapIngestError(
 		return c.json(
 			{ error: 'rate_limited', message: 'Project event quota exceeded' },
 			{ status: 429, headers: { 'Retry-After': error.retryAfter } },
+		);
+	}
+	if (error instanceof TouchUnavailableError) {
+		// Server-side setup failure (not a client framing error, not a
+		// bucket failure): distinct error code, same retryable 503.
+		return c.json(
+			{ error: 'ingest_unavailable', message: 'Attachment ingestion temporarily unavailable' },
+			{ status: 503, headers: { 'Retry-After': '5' } },
 		);
 	}
 	if (error instanceof AttachmentStorageError) {

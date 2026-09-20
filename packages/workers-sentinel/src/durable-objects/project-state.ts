@@ -269,6 +269,7 @@ type IngestOutcome =
 	| { kind: 'duplicate' }
 	| { kind: 'filtered' }
 	| { kind: 'rate_limited' }
+	| { kind: 'purge_pending' }
 	| {
 			kind: 'stored';
 			issueId: string;
@@ -745,6 +746,13 @@ export class ProjectState extends DurableObject<Env> {
 			);
 		}
 
+		if (outcome.kind === 'purge_pending') {
+			return new Response(
+				JSON.stringify({ error: 'purge_pending', message: 'Project purge in progress' }),
+				{ status: 503, headers: { 'Content-Type': 'application/json' } },
+			);
+		}
+
 		if (outcome.kind === 'filtered') {
 			return this.jsonResponse({
 				filtered: true,
@@ -789,6 +797,13 @@ export class ProjectState extends DurableObject<Env> {
 		userHash: string | null,
 		attachments: ExtractedAttachment[],
 	): IngestOutcome {
+		// Purge admission is re-checked inside the transaction: the async
+		// preparation before it (user hashing) can suspend the handler while
+		// a purge starts, and writes must not land under the sweep.
+		if (this.getConfigValue('purge_pending') === '1') {
+			return { kind: 'purge_pending' };
+		}
+
 		// Atomic quota admission: the pre-transaction check is advisory (it
 		// runs before async prep, where requests can interleave); this one
 		// reads the persisted counter inside the transaction and is exact.
@@ -1337,9 +1352,12 @@ export class ProjectState extends DurableObject<Env> {
 		);
 
 		this.ctx.storage.transactionSync(() => {
+			// Seed BEFORE the cascade: on the first delete after upgrade the
+			// counter row may not exist yet, and seeding after the delete
+			// would already exclude the deleted bytes (undercounting).
+			this.seedAttachmentUsage();
 			// Delete cascade handles events, stats, users
 			this.sql.exec('DELETE FROM issues WHERE id = ?', issueId);
-			this.seedAttachmentUsage();
 			this.sql.exec(
 				'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
 				totalBytes,
@@ -1403,12 +1421,13 @@ export class ProjectState extends DurableObject<Env> {
 			);
 			let affected = 0;
 			this.ctx.storage.transactionSync(() => {
+				// Seed BEFORE the delete (see handleDeleteIssue)
+				this.seedAttachmentUsage();
 				const cursor = this.sql.exec(
 					`DELETE FROM issues WHERE id IN (${placeholders})`,
 					...issueIds,
 				);
 				affected = cursor.rowsWritten;
-				this.seedAttachmentUsage();
 				this.sql.exec(
 					'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
 					totalBytes,
@@ -2523,6 +2542,9 @@ export class ProjectState extends DurableObject<Env> {
 			);
 
 			this.ctx.storage.transactionSync(() => {
+				// Seed BEFORE the deletes (see handleDeleteIssue)
+				this.seedAttachmentUsage();
+
 				// Delete old events (attachment rows cascade)
 				this.sql.exec('DELETE FROM events WHERE received_at < ?', cutoffDate);
 
@@ -2552,7 +2574,6 @@ export class ProjectState extends DurableObject<Env> {
 				// Clean up orphaned issue_users for deleted issues
 				this.sql.exec('DELETE FROM issue_users WHERE issue_id NOT IN (SELECT id FROM issues)');
 
-				this.seedAttachmentUsage();
 				this.sql.exec(
 					'UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1',
 					totalBytes,

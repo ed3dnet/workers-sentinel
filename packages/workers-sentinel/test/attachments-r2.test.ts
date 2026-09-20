@@ -509,6 +509,82 @@ describe('attachments in R2', () => {
 		expect(await listKeys(`p/${project.id}/`)).toEqual([]);
 	});
 
+	it('shared non-attachment budget: many individually-small events exceeding 5 MiB total → 400', async () => {
+		const project = await createTestProject(testUser.token!, { name: `Shared ${Date.now()}` });
+		const parts: Array<string | Uint8Array> = [
+			envelopeHeader(project, crypto.randomUUID().replace(/-/g, '')),
+			'\n',
+		];
+		// 12 events × ~512 KiB each: every item is under the per-item bound,
+		// but the request-wide shared budget (5 MiB) is exceeded
+		const bigMessage = 'm'.repeat(512 * 1024);
+		for (let i = 0; i < 12; i++) {
+			const eventId = crypto.randomUUID().replace(/-/g, '');
+			parts.push(
+				JSON.stringify({ type: 'event' }),
+				'\n',
+				enc.encode(
+					JSON.stringify({
+						event_id: eventId,
+						timestamp: new Date().toISOString(),
+						platform: 'javascript',
+						message: bigMessage,
+					}),
+				),
+				'\n',
+			);
+		}
+		const response = await postEnvelope(project, frame(parts));
+		expect(response.status).toBe(400);
+		// Nothing was stored: no events at all
+		const issues = await authFetch(
+			testUser.token!,
+			`http://localhost/api/projects/${project.slug}/issues`,
+		);
+		const issuesData = (await issues.json()) as { issues: unknown[] };
+		expect(issuesData.issues ?? []).toHaveLength(0);
+	});
+
+	it('purge_pending rejects a real-route envelope ingest with 503 and cleans blobs', async () => {
+		const project = await createTestProject(testUser.token!, { name: `Purge503 ${Date.now()}` });
+		const stub = projectStub(project.id);
+
+		// Start a pending purge (faulted sweep keeps the project's DO alive;
+		// the project itself remains registered, so DSN auth still works)
+		const pending = await stub.fetch('http://internal/purge', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ projectId: project.id, fault: 'purge-sweep' }),
+		});
+		expect(((await pending.json()) as { pending?: boolean }).pending ?? false).toBe(true);
+
+		// A real envelope ingest with an attachment: the blob uploads, then
+		// the DO ingest boundary rejects with purge_pending and the worker
+		// must surface 503 (never an ack) and delete the blob
+		const eventId = crypto.randomUUID().replace(/-/g, '');
+		const response = await postEnvelope(
+			project,
+			frame([
+				envelopeHeader(project, eventId),
+				'\n',
+				...eventItem(eventId, 'ingest during pending purge'),
+				...attachmentItem('p.txt', 'purge race'),
+			]),
+		);
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as { error?: string };
+		expect(body.error).toBe('purge_pending');
+		expect(await listKeys(`p/${project.id}/`)).toEqual([]);
+		const stored = await authFetch(
+			testUser.token!,
+			`http://localhost/api/projects/${project.slug}/events/${eventId}`,
+		);
+		expect(stored.status).toBe(404);
+
+		// Finish the purge so later suites see a clean project
+		await runDurableObjectAlarm(stub);
+	});
+
 	it('retry is idempotent; GC removes only expired orphans (AC.4)', async () => {
 		const project = await createTestProject(testUser.token!, { name: `GC ${Date.now()}` });
 		const eventId = crypto.randomUUID().replace(/-/g, '');
@@ -897,9 +973,33 @@ describe('attachments in R2', () => {
 		expect(unsat.status).toBe(416);
 		expect(unsat.headers.get('Content-Range')).toBe('bytes */4096');
 
+		// Zero-byte attachment: any range is unsatisfiable (never a
+		// zero-length 206 with an invalid Content-Range)
+		{
+			const emptyId = crypto.randomUUID().replace(/-/g, '');
+			await postEnvelope(
+				project,
+				frame([
+					envelopeHeader(project, emptyId),
+					'\n',
+					...eventItem(emptyId, 'zero byte range'),
+					...attachmentItem('empty.bin', ''),
+				]),
+			);
+			const emptyList = await listAttachments(testUser.token!, project.slug, emptyId);
+			const emptyUrl = `http://localhost/api/projects/${project.slug}/attachments/${emptyList.attachments[0].id}`;
+			const emptyRange = await authFetch(testUser.token!, emptyUrl, {
+				headers: { Range: 'bytes=-1' },
+			});
+			expect(emptyRange.status).toBe(416);
+			expect(emptyRange.headers.get('Content-Range')).toBe('bytes */0');
+		}
+
 		// Metadata exists, blob gone → distinct 404
-		const [key] = await listKeys(`p/${project.id}/`);
-		await env.ATTACHMENTS.delete(key);
+		const objects = await env.ATTACHMENTS.list({ prefix: `p/${project.id}/` });
+		const target = objects.objects.find((o) => o.size === 4096);
+		expect(target).toBeDefined();
+		await env.ATTACHMENTS.delete(target!.key);
 		const missing = await authFetch(testUser.token!, url);
 		expect(missing.status).toBe(404);
 		expect(((await missing.json()) as { error: string }).error).toBe('attachment_data_missing');

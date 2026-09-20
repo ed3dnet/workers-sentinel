@@ -135,9 +135,10 @@ function parseRange(header: string | undefined, size: number): ByteRange | 'unsa
 	if (!match || (match[1] === '' && match[2] === '')) return null;
 	const total = size;
 	if (match[1] === '') {
-		// suffix range: last N bytes
+		// suffix range: last N bytes (unsatisfiable on an empty representation)
 		const suffix = Number.parseInt(match[2], 10);
 		if (!Number.isInteger(suffix) || suffix <= 0) return 'unsatisfiable';
+		if (total === 0) return 'unsatisfiable';
 		if (suffix >= total) return { offset: 0, length: total };
 		return { offset: total - suffix, length: suffix };
 	}
