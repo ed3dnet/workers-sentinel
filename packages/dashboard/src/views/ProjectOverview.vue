@@ -99,32 +99,56 @@ watch(slug, () => loadSummary());
 
 		<!-- Summary -->
 		<div v-else-if="summary">
-			<!-- Metric cards -->
+			<!-- Metric cards (click through to the issues list) -->
 			<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-				<div class="card p-4">
+				<RouterLink
+					:to="`/projects/${slug}/issues?status=unresolved`"
+					class="card p-4 block hover:border-primary-400 dark:hover:border-primary-600 hover:shadow-md transition-colors group"
+				>
 					<p class="text-2xl font-bold text-gray-900 dark:text-white">
 						{{ unresolvedCount.toLocaleString() }}
 					</p>
-					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Unresolved Issues</p>
-				</div>
-				<div class="card p-4">
+					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+						Unresolved Issues
+						<span class="opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
+					</p>
+				</RouterLink>
+				<RouterLink
+					:to="`/projects/${slug}/issues?status=`"
+					class="card p-4 block hover:border-primary-400 dark:hover:border-primary-600 hover:shadow-md transition-colors group"
+				>
 					<p class="text-2xl font-bold text-gray-900 dark:text-white">
 						{{ summary.events24h.toLocaleString() }}
 					</p>
-					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Events (24h)</p>
-				</div>
-				<div class="card p-4">
+					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+						Events (24h)
+						<span class="opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
+					</p>
+				</RouterLink>
+				<RouterLink
+					:to="`/projects/${slug}/issues?status=`"
+					class="card p-4 block hover:border-primary-400 dark:hover:border-primary-600 hover:shadow-md transition-colors group"
+				>
 					<p class="text-2xl font-bold text-gray-900 dark:text-white">
 						{{ summary.events7d.toLocaleString() }}
 					</p>
-					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Events (7d)</p>
-				</div>
-				<div class="card p-4">
+					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+						Events (7d)
+						<span class="opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
+					</p>
+				</RouterLink>
+				<RouterLink
+					:to="`/projects/${slug}/issues?sort=user`"
+					class="card p-4 block hover:border-primary-400 dark:hover:border-primary-600 hover:shadow-md transition-colors group"
+				>
 					<p class="text-2xl font-bold text-gray-900 dark:text-white">
 						{{ summary.totalUsers.toLocaleString() }}
 					</p>
-					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Users Affected</p>
-				</div>
+					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+						Users Affected
+						<span class="opacity-0 group-hover:opacity-100 transition-opacity" aria-hidden="true">→</span>
+					</p>
+				</RouterLink>
 			</div>
 
 			<!-- Error trend chart -->

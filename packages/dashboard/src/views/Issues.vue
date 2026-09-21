@@ -28,6 +28,22 @@ const slug = computed(() => route.params.slug as string);
 const currentProject = computed(() => projectsStore.projects.find((p) => p.slug === slug.value));
 const isCloudflareWorkers = computed(() => currentProject.value?.platform === 'cloudflare-workers');
 
+/** Status values the route query may seed (empty = all). */
+const QUERY_STATUSES = new Set(['', 'unresolved', 'resolved', 'ignored', 'snoozed']);
+const PAGE_SIZES = [25, 50, 100];
+
+function statusFromQuery(): string {
+	const raw = route.query.status;
+	return typeof raw === 'string' && QUERY_STATUSES.has(raw) ? raw : 'unresolved';
+}
+function sortFromQuery(): string {
+	return route.query.sort === 'user' ? 'user' : '';
+}
+function limitFromQuery(): number {
+	const raw = Number(route.query.limit);
+	return PAGE_SIZES.includes(raw) ? raw : 25;
+}
+
 interface TagFacet {
 	key: string;
 	issueCount: number;
@@ -38,7 +54,10 @@ interface TagFacet {
 const issues = ref<Issue[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
-const statusFilter = ref<string>('unresolved');
+// Seeded from the route query so overview cards can deep-link with filters
+const statusFilter = ref<string>(statusFromQuery());
+const sortMode = ref<string>(sortFromQuery());
+const pageSize = ref<number>(limitFromQuery());
 const environmentFilter = ref<string>('');
 const environments = ref<Array<{ name: string; issueCount: number }>>([]);
 const hasMore = ref(false);
@@ -165,6 +184,10 @@ async function loadIssues(append = false) {
 		if (environmentFilter.value) {
 			params.set('environment', environmentFilter.value);
 		}
+		if (sortMode.value === 'user') {
+			params.set('sort', 'user_count');
+		}
+		params.set('limit', String(pageSize.value));
 		if (append && nextCursor.value) {
 			params.set('cursor', nextCursor.value);
 		}
@@ -289,7 +312,23 @@ onMounted(() => {
 
 watch(statusFilter, () => loadIssues());
 watch(environmentFilter, () => loadIssues());
+watch(pageSize, () => loadIssues());
+watch(sortMode, () => loadIssues());
 watch(slug, () => loadIssues());
+// Component reuse: overview → issues navigations with a different query
+// remount nothing, so re-seed the filters when the query changes.
+watch(
+	() => [route.query.status, route.query.sort, route.query.limit] as const,
+	() => {
+		const nextStatus = statusFromQuery();
+		const nextSort = sortFromQuery();
+		const nextLimit = limitFromQuery();
+		// Ref watchers trigger the reload when values actually change
+		if (nextStatus !== statusFilter.value) statusFilter.value = nextStatus;
+		if (nextSort !== sortMode.value) sortMode.value = nextSort;
+		if (nextLimit !== pageSize.value) pageSize.value = nextLimit;
+	},
+);
 </script>
 
 <template>
@@ -302,6 +341,16 @@ watch(slug, () => loadIssues());
 				<option value="resolved">Resolved</option>
 				<option value="ignored">Ignored</option>
 				<option value="snoozed">Snoozed</option>
+			</select>
+			<select
+				v-model.number="pageSize"
+				class="input w-auto"
+				title="Issues per page"
+				aria-label="Issues per page"
+			>
+				<option :value="25">25 / page</option>
+				<option :value="50">50 / page</option>
+				<option :value="100">100 / page</option>
 			</select>
 			<select
 				v-for="facet in tagFacets"
@@ -503,6 +552,20 @@ Sentry.init({
 
 		<!-- Issues list -->
 		<div v-else class="card divide-y divide-gray-200 dark:divide-gray-700">
+			<!-- Page-scoped select-all -->
+			<div class="flex items-center px-4 py-2 text-xs text-gray-500 dark:text-gray-400">
+				<div class="pr-3">
+					<input
+						type="checkbox"
+						:checked="allSelected"
+						:indeterminate="someSelected && !allSelected"
+						class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+						aria-label="Select all issues on this page"
+						@change="toggleSelectAll"
+					/>
+				</div>
+				<span>{{ allSelected ? 'All' : 'Select all' }} {{ issues.length }} issue{{ issues.length !== 1 ? 's' : '' }} on this page</span>
+			</div>
 			<div
 				v-for="issue in issues"
 				:key="issue.id"
