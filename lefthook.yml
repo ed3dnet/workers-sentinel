@@ -5,15 +5,13 @@ pre-commit:
     - name: lint
       glob: "*.{js,mjs,cjs,ts,tsx,vue,json,jsonc}"
       run: pnpm exec biome check --no-errors-on-unmatched {staged_files}
-    # Unit suite (vitest-pool-workers, 324 tests) whenever worker code,
-    # tests, or config are part of the commit. The two env-variant suites run
-    # in their own worker processes: WEBAUTHN_ORIGINS allowlist coverage and
-    # credential-deletion coverage (isolated because the delete flow triggers
-    # a progressive runner slowdown in the shared main-suite worker — see
-    # AGENTS.md "Passkeys").
+    # Unit suite (vitest 4 + @cloudflare/vitest-plugin, 327 tests) whenever
+    # worker code, tests, or config are part of the commit. The origins
+    # variant runs in its own worker with WEBAUTHN_ORIGINS bound, covering
+    # the allowlist path of the trusted-origin policy.
     - name: unit tests
       glob: "{packages/workers-sentinel/src/**,packages/workers-sentinel/test/**,packages/workers-sentinel/wrangler.jsonc,packages/workers-sentinel/vitest.config.ts,pnpm-lock.yaml}"
-      run: pnpm --dir packages/workers-sentinel test && pnpm --dir packages/workers-sentinel test:webauthn-origins && pnpm --dir packages/workers-sentinel test:webauthn-management
+      run: pnpm --dir packages/workers-sentinel test && pnpm --dir packages/workers-sentinel test:webauthn-origins
     # Dashboard component suite whenever dashboard source or its test setup
     # is part of the commit.
     - name: dashboard tests

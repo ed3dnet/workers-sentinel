@@ -20,7 +20,6 @@
 		"cf-typegen": "wrangler types",
 		"test": "vitest run",
 		"test:webauthn-origins": "vitest run --config vitest.webauthn-origins.config.ts",
-		"test:webauthn-management": "vitest run --config vitest.webauthn-management.config.ts",
 		"test:watch": "vitest",
 		"test:ui": "vitest --ui"
 	},
@@ -51,9 +50,9 @@
 		"tsup": "^8.5.1"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.12.4",
+		"@cloudflare/vitest-plugin": "^1.2.1",
 		"@cloudflare/workers-types": "^4.20260118.0",
-		"vitest": "3.0.9",
+		"vitest": "4.1.11",
 		"wrangler": "^4.59.2"
 	},
 	"peerDependencies": {

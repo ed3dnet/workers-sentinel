@@ -134,7 +134,7 @@ Passkeys via `@simplewebauthn/server` (worker) and `@simplewebauthn/browser` (da
 
 Out of scope by design: conditional UI/autofill, multiple RP IDs beyond the derived one, passkey-only accounts, admin passkey management.
 
-**Test-suite isolation note**: under `vitest-pool-workers` `singleWorker` + `isolatedStorage: false`, exercising the credential-delete flow from the shared main-suite worker reproducibly triggers a progressive isolate-wide transport slowdown in the runner (even `/api/health` latency climbs; exactly one pre-existing marginal test — filters' 100-filter limit at its 20s timeout — falls over). Every configuration without those delete calls is green, `main` included; the delete shape (URL param vs body) is irrelevant, so it is a runner interaction, not application logic. Credential-deletion coverage therefore runs in its own worker via `just test-webauthn-origins`'s sibling `pnpm --dir packages/workers-sentinel test:webauthn-management` (`vitest.webauthn-management.config.ts`), wired into lefthook and the gate. If vitest-pool-workers/workerd fixes the underlying behavior, fold `test/webauthn-management.test.ts` back into `test/webauthn.test.ts`.
+**Runner history note**: the worker test toolchain was migrated from `@cloudflare/vitest-pool-workers@0.12.4` (vitest 3, workerd 1.20260114.0) to `@cloudflare/vitest-plugin@1.2.1` (vitest 4, current workerd). The old runner exhibited a reproducible progressive isolate-wide slowdown once a suite file exercised the credential-delete flow (even `/api/health` latency climbed until a marginal test timed out), which forced the delete tests into a quarantined worker; the migration fixed it and the quarantine was removed. Keep the plugin reasonably current if similar runner anomalies appear.
 
 ### Pagination
 
@@ -265,7 +265,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 324 across 35 files (`just test`) + 3 WebAuthn origin-variant tests (`test:webauthn-origins`) + 3 WebAuthn credential-management tests in their own worker (`test:webauthn-management`) — both variants run real-crypto virtual-authenticator ceremonies — + 14 dashboard component tests (`just test-dashboard`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 327 across 35 files (`just test`; vitest 4 + `@cloudflare/vitest-plugin`, one shared workerd with shared storage — `maxWorkers: 1, isolate: false` — because files depend on globally-shared state like first-user-admin) + 3 WebAuthn origin-variant tests (`test:webauthn-origins`, own worker with `WEBAUTHN_ORIGINS` bound) + 14 dashboard component tests (`just test-dashboard`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/the vitest configs — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 
@@ -321,7 +321,7 @@ npx wrangler r2 object get sentinel-attachments/p/<projectId>/... --remote --pip
 
 ## Testing
 
-Tests use `@cloudflare/vitest-pool-workers` with `isolatedStorage: false` and `singleWorker: true` for state persistence across tests within a describe block. DO operations may fail with "invalidating this Durable Object" error during test restarts—test utilities include retry logic for this.
+Tests use vitest 4 with `@cloudflare/vitest-plugin` (tests run inside a real workerd). The suite runs as one shared worker with shared storage (`maxWorkers: 1, isolate: false`) so state persists across tests within a run; DO operations may fail with "invalidating this Durable Object" error during test restarts—test utilities include retry logic for this.
 
 ## Code Style
 
