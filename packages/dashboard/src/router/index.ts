@@ -80,6 +80,11 @@ const router = createRouter({
 					component: () => import('../views/ApiTokens.vue'),
 				},
 				{
+					path: 'settings',
+					name: 'settings',
+					component: () => import('../views/Settings.vue'),
+				},
+				{
 					path: 'projects/:slug/filters',
 					name: 'project-filters',
 					component: () => import('../views/ProjectFilters.vue'),

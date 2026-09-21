@@ -19,6 +19,8 @@
 		"typecheck": "tsc --noEmit",
 		"cf-typegen": "wrangler types",
 		"test": "vitest run",
+		"test:webauthn-origins": "vitest run --config vitest.webauthn-origins.config.ts",
+		"test:webauthn-management": "vitest run --config vitest.webauthn-management.config.ts",
 		"test:watch": "vitest",
 		"test:ui": "vitest --ui"
 	},
@@ -44,6 +46,7 @@
 	"homepage": "https://github.com/G4brym/workers-sentinel#readme",
 	"dependencies": {
 		"@noble/hashes": "^2.4.0",
+		"@simplewebauthn/server": "13.2.2",
 		"hono": "^4.6.14",
 		"tsup": "^8.5.1"
 	},

@@ -12,6 +12,7 @@ import { memberRoutes } from './routes/members';
 import { projectRoutes } from './routes/projects';
 import { releaseRoutes } from './routes/releases';
 import { sourcemapRoutes } from './routes/sourcemaps';
+import { webauthnRoutes } from './routes/webauthn';
 import type { AuthContext, Env } from './types';
 
 // Re-export Durable Objects
@@ -84,6 +85,16 @@ app.route('/api/auth', authRoutes);
 app.use('/api/auth/tokens/*', authMiddleware);
 app.use('/api/auth/tokens', authMiddleware);
 app.route('/api/auth/tokens', tokenRoutes);
+
+// Passkey (WebAuthn) routes. Login ceremonies are public; register and
+// credential management are session-only (the manage router itself rejects
+// `wst_` API tokens with 403 session_required — AuthContext.session is
+// synthesized for API tokens, so the raw token prefix is the discriminator).
+app.use('/api/auth/webauthn/register/*', authMiddleware);
+app.use('/api/auth/webauthn/verify/register', authMiddleware);
+app.use('/api/auth/webauthn/credentials/*', authMiddleware);
+app.use('/api/auth/webauthn/credentials', authMiddleware);
+app.route('/api/auth/webauthn', webauthnRoutes);
 
 // Ingestion routes (DSN auth, not session auth)
 app.route('/api', ingestionRoutes);

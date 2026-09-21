@@ -1,7 +1,26 @@
 import { DurableObject } from 'cloudflare:workers';
+import type {
+	AuthenticationResponseJSON,
+	AuthenticatorTransportFuture,
+	RegistrationResponseJSON,
+} from '@simplewebauthn/server';
+import {
+	generateAuthenticationOptions,
+	generateRegistrationOptions,
+	verifyAuthenticationResponse,
+	verifyRegistrationResponse,
+} from '@simplewebauthn/server';
 import { hashPassword, hashToken, verifyPassword } from '../lib/password';
 import { validateWebhookUrl } from '../lib/webhook';
-import type { ApiToken, Env, Project, ProjectMember, Session, User } from '../types';
+import type {
+	ApiToken,
+	Env,
+	Project,
+	ProjectMember,
+	Session,
+	User,
+	WebauthnCredentialInfo,
+} from '../types';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -72,7 +91,39 @@ CREATE TABLE IF NOT EXISTS auth_throttle (
   window_start TEXT NOT NULL,
   locked_until TEXT
 );
+
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  public_key BLOB NOT NULL,
+  counter INTEGER NOT NULL DEFAULT 0,
+  transports TEXT,
+  aaguid TEXT,
+  backup_eligible INTEGER NOT NULL DEFAULT 0,
+  backed_up INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS webauthn_challenges (
+  ceremony_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  user_id TEXT,
+  challenge TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  rp_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_bucket ON webauthn_challenges(kind, user_id);
 `;
+
+/** WebAuthn challenge lifetime (5 minutes) and issuance caps. */
+const WEBAUTHN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const WEBAUTHN_MAX_CHALLENGES_PER_BUCKET = 10;
+const WEBAUTHN_MAX_TOTAL_CHALLENGES = 500;
 
 // Login must burn argon2 even when the user does not exist, so response
 // timing does not reveal account existence.
@@ -80,6 +131,43 @@ let dummyHashCache: string | null = null;
 function dummyPasswordHash(): string {
 	dummyHashCache ??= hashPassword('sentinel-timing-equalizer');
 	return dummyHashCache;
+}
+
+function bytesToBase64url(bytes: Uint8Array): string {
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64urlToBytes(text: string): Uint8Array<ArrayBuffer> {
+	const normalized = text.replace(/-/g, '+').replace(/_/g, '/');
+	const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
+	const binary = atob(padded);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	return bytes;
+}
+
+/** Exact-copy ArrayBuffer for a BLOB bind parameter. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	return bytes.slice().buffer;
+}
+
+/** Normalize a BLOB column value (ArrayBuffer or Uint8Array) to Uint8Array. */
+function blobToBytes(value: ArrayBuffer | Uint8Array): Uint8Array<ArrayBuffer> {
+	if (value instanceof Uint8Array) {
+		const copy = new Uint8Array(value.length);
+		copy.set(value);
+		return copy;
+	}
+	return new Uint8Array(value);
+}
+
+/** Stored transports JSON (written by JSON.stringify) back to the lib type. */
+function parseTransports(text: unknown): AuthenticatorTransportFuture[] | undefined {
+	return typeof text === 'string' && text
+		? (JSON.parse(text) as AuthenticatorTransportFuture[])
+		: undefined;
 }
 
 export class AuthState extends DurableObject<Env> {
@@ -103,6 +191,13 @@ export class AuthState extends DurableObject<Env> {
 		// Migration: add disabled flag on users
 		try {
 			this.sql.exec('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0');
+		} catch {
+			// Column already exists
+		}
+		// Migration: add the stable opaque WebAuthn user handle (never email;
+		// minted lazily on first passkey registration)
+		try {
+			this.sql.exec('ALTER TABLE users ADD COLUMN webauthn_user_id TEXT');
 		} catch {
 			// Column already exists
 		}
@@ -237,6 +332,22 @@ export class AuthState extends DurableObject<Env> {
 					return this.handleGetSettings(request);
 				case '/set-settings':
 					return this.handleSetSettings(request);
+				case '/webauthn/register/options':
+					return this.handleWebauthnRegisterOptions(request);
+				case '/webauthn/register/verify':
+					return this.handleWebauthnRegisterVerify(request);
+				case '/webauthn/login/options':
+					return this.handleWebauthnLoginOptions(request);
+				case '/webauthn/login/verify':
+					return this.handleWebauthnLoginVerify(request);
+				case '/webauthn/credentials':
+					return this.handleWebauthnListCredentials(request);
+				case '/webauthn/credential/delete':
+					return this.handleWebauthnDeleteCredential(request);
+				case '/webauthn/test/backdate-ceremony':
+					return this.handleWebauthnTestBackdate(request);
+				case '/webauthn/test/challenge-count':
+					return this.handleWebauthnTestChallengeCount();
 				default:
 					return new Response(JSON.stringify({ error: 'not_found' }), {
 						status: 404,
@@ -453,7 +564,12 @@ export class AuthState extends DurableObject<Env> {
 			updatedAt: userRow.updated_at as string,
 		};
 
-		return this.jsonResponse({ user, token: session.id });
+		// Additive: lets the client know the passkey nag state immediately
+		return this.jsonResponse({
+			user,
+			token: session.id,
+			hasPasskey: this.hasPasskey(userRow.id as string),
+		});
 	}
 
 	private async handleLogout(request: Request): Promise<Response> {
@@ -596,7 +712,7 @@ export class AuthState extends DurableObject<Env> {
 			createdAt: row.session_created as string,
 		};
 
-		return this.jsonResponse({ user, session });
+		return this.jsonResponse({ user, session, hasPasskey: this.hasPasskey(row.user_id as string) });
 	}
 
 	private async handleGetMe(request: Request): Promise<Response> {
@@ -1329,6 +1445,393 @@ export class AuthState extends DurableObject<Env> {
 		return this.jsonResponse({ settings: { registrationOpen: open } });
 	}
 
+	private async handleWebauthnRegisterOptions(request: Request): Promise<Response> {
+		const { userId, origin, rpID } = (await request.json()) as {
+			userId?: string;
+			origin?: string;
+			rpID?: string;
+		};
+		if (!userId || !origin || !rpID) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'userId, origin, and rpID are required' },
+				400,
+			);
+		}
+		const userRows = this.sql
+			.exec('SELECT id, email, name, disabled, webauthn_user_id FROM users WHERE id = ?', userId)
+			.toArray();
+		if (userRows.length === 0) {
+			return this.jsonResponse({ error: 'user_not_found' }, 404);
+		}
+		if ((userRows[0].disabled as number) === 1) {
+			return this.jsonResponse({ error: 'user_disabled' }, 403);
+		}
+
+		const webauthnUserId = this.ensureWebauthnUserId(
+			userId,
+			userRows[0].webauthn_user_id as string | null,
+		);
+
+		const existing = this.sql
+			.exec('SELECT id, transports FROM webauthn_credentials WHERE user_id = ?', userId)
+			.toArray();
+		const excludeCredentials = existing.map((row) => ({
+			id: row.id as string,
+			transports: parseTransports(row.transports),
+		}));
+
+		const options = await generateRegistrationOptions({
+			rpName: 'Workers Sentinel',
+			rpID,
+			userName: userRows[0].email as string,
+			userID: base64urlToBytes(webauthnUserId),
+			userDisplayName: userRows[0].name as string,
+			attestationType: 'none',
+			authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
+			excludeCredentials,
+		});
+
+		const ceremonyId = this.storeChallenge('register', userId, options.challenge, origin, rpID);
+		return this.jsonResponse({ options, ceremonyId });
+	}
+
+	private async handleWebauthnRegisterVerify(request: Request): Promise<Response> {
+		const { userId, ceremonyId, name, response, origin, rpID } = (await request.json()) as {
+			userId?: string;
+			ceremonyId?: string;
+			name?: string;
+			response?: RegistrationResponseJSON;
+			origin?: string;
+			rpID?: string;
+		};
+		if (!userId || !origin || !rpID) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'userId, origin, and rpID are required' },
+				400,
+			);
+		}
+
+		// Claim the ceremony synchronously FIRST: once the body carries a
+		// parseable ceremonyId, the challenge row is consumed before any other
+		// validation, so every identified attempt (blank name, malformed
+		// payload, failed verification alike) burns it.
+		const claim =
+			typeof ceremonyId === 'string' && ceremonyId.length > 0
+				? this.claimCeremony(ceremonyId, 'register', userId, origin, rpID)
+				: null;
+		if (!claim) {
+			return this.jsonResponse(
+				{ error: 'ceremony_invalid', message: 'Unknown, expired, or mismatched ceremony' },
+				400,
+			);
+		}
+
+		const trimmedName = typeof name === 'string' ? name.trim() : '';
+		if (!trimmedName) {
+			return this.jsonResponse(
+				{ error: 'name_required', message: 'A name for the passkey is required' },
+				400,
+			);
+		}
+		if (trimmedName.length > 100) {
+			return this.jsonResponse(
+				{ error: 'invalid_name', message: 'Name must be at most 100 characters' },
+				400,
+			);
+		}
+
+		const userRows = this.sql.exec('SELECT id, disabled FROM users WHERE id = ?', userId).toArray();
+		if (userRows.length === 0 || (userRows[0].disabled as number) === 1) {
+			return this.jsonResponse({ error: 'user_disabled' }, 403);
+		}
+
+		if (!response || typeof response !== 'object') {
+			return this.jsonResponse(
+				{ error: 'verification_failed', message: 'Missing registration response' },
+				400,
+			);
+		}
+
+		let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
+		try {
+			verification = await verifyRegistrationResponse({
+				response,
+				expectedChallenge: claim.challenge,
+				expectedOrigin: claim.origin,
+				expectedRPID: claim.rpID,
+				requireUserVerification: false,
+			});
+		} catch (error) {
+			return this.jsonResponse(
+				{
+					error: 'verification_failed',
+					message: error instanceof Error ? error.message : 'Registration verification failed',
+				},
+				400,
+			);
+		}
+		if (!verification.verified || !verification.registrationInfo) {
+			return this.jsonResponse(
+				{ error: 'verification_failed', message: 'Registration verification failed' },
+				400,
+			);
+		}
+
+		const { credential, aaguid, credentialDeviceType, credentialBackedUp } =
+			verification.registrationInfo;
+
+		const duplicate = this.sql
+			.exec('SELECT 1 FROM webauthn_credentials WHERE id = ?', credential.id)
+			.toArray();
+		if (duplicate.length > 0) {
+			return this.jsonResponse(
+				{ error: 'credential_exists', message: 'This passkey is already registered' },
+				409,
+			);
+		}
+
+		const now = new Date().toISOString();
+		this.sql.exec(
+			`INSERT INTO webauthn_credentials
+			 (id, user_id, name, public_key, counter, transports, aaguid, backup_eligible, backed_up, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			credential.id,
+			userId,
+			trimmedName,
+			toArrayBuffer(credential.publicKey),
+			credential.counter,
+			credential.transports ? JSON.stringify(credential.transports) : null,
+			aaguid,
+			credentialDeviceType === 'multiDevice' ? 1 : 0,
+			credentialBackedUp ? 1 : 0,
+			now,
+		);
+
+		const stored: WebauthnCredentialInfo = {
+			id: credential.id,
+			name: trimmedName,
+			createdAt: now,
+			lastUsedAt: null,
+		};
+		return this.jsonResponse({ credential: stored });
+	}
+
+	private async handleWebauthnLoginOptions(request: Request): Promise<Response> {
+		const { email, origin, rpID } = (await request.json()) as {
+			email?: string;
+			origin?: string;
+			rpID?: string;
+		};
+		if (!origin || !rpID) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'origin and rpID are required' },
+				400,
+			);
+		}
+
+		// Optional email hint: when it names a live, enabled user the
+		// challenge is user-bound (verify then only accepts that user's
+		// credentials). Credential IDs are never echoed to this public
+		// endpoint — the challenge is always discoverable-shaped so the
+		// response cannot reveal account existence, enabledness, or
+		// passkey adoption. Residual, accepted: a caller who already holds
+		// a valid passkey can still distinguish a bound (401) from an
+		// unbound (200) verify; see AGENTS.md.
+		let boundUserId: string | null = null;
+		if (email && typeof email === 'string') {
+			const rows = this.sql
+				.exec('SELECT id, disabled FROM users WHERE email = ?', email.trim().toLowerCase())
+				.toArray();
+			if (rows.length > 0 && (rows[0].disabled as number) === 0) {
+				boundUserId = rows[0].id as string;
+			}
+		}
+
+		const options = await generateAuthenticationOptions({
+			rpID,
+			userVerification: 'preferred',
+		});
+
+		const ceremonyId = this.storeChallenge('login', boundUserId, options.challenge, origin, rpID);
+		return this.jsonResponse({ options, ceremonyId });
+	}
+
+	private async handleWebauthnLoginVerify(request: Request): Promise<Response> {
+		const { ceremonyId, response, origin, rpID } = (await request.json()) as {
+			ceremonyId?: string;
+			response?: AuthenticationResponseJSON;
+			origin?: string;
+			rpID?: string;
+		};
+		if (!origin || !rpID) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'origin and rpID are required' },
+				400,
+			);
+		}
+
+		// Claim the ceremony FIRST (kind/origin/rpID must match the stored
+		// row; user binding is checked once the credential resolves).
+		const claim =
+			typeof ceremonyId === 'string' && ceremonyId.length > 0
+				? this.claimCeremony(ceremonyId, 'login', null, origin, rpID)
+				: null;
+		if (!claim) {
+			return this.jsonResponse(
+				{ error: 'ceremony_invalid', message: 'Unknown, expired, or mismatched ceremony' },
+				400,
+			);
+		}
+
+		// Unknown credential id consumes the ceremony and fails uniformly
+		if (!response || typeof response.id !== 'string' || !response.id) {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+		const credRows = this.sql
+			.exec(
+				`SELECT id, user_id, public_key, counter, transports FROM webauthn_credentials WHERE id = ?`,
+				response.id,
+			)
+			.toArray();
+		if (credRows.length === 0) {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+		const credentialRow = credRows[0];
+
+		// A user-bound (email-hinted) ceremony only accepts that user's credentials
+		if (claim.userId !== null && claim.userId !== credentialRow.user_id) {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+
+		const userRows = this.sql
+			.exec(
+				'SELECT id, email, name, role, disabled, created_at, updated_at FROM users WHERE id = ?',
+				credentialRow.user_id,
+			)
+			.toArray();
+		// Uniform 401 for missing and disabled accounts (no disable oracle)
+		if (userRows.length === 0 || (userRows[0].disabled as number) === 1) {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+
+		let verification: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
+		try {
+			verification = await verifyAuthenticationResponse({
+				response,
+				expectedChallenge: claim.challenge,
+				expectedOrigin: claim.origin,
+				expectedRPID: claim.rpID,
+				requireUserVerification: false,
+				credential: {
+					id: credentialRow.id as string,
+					publicKey: blobToBytes(credentialRow.public_key as ArrayBuffer | Uint8Array),
+					counter: credentialRow.counter as number,
+					transports: parseTransports(credentialRow.transports),
+				},
+			});
+		} catch {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+		if (!verification.verified) {
+			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
+		}
+
+		const now = new Date().toISOString();
+		this.sql.exec(
+			'UPDATE webauthn_credentials SET counter = ?, last_used_at = ? WHERE id = ?',
+			verification.authenticationInfo.newCounter,
+			now,
+			credentialRow.id as string,
+		);
+
+		// Mint a session via the same path as password login (same 20-session cap)
+		const session = await this.createSession(userRows[0].id as string);
+
+		const user: User = {
+			id: userRows[0].id as string,
+			email: userRows[0].email as string,
+			name: userRows[0].name as string,
+			role: userRows[0].role as 'admin' | 'member',
+			createdAt: userRows[0].created_at as string,
+			updatedAt: userRows[0].updated_at as string,
+		};
+
+		return this.jsonResponse({ user, token: session.id, hasPasskey: true });
+	}
+
+	private async handleWebauthnListCredentials(request: Request): Promise<Response> {
+		const { userId } = (await request.json()) as { userId?: string };
+		if (!userId) {
+			return this.jsonResponse({ error: 'missing_user_id' }, 400);
+		}
+		const rows = this.sql
+			.exec(
+				'SELECT id, name, created_at, last_used_at FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at DESC',
+				userId,
+			)
+			.toArray();
+		const credentials: WebauthnCredentialInfo[] = rows.map((row) => ({
+			id: row.id as string,
+			name: row.name as string,
+			createdAt: row.created_at as string,
+			lastUsedAt: (row.last_used_at as string | null) ?? null,
+		}));
+		return this.jsonResponse({ credentials });
+	}
+
+	private async handleWebauthnDeleteCredential(request: Request): Promise<Response> {
+		const { userId, credentialId } = (await request.json()) as {
+			userId?: string;
+			credentialId?: string;
+		};
+		if (!userId || !credentialId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		// Delete only when owned by the caller (uniform 404 otherwise).
+		// Deleting the last passkey is allowed: password login remains.
+		const owned = this.sql
+			.exec(
+				'SELECT id FROM webauthn_credentials WHERE id = ? AND user_id = ?',
+				credentialId,
+				userId,
+			)
+			.toArray();
+		if (owned.length === 0) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+		this.sql.exec('DELETE FROM webauthn_credentials WHERE id = ?', credentialId);
+		return this.jsonResponse({ success: true });
+	}
+
+	// Test-only ceremony hooks (inert unless WEBAUTHN_TEST_HOOKS=enabled)
+
+	private async handleWebauthnTestBackdate(request: Request): Promise<Response> {
+		if (this.env.WEBAUTHN_TEST_HOOKS !== 'enabled') {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+		const { ceremonyId, ageMs } = (await request.json()) as {
+			ceremonyId?: string;
+			ageMs?: number;
+		};
+		if (!ceremonyId || typeof ageMs !== 'number') {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		this.sql.exec(
+			'UPDATE webauthn_challenges SET created_at = ? WHERE ceremony_id = ?',
+			new Date(Date.now() - ageMs).toISOString(),
+			ceremonyId,
+		);
+		return this.jsonResponse({ success: true });
+	}
+
+	private handleWebauthnTestChallengeCount(): Response {
+		if (this.env.WEBAUTHN_TEST_HOOKS !== 'enabled') {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+		const row = this.sql.exec('SELECT COUNT(*) AS count FROM webauthn_challenges').one();
+		return this.jsonResponse({ count: (row?.count as number) ?? 0 });
+	}
+
 	private async handleListUsers(request: Request): Promise<Response> {
 		const { requestingUserRole } = (await request.json()) as {
 			requestingUserRole: string;
@@ -1385,6 +1888,130 @@ export class AuthState extends DurableObject<Env> {
 
 	private async cleanExpiredSessions(): Promise<void> {
 		this.sql.exec('DELETE FROM sessions WHERE expires_at < ?', new Date().toISOString());
+	}
+
+	/** Whether the user has at least one registered passkey. */
+	private hasPasskey(userId: string): boolean {
+		const row = this.sql
+			.exec('SELECT EXISTS(SELECT 1 FROM webauthn_credentials WHERE user_id = ?) AS has', userId)
+			.one();
+		return (row?.has as number) === 1;
+	}
+
+	/**
+	 * The stable opaque WebAuthn user handle (32 random bytes, base64url).
+	 * Minted lazily on first registration; never the email, ≤64 bytes per spec.
+	 */
+	private ensureWebauthnUserId(userId: string, existing: string | null): string {
+		if (existing) return existing;
+		const bytes = new Uint8Array(32);
+		crypto.getRandomValues(bytes);
+		const handle = bytesToBase64url(bytes);
+		this.sql.exec('UPDATE users SET webauthn_user_id = ? WHERE id = ?', handle, userId);
+		return handle;
+	}
+
+	/**
+	 * Store a ceremony challenge. Every issuance first sweeps expired rows,
+	 * then enforces bounded outstanding sets: at most 10 unexpired per
+	 * (kind, user) bucket and 500 unexpired total, evicting oldest-first
+	 * within the bucket so the table never grows beyond bounds.
+	 */
+	private storeChallenge(
+		kind: 'register' | 'login',
+		userId: string | null,
+		challenge: string,
+		origin: string,
+		rpID: string,
+	): string {
+		const nowIso = new Date().toISOString();
+		const cutoff = new Date(Date.now() - WEBAUTHN_CHALLENGE_TTL_MS).toISOString();
+		this.sql.exec('DELETE FROM webauthn_challenges WHERE created_at < ?', cutoff);
+
+		const total =
+			(this.sql.exec('SELECT COUNT(*) AS count FROM webauthn_challenges').one()?.count as number) ??
+			0;
+		if (total >= WEBAUTHN_MAX_TOTAL_CHALLENGES) {
+			this.sql.exec(
+				`DELETE FROM webauthn_challenges WHERE ceremony_id IN (
+					SELECT ceremony_id FROM webauthn_challenges
+					ORDER BY created_at ASC, ceremony_id ASC LIMIT ?
+				)`,
+				total - WEBAUTHN_MAX_TOTAL_CHALLENGES + 1,
+			);
+		}
+
+		const bucket =
+			(this.sql
+				.exec(
+					'SELECT COUNT(*) AS count FROM webauthn_challenges WHERE kind = ? AND user_id IS ?',
+					kind,
+					userId,
+				)
+				.one()?.count as number) ?? 0;
+		if (bucket >= WEBAUTHN_MAX_CHALLENGES_PER_BUCKET) {
+			this.sql.exec(
+				`DELETE FROM webauthn_challenges WHERE ceremony_id IN (
+					SELECT ceremony_id FROM webauthn_challenges
+					WHERE kind = ? AND user_id IS ?
+					ORDER BY created_at ASC, ceremony_id ASC LIMIT ?
+				)`,
+				kind,
+				userId,
+				bucket - WEBAUTHN_MAX_CHALLENGES_PER_BUCKET + 1,
+			);
+		}
+
+		const ceremonyId = crypto.randomUUID();
+		this.sql.exec(
+			'INSERT INTO webauthn_challenges (ceremony_id, kind, user_id, challenge, origin, rp_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+			ceremonyId,
+			kind,
+			userId,
+			challenge,
+			origin,
+			rpID,
+			nowIso,
+		);
+		return ceremonyId;
+	}
+
+	/**
+	 * Atomically claim a ceremony: select the matching unexpired row (kind,
+	 * origin, rpID, and — for register — the bound user) and delete it before
+	 * any other validation runs. DO input gates make this select-then-delete
+	 * atomic within a single handler. Returns the claimed challenge, or null.
+	 */
+	private claimCeremony(
+		ceremonyId: string,
+		kind: 'register' | 'login',
+		userId: string | null,
+		origin: string,
+		rpID: string,
+	): { challenge: string; userId: string | null; origin: string; rpID: string } | null {
+		const cutoff = new Date(Date.now() - WEBAUTHN_CHALLENGE_TTL_MS).toISOString();
+		const rows = this.sql
+			.exec(
+				'SELECT challenge, user_id, origin, rp_id FROM webauthn_challenges WHERE ceremony_id = ? AND kind = ? AND origin = ? AND rp_id = ? AND created_at >= ?',
+				ceremonyId,
+				kind,
+				origin,
+				rpID,
+				cutoff,
+			)
+			.toArray();
+		if (rows.length === 0) return null;
+		const rowUserId = rows[0].user_id as string | null;
+		if (kind === 'register' && rowUserId !== userId) return null;
+		this.sql.exec('DELETE FROM webauthn_challenges WHERE ceremony_id = ?', ceremonyId);
+		return {
+			challenge: rows[0].challenge as string,
+			userId: rowUserId,
+			// Return the row's pinned values (equal to the request's by the
+			// match above) so verification always uses what was issued.
+			origin: rows[0].origin as string,
+			rpID: rows[0].rp_id as string,
+		};
 	}
 
 	private generateKey(length: number): string {

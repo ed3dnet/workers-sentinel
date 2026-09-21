@@ -5,11 +5,20 @@ pre-commit:
     - name: lint
       glob: "*.{js,mjs,cjs,ts,tsx,vue,json,jsonc}"
       run: pnpm exec biome check --no-errors-on-unmatched {staged_files}
-    # Unit suite (vitest-pool-workers, 248 tests) whenever worker code,
-    # tests, or config are part of the commit.
+    # Unit suite (vitest-pool-workers, 324 tests) whenever worker code,
+    # tests, or config are part of the commit. The two env-variant suites run
+    # in their own worker processes: WEBAUTHN_ORIGINS allowlist coverage and
+    # credential-deletion coverage (isolated because the delete flow triggers
+    # a progressive runner slowdown in the shared main-suite worker — see
+    # AGENTS.md "Passkeys").
     - name: unit tests
       glob: "{packages/workers-sentinel/src/**,packages/workers-sentinel/test/**,packages/workers-sentinel/wrangler.jsonc,packages/workers-sentinel/vitest.config.ts,pnpm-lock.yaml}"
-      run: pnpm --dir packages/workers-sentinel test
+      run: pnpm --dir packages/workers-sentinel test && pnpm --dir packages/workers-sentinel test:webauthn-origins && pnpm --dir packages/workers-sentinel test:webauthn-management
+    # Dashboard component suite whenever dashboard source or its test setup
+    # is part of the commit.
+    - name: dashboard tests
+      glob: "{packages/dashboard/src/**,packages/dashboard/test/**,packages/dashboard/vitest.config.ts,pnpm-lock.yaml}"
+      run: pnpm --dir packages/dashboard test
 
 # Integration tests run only when the push updates refs/heads/main.
 # use_stdin forwards git's ref lines so the wrapper can detect the target.

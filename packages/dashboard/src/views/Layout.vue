@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, watch } from 'vue';
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router';
+import PasskeyNag from '../components/PasskeyNag.vue';
 import { useAuthStore } from '../stores/auth';
 import { useProjectsStore } from '../stores/projects';
 
@@ -33,6 +34,9 @@ watch(
 
 <template>
 	<div class="flex h-screen">
+		<!-- Persistent passkey adoption prompt (per-visit dismissal, in-memory only) -->
+		<PasskeyNag />
+
 		<!-- Sidebar -->
 		<aside class="w-64 bg-gray-900 text-white flex flex-col">
 			<!-- Logo -->
@@ -86,7 +90,12 @@ watch(
 			<!-- User -->
 			<div class="p-4 border-t border-gray-800">
 				<div class="flex items-center justify-between">
-					<div class="flex items-center min-w-0">
+					<RouterLink
+						to="/settings"
+						class="flex items-center min-w-0 hover:opacity-80"
+						title="Account settings"
+						data-testid="user-widget-settings-link"
+					>
 						<div
 							class="w-8 h-8 bg-gray-700 rounded-full flex items-center justify-center text-sm font-medium"
 						>
@@ -96,7 +105,7 @@ watch(
 							<p class="text-sm font-medium truncate">{{ authStore.user?.name }}</p>
 							<p class="text-xs text-gray-400 truncate">{{ authStore.user?.email }}</p>
 						</div>
-					</div>
+					</RouterLink>
 					<button @click="logout" class="text-gray-400 hover:text-white" title="Logout">
 						<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 							<path
@@ -151,7 +160,6 @@ watch(
 						>
 							Issues
 						</RouterLink>
-						<RouterLink
 						<RouterLink
 							:to="`/projects/${currentProject.slug}/releases`"
 							class="px-3 py-1.5 text-sm rounded-lg"

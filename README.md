@@ -87,6 +87,7 @@ Workers Sentinel gives you a private, self-hosted error tracking solution with a
 - **🔌 Sentry SDK Compatible**: Use existing Sentry SDKs by changing only the DSN endpoint
 - **🔒 Secure & Private**: Self-hosted on your Cloudflare account with no third-party data access
 - **🔐 Smart Authentication**: Automatic first-user admin setup with session-based auth
+- **🔑 Passkeys (WebAuthn)**: Register named passkeys and sign in usernameless with a fingerprint, face, or security key — no password needed; managed from the account Settings page
 - **📊 Issue Grouping**: Automatic fingerprinting groups similar errors into issues
 - **📈 Project Overview Dashboard**: At-a-glance error health with trend charts, metric cards, and top active issues
 - **📈 Event Statistics**: Track error frequency with hourly aggregations

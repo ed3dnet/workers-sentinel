@@ -14,6 +14,18 @@ export interface Env {
 	SETUP_TOKEN?: string;
 	/** Optional comma-separated list of origins allowed cross-origin access to the dashboard API. */
 	CORS_ORIGINS?: string;
+	/**
+	 * Optional comma-separated list of additional origins trusted to run
+	 * WebAuthn ceremonies (e.g. `http://localhost:5173` for the vite dev
+	 * proxy). Same-origin is always trusted; this extends the allowlist.
+	 */
+	WEBAUTHN_ORIGINS?: string;
+	/**
+	 * Test-only: when bound to `'enabled'` (vitest miniflare config), the
+	 * internal ceremony-inspection endpoints become active. Never set in
+	 * production — the mechanism is inert without it.
+	 */
+	WEBAUTHN_TEST_HOOKS?: string;
 	ASSETS?: Fetcher;
 }
 
@@ -63,6 +75,14 @@ export interface ApiToken {
 	lastUsedAt: string | null;
 	expiresAt: string | null;
 	createdAt: string;
+}
+
+// Passkey (WebAuthn) types
+export interface WebauthnCredentialInfo {
+	id: string;
+	name: string;
+	createdAt: string;
+	lastUsedAt: string | null;
 }
 
 // Issue types

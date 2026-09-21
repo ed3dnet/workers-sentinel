@@ -31,6 +31,7 @@ pnpm typecheck
 # Dashboard-specific
 pnpm --filter @workers-sentinel/dashboard dev      # Vite dev server
 pnpm --filter @workers-sentinel/dashboard build    # Production build
+pnpm --filter @workers-sentinel/dashboard test     # Component tests (vitest + happy-dom)
 
 # Worker-specific
 pnpm --filter @workers-sentinel/worker dev         # Wrangler dev
@@ -100,10 +101,40 @@ The contract for API consumers (dashboard, CLI tooling, agent skills). Two surfa
 | Credential | Where it works | Notes |
 |---|---|---|
 | Session token (`Authorization: Bearer <token>`) | `/api/projects/*`, `/api/auth/*`, `/api/admin/*` | From `POST /api/auth/login`; what the dashboard uses |
-| API token (`Authorization: Bearer wst_…`) | Same protected surface as sessions | Mint via `POST /api/auth/tokens` (session auth required); stored hashed; revocable |
+| API token (`Authorization: Bearer wst_…`) | Same protected surface as sessions | Mint via `POST /api/auth/tokens` (session auth required); stored hashed; revocable. **Rejected (403 `session_required`) on passkey register/manage endpoints** — an API token must not mint credentials that survive token revocation |
+| Passkey (WebAuthn credential) | Login only, via `POST /api/auth/webauthn/login/*` | Register/manage require a session; see Passkeys below |
 | DSN public key (`?sentry_key=`, `X-Sentry-Auth`, or basic auth) | **Ingestion only** (`POST /api/{projectId}/envelope|store`) | Cannot read anything; never valid on `/api/projects/*` |
 
 401 vs 404 precedence: auth middleware runs before route matching on protected namespaces, so an **anonymous** request to an unknown `/api/projects/…` path gets `401`, and an **authenticated** one gets a JSON `404`. Unknown `/api/*` paths (any method) return `404 {"error":"not_found"}` JSON — never the SPA HTML. One exception: `OPTIONS /api/*` is answered by the CORS preflight handler with a bare `204` before auth or 404 logic runs.
+
+### Passkeys (WebAuthn)
+
+Passkeys via `@simplewebauthn/server` (worker) and `@simplewebauthn/browser` (dashboard), both pinned at exactly `13.2.2` — community-proven on workerd, not vendor-certified; the pin keeps a silent upgrade from changing that, and the ceremony tests run the real verification code paths.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /api/auth/webauthn/register/options` | session (`wst_` → 403 `session_required`) | Issue a registration ceremony |
+| `POST /api/auth/webauthn/verify/register` | session (`wst_` → 403) | Verify + store a named credential |
+| `POST /api/auth/webauthn/login/options` | public (≤8 KiB body) | Issue a login ceremony; optional `{email}` hint |
+| `POST /api/auth/webauthn/verify/login` | public (≤8 KiB body) | Verify an assertion, mint a session |
+| `GET /api/auth/webauthn/credentials` | session (`wst_` → 403) | List the caller's passkeys |
+| `POST /api/auth/webauthn/credentials/delete` | session (`wst_` → 403) | Delete one — body `{credentialId}`; owner-only, cross-user 404 |
+
+**Wire contract**: every options response is `{options, ceremonyId}`; every verify request carries `{ceremonyId, response, …}` (register verify adds `name`). The challenge row binds kind, user (register: always; login: only when an email hint resolved), challenge, origin, and rpID.
+
+- **Names**: required, trimmed, 1..100 chars (`400 name_required` / `invalid_name`). A verify with a valid `ceremonyId` but a blank/oversized/non-string name still consumes the ceremony — claim-before-validate.
+- **Ceremony claim semantics**: challenges are single-use and expire after 5 minutes. The claim (select-then-delete in one DO handler, atomic without relying on input gates) happens before any other validation, but it *matches* kind + user + origin + rpID + TTL — so malformed payloads, blank names, failed verification, and unknown credentials burn the ceremony, while a mismatched-context claim (wrong kind/user/origin/rpID) is rejected **without** consuming it: the ceremony ID is an unguessable capability, and a mismatched claim gains an attacker nothing the rightful context doesn't already allow. Every issuance sweeps expired rows and caps outstanding challenges (≤10 per (kind, user) bucket — unbound login ceremonies share one anonymous bucket — and ≤500 total, evicting oldest-first), so the table is bounded without 429s. **Accepted availability tradeoff**: a sustained anonymous flood of `login/options` can evict a victim's in-flight ceremony within its bucket (bounded ring by design); if that matters for your deployment, put a Cloudflare WAF rate-limiting rule on `/api/auth/webauthn/*`.
+- **Login email hint (optional)**: when the hint names a live, enabled user the challenge is *bound* to that user (verify rejects any other user's credential with the uniform 401). The options response is always discoverable-shaped — credential IDs are never echoed to this public endpoint, so account existence/enabledness/passkey adoption is not disclosed by response shape. Residual, accepted: a caller who already holds a valid passkey can distinguish a bound (401) from an unbound (200) verify. The dashboard never sends the hint (usernameless only).
+- **Body caps (streaming)**: public login endpoints cap bodies at 8 KiB, session-side register endpoints at 64 KiB (attestation objects) — enforced *while streaming*, never buffer-then-measure. Non-object JSON bodies (null, arrays, scalars) → `400 invalid_json`.
+- **User verification policy**: options request `userVerification: 'preferred'` and the server verifies with `requireUserVerification: false` — a deliberate possession-based policy (phishing-resistant login even for security keys without a PIN; UV-capable authenticators will typically verify anyway). If MFA-grade UV is required, change both before deploying.
+- **Trusted-origin policy**: expected origins never come from the request alone. The browser `Origin` header is accepted iff it equals the request URL origin (same-origin — prod needs zero config) or is listed in the `WEBAUTHN_ORIGINS` env var (comma-separated exact origins, e.g. `http://localhost:5173` for the vite dev proxy); otherwise `403 origin_not_allowed`. `rpID` is the accepted origin's hostname. The accepted pair is pinned at options and re-checked at verify (an options↔verify mismatch fails even when both origins are individually trusted). WebAuthn's origin binding only proves "this origin ran the ceremony"; which origins are trusted is this server policy.
+- **Counter leniency**: the library rejects non-increasing counters whenever either side is non-zero; the `0/0` case is allowed by design for synced passkeys that report no counter.
+- **`hasPasskey`**: `GET /api/auth/me` and the password `POST /api/auth/login` response include `hasPasskey: boolean` (additive) — the dashboard uses it to drive the passkey-adoption nag (dismissal is in-memory per visit only, never persisted).
+- **Last passkey**: deleting it is allowed (the account returns to password-only and the nag); the dashboard warns before that delete. `webauthn_user_id` (the spec's user handle) is a stable opaque 32-byte value minted on first registration — never the email.
+
+Out of scope by design: conditional UI/autofill, multiple RP IDs beyond the derived one, passkey-only accounts, admin passkey management.
+
+**Test-suite isolation note**: under `vitest-pool-workers` `singleWorker` + `isolatedStorage: false`, exercising the credential-delete flow from the shared main-suite worker reproducibly triggers a progressive isolate-wide transport slowdown in the runner (even `/api/health` latency climbs; exactly one pre-existing marginal test — filters' 100-filter limit at its 20s timeout — falls over). Every configuration without those delete calls is green, `main` included; the delete shape (URL param vs body) is irrelevant, so it is a runner interaction, not application logic. Credential-deletion coverage therefore runs in its own worker via `just test-webauthn-origins`'s sibling `pnpm --dir packages/workers-sentinel test:webauthn-management` (`vitest.webauthn-management.config.ts`), wired into lefthook and the gate. If vitest-pool-workers/workerd fixes the underlying behavior, fold `test/webauthn-management.test.ts` back into `test/webauthn.test.ts`.
 
 ### Pagination
 
@@ -218,6 +249,7 @@ Full remediation of the findings in `security-analysis/reports/` (see INDEX.md).
 - **Passwords**: argon2id (OWASP m=19MiB/t=2/p=1) via `@noble/hashes` pure JS — workerd disallows dynamic WASM compilation, so hash-wasm-style libraries fail at runtime. Legacy unsalted SHA-256 hashes upgrade transparently on successful login. Verification is constant-time; unknown accounts burn a dummy argon2 to equalize timing.
 - **Sessions/API tokens**: stored hashed at rest (fast SHA-256 lookup hash — sufficient for 256-bit random tokens); max 20 sessions/user (oldest pruned); `POST /api/auth/logout-all` revokes everything; password change (`/api/auth/change-password`, requires current password) revokes all sessions.
 - **Auth throttling**: 5 failed logins per email → 15min lockout (429 + retryAfter); registration limited 5/hour per `CF-Connecting-IP`; admin can close registration via `PUT /api/admin/settings {registrationOpen:false}`; first registration on a fresh install requires the `SETUP_TOKEN` env secret when set (fixes first-user-admin squatting).
+- **Passkeys (WebAuthn)**: ceremonies verified with `@simplewebauthn/server` (pinned `13.2.2`); challenges single-use, 5-minute TTL, issuance bounded (10 per kind+user bucket, 500 total); trusted-origin policy (same-origin + optional `WEBAUTHN_ORIGINS` allowlist — anything else `403 origin_not_allowed`); register/manage session-only (`wst_` API tokens rejected); login failures uniform 401 (no disable oracle); public login bodies capped at 8 KiB / register at 64 KiB, enforced while streaming.
 - **Accounts**: admin can disable/enable users (`PATCH /api/admin/users/:id`) — disables kill sessions and return uniform login errors (no disable oracle).
 - **CORS**: same-origin by default; cross-origin dashboard API access only for origins in the `CORS_ORIGINS` env (comma-separated). Only SDK ingestion endpoints (`/:projectId/envelope|store|security`) serve wildcard CORS — without credentials.
 - **Headers/CSP**: hardening headers on all worker responses + strict CSP and friends via `packages/dashboard/public/_headers` for asset-served pages (the assets layer bypasses the worker for non-`run_worker_first` paths).
@@ -229,11 +261,11 @@ Full remediation of the findings in `security-analysis/reports/` (see INDEX.md).
 - **Webhooks**: https-only, no credentials-in-URL, private/loopback hosts rejected, redirects refused, 10s timeout, target response bodies never logged; webhook URLs hidden from plain members.
 - **Route hygiene**: `/api/projects/:slug/events/latest` registered before `/:eventId` (was shadowed); auth header parsing case-insensitive and trim-tolerant; attacker-controlled content is not logged.
 
-Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API allowlist). Set both as wrangler secrets/vars in production.
+Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API allowlist), `WEBAUTHN_ORIGINS` (extra trusted WebAuthn ceremony origins — dev only; same-origin always trusted). Set them as wrangler secrets/vars in production.
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin disable + re-register is the workflow).
 
-Tests: 306 across 34 files (`just test`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
+Tests: 324 across 35 files (`just test`) + 3 WebAuthn origin-variant tests (`test:webauthn-origins`) + 3 WebAuthn credential-management tests in their own worker (`test:webauthn-management`) — both variants run real-crypto virtual-authenticator ceremonies — + 14 dashboard component tests (`just test-dashboard`) + 11 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/`vitest.config.ts` — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters.
 
 ## Polytoken harness sessions
 

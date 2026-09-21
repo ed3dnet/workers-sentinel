@@ -39,6 +39,18 @@ send-demo-events:
 test:
     pnpm --dir packages/workers-sentinel test
 
+# Worker WebAuthn env-variant suites (own worker processes: origins allowlist
+# path; credential-deletion isolation — see AGENTS.md "Passkeys").
+test-webauthn-origins:
+    pnpm --dir packages/workers-sentinel test:webauthn-origins
+
+test-webauthn-management:
+    pnpm --dir packages/workers-sentinel test:webauthn-management
+
+# Dashboard component suite (vitest + happy-dom + @vue/test-utils).
+test-dashboard:
+    pnpm --dir packages/dashboard test
+
 # Black-box integration suite; boots its own wrangler dev (own port/state).
 test-integration:
     node scripts/integration.mjs
