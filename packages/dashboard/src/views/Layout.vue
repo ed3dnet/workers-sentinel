@@ -118,7 +118,13 @@ watch(
 				<div class="flex items-center justify-between">
 					<div class="flex items-center space-x-4">
 						<h1 class="text-xl font-semibold text-gray-900 dark:text-white">
-							{{ currentProject.name }}
+							<RouterLink
+								:to="`/projects/${currentProject.slug}/overview`"
+								class="hover:text-primary-600 dark:hover:text-primary-400 transition-colors"
+								title="Back to project overview"
+							>
+								{{ currentProject.name }}
+							</RouterLink>
 						</h1>
 						<span class="badge badge-info">{{ currentProject.platform }}</span>
 					</div>
