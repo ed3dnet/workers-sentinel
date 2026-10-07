@@ -29,6 +29,7 @@ pnpm-debug.log*
 
 # Test coverage
 coverage/
+.feedback-tmp/
 
 # TypeScript
 *.tsbuildinfo

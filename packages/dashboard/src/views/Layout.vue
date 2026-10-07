@@ -161,6 +161,17 @@ watch(
 							Issues
 						</RouterLink>
 						<RouterLink
+							:to="`/projects/${currentProject.slug}/feedback`"
+							class="px-3 py-1.5 text-sm rounded-lg"
+							:class="
+								route.name === 'feedback' || route.name === 'feedback-detail'
+									? 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white'
+									: 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
+							"
+						>
+							Feedback
+						</RouterLink>
+						<RouterLink
 							:to="`/projects/${currentProject.slug}/releases`"
 							class="px-3 py-1.5 text-sm rounded-lg"
 							:class="

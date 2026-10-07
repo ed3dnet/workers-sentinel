@@ -94,13 +94,28 @@ export const MAX_NONATTACHMENT_ITEM_BYTES = 5 * 1024 * 1024; // 5 MiB
  * - `migration-flip` — persists a one-shot marker (alarms carry no headers)
  *   that makes the next alarm migration run treat the first row's conditional
  *   flip as if the row had been deleted mid-flight.
+ * - `feedback-commit` — fails feedback metadata persistence after the screenshot upload.
+ * - `delete` — fails a compensating/delete operation before touching R2.
  */
-export type AttachmentFaultMode = 'put' | `put-after:${number}` | 'purge-sweep' | 'migration-flip';
+export type AttachmentFaultMode =
+	| 'put'
+	| `put-after:${number}`
+	| 'purge-sweep'
+	| 'migration-flip'
+	| 'feedback-commit'
+	| 'delete';
 
 /** Parse the `X-Sentinel-Test-Fault` header value; null when absent/unknown. */
 export function parseFaultMode(header: string | undefined | null): AttachmentFaultMode | null {
 	if (!header) return null;
-	if (header === 'put' || header === 'purge-sweep' || header === 'migration-flip') return header;
+	if (
+		header === 'put' ||
+		header === 'purge-sweep' ||
+		header === 'migration-flip' ||
+		header === 'feedback-commit' ||
+		header === 'delete'
+	)
+		return header;
 	const match = /^put-after:(\d+)$/.exec(header);
 	if (match) return `put-after:${Number.parseInt(match[1], 10)}` as const;
 	return null;
@@ -211,6 +226,9 @@ export function createAttachmentStore(
 		},
 
 		async deleteKeys(keys) {
+			if (faultMode === 'delete' || faultMode === 'feedback-commit') {
+				throw new AttachmentStorageError('fault-injected delete failure', 'delete');
+			}
 			for (let i = 0; i < keys.length; i += DELETE_BATCH_SIZE) {
 				const batch = keys.slice(i, i + DELETE_BATCH_SIZE);
 				if (batch.length === 0) continue;

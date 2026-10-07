@@ -231,6 +231,70 @@ Sentry.init({
 });
 ```
 
+### Website feedback widget (browser)
+
+The feedback widget is a separate, framework-independent browser SDK with no React or Vue runtime dependency. It does not report through Sentry's error-event protocol. The prepared package name is `@workers-sentinel/feedback-sdk`, version `0.1.0`; it has **not been published**, and registry ownership/publish permission has not been verified. Do not rely on an npm CDN URL until an authorized release exists.
+
+For this checkout, build and pack the SDK, then install its tarball in your website project:
+
+```sh
+# In this repository
+pnpm install
+pnpm --filter @workers-sentinel/feedback-sdk build
+cd packages/feedback-sdk
+npm pack
+
+# In your website project (adjust the repository path)
+npm install /path/to/workers-sentinel/packages/feedback-sdk/workers-sentinel-feedback-sdk-0.1.0.tgz
+```
+
+After an authorized npm release, the equivalent registry installation is `npm install @workers-sentinel/feedback-sdk@0.1.0`. Initialize either installation with the project's public DSN (shown at project creation and in Project Settings):
+
+```javascript
+import { installFeedbackWidget } from '@workers-sentinel/feedback-sdk';
+
+const feedback = installFeedbackWidget({
+  dsn: 'https://<public_key>@<your-worker>.workers.dev/<project_id>',
+  launcherLabel: 'Send feedback',
+  placement: 'bottom-right',
+  theme: { accentColor: '#c9234a', backgroundColor: '#ffffff' },
+  styleNonce: document.querySelector('meta[name="csp-nonce"]')?.getAttribute('content'),
+  privateSelectors: ['.customer-private'],
+  collectMetadata: async ({ pageUrl, locator }) => ({
+    release: 'website-1.0.0',
+    page: pageUrl,
+    selectedElement: locator,
+  }),
+});
+
+// Call feedback.destroy() when your application no longer needs the widget.
+```
+
+The Sentinel deployment also hosts the standalone SDK at `https://wat.tilmonengineering.com/sdk/feedback.js`, with a version-pinned copy at `https://wat.tilmonengineering.com/sdk/v0.1.0/feedback.js`. Dashboard builds include both files automatically. For another hosting setup, copy the built `packages/feedback-sdk/dist/browser.iife.js` to your website's public `/assets/` directory or your static CDN:
+
+```html
+<script src="/assets/browser.iife.js"></script>
+<script>
+  window.WorkersSentinelFeedback.install({
+    dsn: 'https://<public_key>@<your-worker>.workers.dev/<project_id>',
+    launcherLabel: 'Send feedback',
+    privateSelectors: ['.customer-private'],
+    collectMetadata: async (context) => ({
+      release: 'website-1.0.0',
+      page: context.pageUrl,
+    }),
+  });
+</script>
+```
+
+After publication, a version-pinned npm CDN URL such as `https://cdn.jsdelivr.net/npm/@workers-sentinel/feedback-sdk@0.1.0/dist/browser.iife.js` can replace the local `src`. Your host CSP must allow the script origin (and your initialization script's nonce/hash) and `connect-src` to your Sentinel instance.
+
+Both entry points expose equivalent initialization. The DSN public key is intentionally public and grants submission only; it cannot read feedback. The feedback API accepts credential-less wildcard CORS for cross-origin `POST` and preflight, independent of `CORS_ORIGINS`. Members browse submissions in the project's **Feedback** view. The service currently caps each submission body at 2 MiB, each screenshot at 1.5 MiB, callback metadata at 8 KiB (5 nesting levels and 100 entries per object/array), the complete metadata field at 12 KiB, and feedback submissions at 100 per project per hour. Screenshot bytes share the project's existing attachment budget and retention policy; after project purge, a content-free prefix tombstone and cleanup alarm reclaim uploads that finish late. PNG/JPEG/WebP type/signature agreement is checked server-side; this is not full image decoding or a guarantee of corruption-free images. Set `screenshots: false` to disable capture and require a deliberate text-only submission.
+
+Picking an element temporarily intercepts pointer activation; press **Escape** or Cancel to restore the page. The SDK stores a bounded locator and rectangle, not arbitrary DOM, full text, form values, or field contents. After reviewing the description, the visitor explicitly chooses **Capture screenshot** and reviews the result before submitting. The optional `collectMetadata(context)` callback runs at submission and receives bounded `pageUrl`, `pageTitle`, `description`, `locator`, and `geometry` context; return JSON-safe data only (up to 8 KiB). Do not return secrets or personal data. The callback has a short timeout; if it fails or times out, the form explains the issue and requires the visitor to choose whether to continue without the extra metadata.
+
+The widget is mounted in a Shadow DOM. Configure `styleNonce` when your host page uses a CSP nonce; strict Content Security Policy may otherwise block injected styles or renderer resources. Screenshot capture uses best-effort DOM rendering, not a native browser-tab screenshot. Password controls, `[data-sentinel-feedback-private]`, and configured `privateSelectors` are masked and cannot be disabled. Cross-origin images/fonts, tainted canvases, unsupported CSS, very long documents, and browser restrictions may make the image incomplete or unavailable. Capture happens only after the visitor explicitly chooses **Capture screenshot**; the preview is shown for review before Submit. If capture fails, the UI reports it and asks the visitor before submitting text only. Site owners are responsible for explaining consent/privacy expectations; screenshots can include visible page content beyond the selected element. Closed shadow roots and cross-origin frames are not traversed, and same-origin iframe selection is not supported.
+
 ### Node.js
 
 ```javascript

@@ -157,6 +157,31 @@ CREATE TABLE IF NOT EXISTS attachment_usage (
   bytes INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS feedback_items (
+  id TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  page_url TEXT NOT NULL,
+  page_title TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  geometry TEXT,
+  metadata TEXT NOT NULL DEFAULT 'null',
+  received_at TEXT NOT NULL,
+  screenshot_key TEXT,
+  screenshot_type TEXT,
+  screenshot_size INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_received ON feedback_items(received_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS feedback_uploads (
+  id TEXT PRIMARY KEY,
+  object_key TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback_rate_counters (
+  bucket TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -310,6 +335,13 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		const path = new URL(request.url).pathname;
+		if (
+			path.startsWith('/feedback/') &&
+			(await this.ctx.storage.get('feedback_project_purged')) === true
+		) {
+			return this.jsonResponse({ error: 'project_purged' }, 503);
+		}
 		await this.ensureSchema();
 
 		// Alarm liveness guarantee, independent of isolate warmth: a fired
@@ -324,9 +356,6 @@ export class ProjectState extends DurableObject<Env> {
 			await this.scheduleNextAlarm();
 		}
 
-		const url = new URL(request.url);
-		const path = url.pathname;
-
 		try {
 			switch (path) {
 				case '/ingest':
@@ -335,6 +364,20 @@ export class ProjectState extends DurableObject<Env> {
 					return this.handleIngestWithAttachments(request);
 				case '/touch':
 					return this.handleTouch(request);
+				case '/feedback/touch':
+					return this.handleFeedbackTouch(request);
+				case '/feedback/prepare':
+					return this.handleFeedbackPrepare(request);
+				case '/feedback/commit':
+					return this.handleFeedbackCommit(request);
+				case '/feedback/abort':
+					return this.handleFeedbackAbort(request);
+				case '/feedback/list':
+					return this.handleFeedbackList(request);
+				case '/feedback/detail':
+					return this.handleFeedbackDetail(request);
+				case '/feedback/delete':
+					return this.handleFeedbackDelete(request);
 				case '/issues':
 					return this.handleGetIssues(request);
 				case '/issue':
@@ -469,7 +512,7 @@ export class ProjectState extends DurableObject<Env> {
 	 */
 	private seedAttachmentUsage(): void {
 		this.sql.exec(`INSERT INTO attachment_usage (id, bytes)
-			SELECT 1, COALESCE((SELECT SUM(size) FROM attachments), 0)
+			SELECT 1, COALESCE((SELECT SUM(size) FROM attachments), 0) + COALESCE((SELECT SUM(screenshot_size) FROM feedback_items), 0)
 			WHERE NOT EXISTS (SELECT 1 FROM attachment_usage)`);
 	}
 
@@ -498,6 +541,22 @@ export class ProjectState extends DurableObject<Env> {
 	 * orphan) and returns the rate-limit snapshot so a limited project can
 	 * be rejected before uploading up to 21 MiB of otherwise-doomed blobs.
 	 */
+	private async handleFeedbackTouch(request: Request): Promise<Response> {
+		if (this.getConfigValue('purge_pending') === '1') {
+			return this.jsonResponse({ error: 'purge_pending' }, 503);
+		}
+		try {
+			const body = (await request.json()) as { projectId?: string };
+			if (typeof body.projectId !== 'string' || body.projectId.length === 0) {
+				return this.jsonResponse({ error: 'invalid_project' }, 400);
+			}
+			this.persistProjectId(body.projectId);
+			return this.jsonResponse({ success: true });
+		} catch {
+			return this.jsonResponse({ error: 'invalid_project' }, 400);
+		}
+	}
+
 	private async handleTouch(request: Request): Promise<Response> {
 		// ensureSchema (including alarm guarantee) already ran in fetch()
 		try {
@@ -512,6 +571,247 @@ export class ProjectState extends DurableObject<Env> {
 			isLimited: this.isRateLimited(),
 			retryAfterSeconds: this.retryAfterSeconds() || 3600,
 		});
+	}
+
+	/** Reserve screenshot capacity and consume only the independent feedback quota. */
+	private async handleFeedbackPrepare(request: Request): Promise<Response> {
+		const body = (await request.json()) as {
+			id?: string;
+			objectKey?: string | null;
+			screenshotSize?: number;
+		};
+		if (
+			!body.id ||
+			!Number.isInteger(body.screenshotSize) ||
+			(body.screenshotSize ?? -1) < 0 ||
+			(body.screenshotSize ?? 0) > 1536 * 1024
+		) {
+			return this.jsonResponse({ error: 'invalid_feedback' }, 400);
+		}
+		const projectId = this.getProjectId();
+		if (!projectId) return this.jsonResponse({ error: 'project_uninitialized' }, 503);
+		if (this.getConfigValue('purge_pending') === '1')
+			return this.jsonResponse({ error: 'purge_pending' }, 503);
+		const bucket = this.getHourBucket(new Date().toISOString());
+		this.sql.exec('DELETE FROM feedback_rate_counters WHERE bucket < ?', bucket);
+		const count = this.sql
+			.exec('SELECT count FROM feedback_rate_counters WHERE bucket = ?', bucket)
+			.toArray();
+		const current = count.length ? Number(count[0].count) : 0;
+		if (current >= 100) return this.jsonResponse({ error: 'feedback_rate_limited' }, 429);
+		const size = body.screenshotSize ?? 0;
+		const maxBytes =
+			Number.parseInt(this.getConfigValue('max_attachment_total_bytes') || '', 10) ||
+			MAX_PROJECT_ATTACHMENT_BYTES;
+		if (size > 0) {
+			if (!body.objectKey || !body.objectKey.startsWith(projectPrefix(projectId))) {
+				return this.jsonResponse({ error: 'invalid_feedback' }, 400);
+			}
+			const usage = this.attachmentUsageBytes();
+			const pending = this.sql
+				.exec('SELECT COALESCE(SUM(size), 0) AS total FROM feedback_uploads')
+				.one();
+			if (usage + Number(pending?.total ?? 0) + size > maxBytes) {
+				return this.jsonResponse({ error: 'project_attachment_quota' }, 413);
+			}
+		}
+		try {
+			this.ctx.storage.transactionSync(() => {
+				if (this.getConfigValue('purge_pending') === '1') {
+					throw new Error('purge_pending');
+				}
+				const reserved = this.sql
+					.exec('SELECT 1 FROM feedback_uploads WHERE id = ?', body.id!)
+					.toArray();
+				if (reserved.length > 0) throw new Error('feedback_upload_reserved');
+				this.seedAttachmentUsage();
+				const currentRows = this.sql
+					.exec('SELECT count FROM feedback_rate_counters WHERE bucket = ?', bucket)
+					.toArray();
+				if (currentRows.length && Number(currentRows[0].count) >= 100) {
+					throw new Error('feedback_rate_limited');
+				}
+				if (size > 0) {
+					const usage = this.attachmentUsageBytes();
+					const pending = this.sql
+						.exec('SELECT COALESCE(SUM(size), 0) AS total FROM feedback_uploads')
+						.one();
+					if (usage + Number(pending?.total ?? 0) + size > maxBytes) {
+						throw new Error('project_attachment_quota');
+					}
+				}
+				this.sql.exec(
+					'INSERT INTO feedback_rate_counters (bucket, count) VALUES (?, 1) ON CONFLICT(bucket) DO UPDATE SET count = count + 1',
+					bucket,
+				);
+				if (size > 0 && body.objectKey) {
+					this.sql.exec(
+						'INSERT INTO feedback_uploads (id, object_key, size, created_at) VALUES (?, ?, ?, ?)',
+						body.id!,
+						body.objectKey,
+						size,
+						new Date().toISOString(),
+					);
+				}
+			});
+		} catch (error) {
+			if (error instanceof Error && error.message === 'purge_pending') {
+				return this.jsonResponse({ error: 'purge_pending' }, 503);
+			}
+			if (error instanceof Error && error.message === 'feedback_rate_limited') {
+				return this.jsonResponse({ error: 'feedback_rate_limited' }, 429);
+			}
+			if (error instanceof Error && error.message === 'project_attachment_quota') {
+				return this.jsonResponse({ error: 'project_attachment_quota' }, 413);
+			}
+			throw error;
+		}
+		return this.jsonResponse({ success: true });
+	}
+
+	private async handleFeedbackCommit(request: Request): Promise<Response> {
+		const body = (await request.json()) as {
+			id?: string;
+			description?: string;
+			pageUrl?: string;
+			pageTitle?: string;
+			locator?: string;
+			geometry?: Record<string, number> | null;
+			metadata?: unknown;
+			screenshotKey?: string | null;
+			screenshotType?: string | null;
+			screenshotSize?: number;
+			fault?: string;
+		};
+		if (this.env.ATTACHMENT_FAULT_INJECTION === 'enabled' && body.fault === 'feedback-commit') {
+			return this.jsonResponse({ error: 'injected_feedback_commit_failure' }, 500);
+		}
+		if (!body.id || !body.description || !body.pageUrl || !body.locator)
+			return this.jsonResponse({ error: 'invalid_feedback' }, 400);
+		if (this.getConfigValue('purge_pending') === '1')
+			return this.jsonResponse({ error: 'purge_pending' }, 503);
+		const upload = this.sql
+			.exec('SELECT object_key, size FROM feedback_uploads WHERE id = ?', body.id)
+			.toArray();
+		if (
+			body.screenshotKey &&
+			(upload.length === 0 ||
+				upload[0].object_key !== body.screenshotKey ||
+				Number(upload[0].size) !== body.screenshotSize)
+		) {
+			return this.jsonResponse({ error: 'feedback_upload_not_reserved' }, 409);
+		}
+		const now = new Date().toISOString();
+		try {
+			this.ctx.storage.transactionSync(() => {
+				if (this.getConfigValue('purge_pending') === '1') {
+					throw new Error('purge_pending');
+				}
+				this.seedAttachmentUsage();
+				this.sql.exec(
+					`INSERT INTO feedback_items (id, description, page_url, page_title, locator, geometry, metadata, received_at, screenshot_key, screenshot_type, screenshot_size)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					body.id!,
+					body.description!.slice(0, 4000),
+					body.pageUrl!.slice(0, 2048),
+					(body.pageTitle ?? '').slice(0, 300),
+					body.locator!.slice(0, 1000),
+					body.geometry ? JSON.stringify(body.geometry) : null,
+					JSON.stringify(body.metadata ?? null),
+					now,
+					body.screenshotKey ?? null,
+					body.screenshotType ?? null,
+					body.screenshotSize ?? 0,
+				);
+				if (body.screenshotKey) {
+					this.sql.exec('DELETE FROM feedback_uploads WHERE id = ?', body.id!);
+					this.sql.exec(
+						'UPDATE attachment_usage SET bytes = bytes + ? WHERE id = 1',
+						body.screenshotSize ?? 0,
+					);
+				}
+			});
+		} catch (error) {
+			if (error instanceof Error && error.message === 'purge_pending') {
+				return this.jsonResponse({ error: 'purge_pending' }, 503);
+			}
+			throw error;
+		}
+		return this.jsonResponse({ success: true, id: body.id }, 201);
+	}
+
+	private async handleFeedbackAbort(request: Request): Promise<Response> {
+		const body = (await request.json()) as { id?: string };
+		if (body.id) this.sql.exec('DELETE FROM feedback_uploads WHERE id = ?', body.id);
+		return this.jsonResponse({ success: true });
+	}
+
+	private feedbackRow(row: Record<string, SqlStorageValue>): Record<string, unknown> {
+		return {
+			id: row.id as string,
+			description: row.description as string,
+			pageUrl: row.page_url as string,
+			pageTitle: row.page_title as string,
+			locator: row.locator as string,
+			geometry: row.geometry ? JSON.parse(row.geometry as string) : null,
+			metadata: JSON.parse((row.metadata as string) || 'null'),
+			receivedAt: row.received_at as string,
+			screenshotKey: row.screenshot_key as string | null,
+			screenshotType: row.screenshot_type as string | null,
+			screenshotSize: row.screenshot_size as number,
+		};
+	}
+
+	private async handleFeedbackList(request: Request): Promise<Response> {
+		const body = (await request.json()) as { cursor?: string; limit?: number };
+		const limit = clampLimit(body.limit, 25);
+		let sql = 'SELECT * FROM feedback_items';
+		const params: (string | number)[] = [];
+		if (body.cursor) {
+			const [time, id] = body.cursor.split('|');
+			if (!time || !id || id.length > 80)
+				return this.jsonResponse({ error: 'invalid_cursor' }, 400);
+			sql += ' WHERE (received_at < ? OR (received_at = ? AND id < ?))';
+			params.push(time, time, id);
+		}
+		params.push(limit + 1);
+		const rows = this.sql
+			.exec(`${sql} ORDER BY received_at DESC, id DESC LIMIT ?`, ...params)
+			.toArray();
+		const hasMore = rows.length > limit;
+		const items = rows.slice(0, limit).map((row) => this.feedbackRow(row));
+		const last = items.at(-1) as { receivedAt: string; id: string } | undefined;
+		return this.jsonResponse({
+			feedback: items,
+			hasMore,
+			...(hasMore && last ? { nextCursor: `${last.receivedAt}|${last.id}` } : {}),
+		});
+	}
+
+	private async handleFeedbackDetail(request: Request): Promise<Response> {
+		const { id } = (await request.json()) as { id?: string };
+		if (!id) return this.jsonResponse({ error: 'missing_feedback_id' }, 400);
+		const rows = this.sql.exec('SELECT * FROM feedback_items WHERE id = ?', id).toArray();
+		if (!rows.length) return this.jsonResponse({ error: 'feedback_not_found' }, 404);
+		return this.jsonResponse({ feedback: this.feedbackRow(rows[0]) });
+	}
+
+	private async handleFeedbackDelete(request: Request): Promise<Response> {
+		const { id } = (await request.json()) as { id?: string };
+		if (!id) return this.jsonResponse({ error: 'missing_feedback_id' }, 400);
+		const rows = this.sql
+			.exec('SELECT screenshot_key, screenshot_size FROM feedback_items WHERE id = ?', id)
+			.toArray();
+		if (!rows.length) return this.jsonResponse({ error: 'feedback_not_found' }, 404);
+		const key = rows[0].screenshot_key as string | null;
+		const size = Number(rows[0].screenshot_size ?? 0);
+		this.ctx.storage.transactionSync(() => {
+			this.seedAttachmentUsage();
+			this.sql.exec('DELETE FROM feedback_items WHERE id = ?', id);
+			this.sql.exec('UPDATE attachment_usage SET bytes = MAX(0, bytes - ?) WHERE id = 1', size);
+		});
+		if (key) await this.deleteAttachmentBlobs([key]);
+		return this.jsonResponse({ success: true });
 	}
 
 	/**
@@ -595,8 +895,13 @@ export class ProjectState extends DurableObject<Env> {
 			return this.jsonResponse({ purged: false, pending: true });
 		}
 
+		const cleanupProjectId = this.getProjectId();
 		await this.ctx.storage.deleteAll();
-		// Allow the schema to be recreated lazily on the next request
+		await this.ctx.storage.put('feedback_project_purged', true);
+		if (cleanupProjectId) {
+			await this.ctx.storage.put('purged_project_prefix', projectPrefix(cleanupProjectId));
+			await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+		}
 		this.initialized = false;
 		return this.jsonResponse({ purged: true });
 	}
@@ -1139,6 +1444,10 @@ export class ProjectState extends DurableObject<Env> {
 			Number.isInteger(bytesConfig) && bytesConfig > 0 ? bytesConfig : MAX_PROJECT_ATTACHMENT_BYTES;
 
 		let bytes = this.attachmentUsageBytes();
+		const pendingFeedback = this.sql
+			.exec('SELECT COALESCE(SUM(size), 0) AS total FROM feedback_uploads')
+			.one();
+		bytes += Number(pendingFeedback?.total ?? 0);
 		const storable: ExtractedAttachment[] = [];
 		const dropped: DroppedAttachment[] = [];
 		for (const attachment of attachments) {
@@ -2577,10 +2886,26 @@ export class ProjectState extends DurableObject<Env> {
 	 * Alarm entry point. The body runs inside a try/finally so an exception
 	 * mid-alarm (e.g. a transient R2 failure during migration) never leaves
 	 * the DO without a future alarm: GC/migration/purge-retry would stall
-	 * until the next fetch otherwise. A wiped DO is NOT rescheduled
-	 * (deleteAll cancelled its alarms; the state is gone).
+	 * until the next fetch otherwise. Purged projects retain only a prefix
+	 * tombstone and cleanup alarm to reclaim late, previously reserved uploads.
 	 */
 	async alarm(): Promise<void> {
+		const purgedPrefix = await this.ctx.storage.get<string>('purged_project_prefix');
+		if (purgedPrefix) {
+			try {
+				const store = createAttachmentStore(this.env, null);
+				const cursor = await this.ctx.storage.get<string>('purged_prefix_cursor');
+				const page = await store.listPage(purgedPrefix, cursor ?? null);
+				await store.deleteKeys(page.objects.map((object) => object.key));
+				if (page.cursor) await this.ctx.storage.put('purged_prefix_cursor', page.cursor);
+				else await this.ctx.storage.delete('purged_prefix_cursor');
+			} finally {
+				// In-flight requests can put after the initial purge and fail compensation.
+				// Keep only a prefix tombstone and cleanup alarm; never restore tenant rows.
+				await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+			}
+			return;
+		}
 		let wiped = false;
 		try {
 			wiped = await this.runAlarmWork();
@@ -2601,9 +2926,15 @@ export class ProjectState extends DurableObject<Env> {
 			if (!complete) {
 				return false; // the alarm wrapper reschedules the retry
 			}
+			const cleanupProjectId = this.getProjectId();
 			await this.ctx.storage.deleteAll();
+			await this.ctx.storage.put('feedback_project_purged', true);
+			if (cleanupProjectId) {
+				await this.ctx.storage.put('purged_project_prefix', projectPrefix(cleanupProjectId));
+				await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+			}
 			this.initialized = false;
-			return true; // wiped: do not reschedule
+			return true; // cleanup uses the prefix tombstone, not the wiped SQL schema
 		}
 
 		const now = new Date().toISOString();
@@ -2624,17 +2955,21 @@ export class ProjectState extends DurableObject<Env> {
 			// deletes and the usage decrement.
 			const doomedRows = this.sql
 				.exec(
-					`SELECT r2_key FROM attachments
+					`SELECT r2_key AS object_key, size FROM attachments
 					 WHERE storage = 'r2' AND r2_key IS NOT NULL
-					   AND event_id IN (SELECT id FROM events WHERE received_at < ?)`,
+					   AND event_id IN (SELECT id FROM events WHERE received_at < ?)
+					 UNION ALL SELECT screenshot_key AS object_key, screenshot_size AS size FROM feedback_items WHERE received_at < ? AND screenshot_key IS NOT NULL`,
+					cutoffDate,
 					cutoffDate,
 				)
 				.toArray();
 			const totalBytes = this.sumAttachmentBytes(
 				this.sql
 					.exec(
-						`SELECT COALESCE(SUM(size), 0) AS total FROM attachments
-						 WHERE event_id IN (SELECT id FROM events WHERE received_at < ?)`,
+						`SELECT
+						 (SELECT COALESCE(SUM(size), 0) FROM attachments WHERE event_id IN (SELECT id FROM events WHERE received_at < ?))
+						 + (SELECT COALESCE(SUM(screenshot_size), 0) FROM feedback_items WHERE received_at < ?) AS total`,
+						cutoffDate,
 						cutoffDate,
 					)
 					.toArray(),
@@ -2644,7 +2979,8 @@ export class ProjectState extends DurableObject<Env> {
 				// Seed BEFORE the deletes (see handleDeleteIssue)
 				this.seedAttachmentUsage();
 
-				// Delete old events (attachment rows cascade)
+				// Delete old feedback metadata and event rows; both lifecycles share the quota.
+				this.sql.exec('DELETE FROM feedback_items WHERE received_at < ?', cutoffDate);
 				this.sql.exec('DELETE FROM events WHERE received_at < ?', cutoffDate);
 
 				// Delete old issue_stats buckets
@@ -2679,11 +3015,18 @@ export class ProjectState extends DurableObject<Env> {
 				);
 			});
 
-			await this.deleteAttachmentBlobs(doomedRows.map((row) => row.r2_key as string));
+			await this.deleteAttachmentBlobs(doomedRows.map((row) => row.object_key as string));
 		}
 
 		// Correct usage-counter drift from SUM(size) at most once per day
 		this.maybeRecomputeAttachmentUsage();
+
+		// Expired upload reservations must not protect failed/compensated uploads
+		// indefinitely or keep their bytes charged against pending quota.
+		this.sql.exec(
+			'DELETE FROM feedback_uploads WHERE created_at <= ?',
+			new Date(Date.now() - GC_GRACE_MS).toISOString(),
+		);
 
 		// Reclaim orphaned blobs (uploaded but never committed by any row)
 		const gcRemoved = await this.runGcSweep();
@@ -2728,7 +3071,7 @@ export class ProjectState extends DurableObject<Env> {
 		this.setConfigValue('attachment_usage_recomputed_at', String(now));
 		this.seedAttachmentUsage();
 		this.sql.exec(
-			'UPDATE attachment_usage SET bytes = (SELECT COALESCE(SUM(size), 0) FROM attachments) WHERE id = 1',
+			'UPDATE attachment_usage SET bytes = (SELECT COALESCE(SUM(size), 0) FROM attachments) + (SELECT COALESCE(SUM(screenshot_size), 0) FROM feedback_items) WHERE id = 1',
 		);
 	}
 
@@ -2762,7 +3105,15 @@ export class ProjectState extends DurableObject<Env> {
 				for (const object of page.objects) {
 					if (now - object.uploaded.getTime() <= GC_GRACE_MS) continue;
 					const referenced = this.sql
-						.exec('SELECT 1 FROM attachments WHERE r2_key = ?', object.key)
+						.exec(
+							`SELECT 1 FROM attachments WHERE r2_key = ?
+							 UNION ALL SELECT 1 FROM feedback_items WHERE screenshot_key = ?
+							 UNION ALL SELECT 1 FROM feedback_uploads WHERE object_key = ? AND created_at > ? LIMIT 1`,
+							object.key,
+							object.key,
+							object.key,
+							new Date(now - GC_GRACE_MS).toISOString(),
+						)
 						.toArray();
 					if (referenced.length === 0) {
 						doomed.push(object.key);

@@ -5,6 +5,7 @@ import { api0ErrorTranslator, api0Routes } from './routes/api0';
 import { attachmentRoutes } from './routes/attachments';
 import { authRoutes, tokenRoutes } from './routes/auth';
 import { eventRoutes } from './routes/events';
+import { feedbackRoutes } from './routes/feedback';
 import { filterRoutes } from './routes/filters';
 import { ingestionRoutes } from './routes/ingestion';
 import { issueRoutes } from './routes/issues';
@@ -38,18 +39,23 @@ app.use('/api/*', async (c, next) => {
 		.split(',')
 		.map((entry) => entry.trim())
 		.filter(Boolean);
+	const isFeedbackPath = /^\/api\/[^/]+\/feedback\/?$/.test(c.req.path);
 	const allowed = origin && allowlist.includes(origin) ? origin : null;
-	if (allowed) {
+	if (isFeedbackPath && origin) {
+		c.header('Access-Control-Allow-Origin', '*');
+		c.header('Access-Control-Allow-Headers', 'Content-Type');
+		c.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+	} else if (allowed) {
 		c.header('Access-Control-Allow-Origin', allowed);
 		c.header('Access-Control-Allow-Credentials', 'true');
 		c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 		c.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
 		c.header('Vary', 'Origin');
 	}
-	// SDK ingestion paths handle their own permissive preflight; everything
-	// else answers preflight with a bare 204 and no CORS grant.
+	// SDK ingestion and public feedback paths handle their own permissive
+	// preflight; everything else answers with no cross-origin grant.
 	const isSdkPath = /^\/api\/[^/]+\/(envelope|store|security)\/?$/.test(c.req.path);
-	if (c.req.method === 'OPTIONS' && !isSdkPath) {
+	if (c.req.method === 'OPTIONS' && !isSdkPath && !isFeedbackPath) {
 		return c.body(null, 204);
 	}
 	await next();
@@ -101,6 +107,7 @@ app.route('/api', ingestionRoutes);
 
 // Protected routes (session auth required)
 app.use('/api/projects/*', authMiddleware);
+app.route('/api', feedbackRoutes);
 app.route('/api/projects', projectRoutes);
 app.route('/api/projects', memberRoutes);
 app.route('/api/projects', issueRoutes);
