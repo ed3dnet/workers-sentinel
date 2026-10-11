@@ -6,3 +6,7 @@ node = "26.8.1"
 "npm:pnpm" = "10.24.0"
 just = "1.43.0"
 lefthook = "2.1.14"
+
+# Local credentials stay in the existing git-ignored .env, never in MCP config.
+[env]
+_.file = ".env"

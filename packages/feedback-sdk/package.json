@@ -1,0 +1,54 @@
+{
+	"name": "@workers-sentinel/feedback-sdk",
+	"version": "0.1.0",
+	"description": "Framework-independent feedback widget for Workers Sentinel",
+	"license": "MIT",
+	"publishConfig": {
+		"access": "public"
+	},
+	"type": "module",
+	"sideEffects": false,
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./script": "./dist/browser.iife.js",
+		"./browser": {
+			"types": "./dist/browser.d.ts",
+			"import": "./dist/browser.js"
+		}
+	},
+	"unpkg": "./dist/browser.iife.js",
+	"jsdelivr": "./dist/browser.iife.js",
+	"files": [
+		"dist",
+		"README.md",
+		"SKILL.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsup --config tsup.config.ts",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:browser": "pnpm build && node test/browser.mjs"
+	},
+	"dependencies": {
+		"html-to-image": "^1.11.13"
+	},
+	"devDependencies": {
+		"happy-dom": "^15.11.7",
+		"playwright": "^1.56.0",
+		"tsup": "^8.5.1",
+		"typescript": "^5.9.3",
+		"vitest": "^3.0.9"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/G4brym/workers-sentinel.git",
+		"directory": "packages/feedback-sdk"
+	}
+}

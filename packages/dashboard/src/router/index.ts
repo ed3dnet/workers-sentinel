@@ -55,6 +55,16 @@ const router = createRouter({
 					component: () => import('../views/IssueDetail.vue'),
 				},
 				{
+					path: 'projects/:slug/feedback',
+					name: 'feedback',
+					component: () => import('../views/Feedback.vue'),
+				},
+				{
+					path: 'projects/:slug/feedback/:feedbackId',
+					name: 'feedback-detail',
+					component: () => import('../views/FeedbackDetail.vue'),
+				},
+				{
 					path: 'projects/:slug/events/:eventId',
 					name: 'event-detail',
 					component: () => import('../views/EventDetail.vue'),

@@ -8,6 +8,7 @@ export default defineConfig({
 			miniflare: {
 				bindings: {
 					SETUP_TOKEN: 'test-setup-token',
+					CORS_ORIGINS: 'https://listed.example',
 					// Test-only fault-injection switch: enables the
 					// X-Sentinel-Test-Fault header and internal fault
 					// markers. Never bound in wrangler.jsonc, so the

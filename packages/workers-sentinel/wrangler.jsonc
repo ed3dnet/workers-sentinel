@@ -13,12 +13,15 @@
 	"workers_dev": false,
 	"routes": [
 		{
-			"pattern": "aw-heck.ed3d.net",
+			"pattern": "wat.tilmonengineering.com",
 			"custom_domain": true
 		}
 	],
 	"build": {
 		"command": "cd ../dashboard && npm run build"
+	},
+	"vars": {
+		"FEEDBACK_DSN": "https://8b4c3e3d981e37fa1fbe70a8dfe8d9ac@wat.tilmonengineering.com/653a8a0a-a93b-4901-887b-3a751218fe6a"
 	},
 	// Attachment blob storage (metadata rows stay in ProjectState). Miniflare
 	// (`wrangler dev`, vitest-pool-workers, the integration runner) simulates

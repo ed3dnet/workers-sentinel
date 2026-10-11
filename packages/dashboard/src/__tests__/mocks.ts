@@ -24,17 +24,23 @@ export interface MockApiState {
 	get: Map<string, RouteHandler>;
 	post: Map<string, RouteHandler>;
 	delete: Map<string, RouteHandler>;
-	calls: Array<{ method: 'get' | 'post' | 'delete'; url: string; body?: unknown }>;
+	patch: Map<string, RouteHandler>;
+	calls: Array<{ method: 'get' | 'post' | 'delete' | 'patch'; url: string; body?: unknown }>;
 }
 
 export const mockApi: MockApiState = {
 	get: new Map(),
 	post: new Map(),
 	delete: new Map(),
+	patch: new Map(),
 	calls: [],
 };
 
-function dispatch(method: 'get' | 'post' | 'delete', url: string, body?: unknown): unknown {
+function dispatch(
+	method: 'get' | 'post' | 'delete' | 'patch',
+	url: string,
+	body?: unknown,
+): unknown {
 	mockApi.calls.push({ method, url, body });
 	const handler = mockApi[method].get(url);
 	if (!handler) {
@@ -48,9 +54,7 @@ function dispatch(method: 'get' | 'post' | 'delete', url: string, body?: unknown
 export const api = {
 	get: vi.fn((url: string) => Promise.resolve(dispatch('get', url))),
 	post: vi.fn((url: string, body?: unknown) => Promise.resolve(dispatch('post', url, body))),
-	patch: vi.fn((url: string, body?: unknown) =>
-		Promise.resolve(dispatch('patch' as never, url, body)),
-	),
+	patch: vi.fn((url: string, body?: unknown) => Promise.resolve(dispatch('patch', url, body))),
 	delete: vi.fn((url: string) => Promise.resolve(dispatch('delete', url))),
 };
 
@@ -64,6 +68,7 @@ export function resetMocks(): void {
 	mockApi.get.clear();
 	mockApi.post.clear();
 	mockApi.delete.clear();
+	mockApi.patch.clear();
 	mockApi.calls.length = 0;
 	try {
 		globalThis.localStorage?.clear();
@@ -82,4 +87,7 @@ export function onPost(url: string, handler: RouteHandler): void {
 }
 export function onDelete(url: string, handler: RouteHandler): void {
 	mockApi.delete.set(url, handler);
+}
+export function onPatch(url: string, handler: RouteHandler): void {
+	mockApi.patch.set(url, handler);
 }

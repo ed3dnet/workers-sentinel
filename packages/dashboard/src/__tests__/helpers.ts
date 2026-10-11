@@ -40,6 +40,11 @@ export function testRouter(): Router {
 			{ path: '/login', component: { template: '<div>login</div>' } },
 			{ path: '/settings', component: { template: '<div>settings</div>' } },
 			{ path: '/projects', component: { template: '<div>projects</div>' } },
+			{ path: '/projects/:slug/feedback', component: { template: '<div>feedback</div>' } },
+			{
+				path: '/projects/:slug/feedback/:feedbackId',
+				component: { template: '<div>feedback detail</div>' },
+			},
 			{ path: '/', component: { template: '<div>home</div>' } },
 		],
 	});

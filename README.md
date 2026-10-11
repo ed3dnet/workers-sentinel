@@ -136,16 +136,47 @@ npm create cloudflare@latest -- --template=https://github.com/G4brym/workers-sen
 ### Manual Deployment
 
 ```bash
-# Clone the repository
-git clone https://github.com/G4brym/workers-sentinel.git
+# Clone this deployment's source repository
+git clone https://github.com/tilmon-engineering/workers-sentinel.git
 cd workers-sentinel
 
 # Install dependencies
 pnpm install
 
-# Build and deploy
-pnpm deploy
+# Build and deploy an already bootstrapped installation
+CLOUDFLARE_ACCOUNT_ID=<zone-owning-account-id> pnpm deploy
 ```
+
+This source configuration deploys `workers-sentinel` to the custom domain
+`wat.tilmonengineering.com`, with `workers.dev` disabled. Confirm the domain's
+Cloudflare zone is active in the selected account and inspect existing hostname
+records before deploying. Wrangler manages custom-domain DNS and certificates;
+do not overwrite a conflicting record. The separate one-click template is not
+the deployment path used here.
+
+Before the first deployment, ensure the `sentinel-attachments` R2 bucket exists
+in that account (`wrangler r2 bucket create sentinel-attachments`). Keep the
+`AuthState` and `ProjectState` bindings and the `v1` migration history unchanged.
+Run the local release checks and Wrangler dry-run before deploying.
+
+For a **fresh installation**, do not run the public deployment command above
+first. Create a temporary Wrangler config beside `packages/workers-sentinel/wrangler.jsonc`
+that copies its code, build, assets, compatibility, R2, and Durable Object settings,
+but omits `routes` and keeps `workers_dev: false`. From the Worker package directory,
+deploy that config with the account pinned and explicit `--config` selection. Set
+`SETUP_TOKEN` using `wrangler secret put SETUP_TOKEN --config <bootstrap-config>`;
+use a securely generated value, never source-controlled configuration. Confirm the
+secret name is present and the Worker has no public deploy targets before deploying
+`wrangler.jsonc`. Secret provisioning itself deploys a version, so keep selecting
+the route-free config until the secret is installed. Retain the bootstrap config
+until production verification succeeds, then remove it.
+
+Register the first administrator with the setup token, then immediately disable
+open registration in admin settings (`registrationOpen: false`). Verify anonymous
+registration returns `403 registration_disabled` before running the production
+smoke script. Use a dedicated temporary project and API token for the smoke, then
+delete the project and revoke the token. Store credentials outside Git; a local
+`.env`, if used, must remain git-ignored and owner-readable only.
 
 ### Local Development (guarded supervisor)
 
@@ -230,6 +261,82 @@ Sentry.init({
   dsn: 'https://<public_key>@<your-worker>.workers.dev/<project_id>',
 });
 ```
+
+### Website feedback widget (browser)
+
+The feedback widget is a separate, framework-independent browser SDK with no React or Vue runtime dependency. It does not report through Sentry's error-event protocol. The prepared package name is `@workers-sentinel/feedback-sdk`, version `0.1.0`; it has **not been published**, and registry ownership/publish permission has not been verified. Do not rely on an npm CDN URL until an authorized release exists.
+
+For this checkout, build and pack the SDK, then install its tarball in your website project:
+
+```sh
+# In this repository
+pnpm install
+pnpm --filter @workers-sentinel/feedback-sdk build
+cd packages/feedback-sdk
+npm pack
+
+# In your website project (adjust the repository path)
+npm install /path/to/workers-sentinel/packages/feedback-sdk/workers-sentinel-feedback-sdk-0.1.0.tgz
+```
+
+After an authorized npm release, the equivalent registry installation is `npm install @workers-sentinel/feedback-sdk@0.1.0`. Initialize either installation with the project's public DSN (shown at project creation and in Project Settings):
+
+```javascript
+import { installFeedbackWidget } from '@workers-sentinel/feedback-sdk';
+
+const feedback = installFeedbackWidget({
+  dsn: 'https://<public_key>@<your-worker>.workers.dev/<project_id>',
+  launcherLabel: 'Send feedback',
+  placement: 'bottom-right',
+  theme: { accentColor: '#c9234a', backgroundColor: '#ffffff' },
+  styleNonce: document.querySelector('meta[name="csp-nonce"]')?.getAttribute('content'),
+  privateSelectors: ['.customer-private'],
+  collectMetadata: async ({ pageUrl, locator }) => ({
+    release: 'website-1.0.0',
+    page: pageUrl,
+    selectedElement: locator,
+  }),
+});
+
+// Call feedback.destroy() when your application no longer needs the widget.
+```
+
+The Sentinel deployment also hosts the standalone SDK at `https://wat.tilmonengineering.com/sdk/feedback.js`, with a version-pinned copy at `https://wat.tilmonengineering.com/sdk/v0.1.0/feedback.js`. Dashboard builds include both files automatically. For another hosting setup, copy the built `packages/feedback-sdk/dist/browser.iife.js` to your website's public `/assets/` directory or your static CDN:
+
+```html
+<script src="/assets/browser.iife.js"></script>
+<script>
+  window.WorkersSentinelFeedback.install({
+    dsn: 'https://<public_key>@<your-worker>.workers.dev/<project_id>',
+    launcherLabel: 'Send feedback',
+    privateSelectors: ['.customer-private'],
+    collectMetadata: async (context) => ({
+      release: 'website-1.0.0',
+      page: context.pageUrl,
+    }),
+  });
+</script>
+```
+
+After publication, a version-pinned npm CDN URL such as `https://cdn.jsdelivr.net/npm/@workers-sentinel/feedback-sdk@0.1.0/dist/browser.iife.js` can replace the local `src`. Your host CSP must allow the script origin (and your initialization script's nonce/hash) and `connect-src` to your Sentinel instance.
+
+Both entry points expose equivalent initialization. The DSN public key is intentionally public and grants submission only; it cannot read feedback. The feedback API accepts credential-less wildcard CORS for cross-origin `POST` and preflight, independent of `CORS_ORIGINS`. Members browse submissions in the project's **Feedback** view. The service currently caps each submission body at 2 MiB, each screenshot at 1.5 MiB, callback metadata at 8 KiB (5 nesting levels and 100 entries per object/array), the complete metadata field at 12 KiB, and feedback submissions at 100 per project per hour. Screenshot bytes share the project's existing attachment budget and retention policy; after project purge, a content-free prefix tombstone and cleanup alarm reclaim uploads that finish late. PNG/JPEG/WebP type/signature agreement is checked server-side; this is not full image decoding or a guarantee of corruption-free images. Set `screenshots: false` to disable capture and require a deliberate text-only submission.
+
+Picking an element temporarily intercepts pointer activation; press **Escape** or Cancel to restore the page. The SDK stores a bounded locator and rectangle, not arbitrary DOM, full text, form values, or field contents. Opening the launcher starts element selection without showing the form. Selecting an element automatically captures a best-effort masked screenshot, then opens the form with the locator and image ready for review. The visitor enters a description and chooses **Send feedback**; nothing is uploaded until then. After success, the widget is ready for another report without reloading the page. The optional `collectMetadata(context)` callback runs at submission and receives bounded `pageUrl`, `pageTitle`, `description`, `locator`, and `geometry` context; return JSON-safe data only (up to 8 KiB). Do not return secrets or personal data. The callback has a short timeout; if it fails or times out, the form explains the issue and requires the visitor to choose whether to continue without the extra metadata.
+
+The widget is mounted in a Shadow DOM. Configure `styleNonce` when your host page uses a CSP nonce; strict Content Security Policy may otherwise block injected styles or renderer resources. Screenshot capture uses best-effort DOM rendering, not a native browser-tab screenshot. Password controls, `[data-sentinel-feedback-private]`, and configured `privateSelectors` are masked and cannot be disabled. Cross-origin images/fonts, tainted canvases, unsupported CSS, very long documents, and browser restrictions may make the image incomplete or unavailable. Capture starts automatically after element selection; the preview is shown for review before Send. If capture fails, the form clearly warns that no screenshot is attached, and the visitor can still send the description and selected-element context without an additional fallback step. Site owners are responsible for explaining consent/privacy expectations; screenshots can include visible page content beyond the selected element. Closed shadow roots and cross-origin frames are not traversed, and same-origin iframe selection is not supported.
+
+### Enable feedback on Sentinel's own dashboard
+
+Set the optional Worker deployment variable `FEEDBACK_DSN` to the project's public DSN in `packages/workers-sentinel/wrangler.jsonc` (`vars`) or your deployment configuration. Redeploy to apply it. No dashboard configuration UI exists; omitting or blanking the variable disables the installation.
+
+```jsonc
+"vars": {
+  "FEEDBACK_DSN": "https://PUBLIC_KEY@your-sentinel-host/PROJECT_ID"
+}
+```
+
+The dashboard reads only this public value from `/api/dashboard-config`, loads its same-origin `/sdk/feedback.js`, and installs one **Send feedback** launcher. It adds the current route as application metadata (not session credentials or user identity) and masks inputs, textareas, and selects in addition to the SDK's mandatory private masks. The launcher starts selection immediately; capture runs automatically before the form appears, and only **Send feedback** uploads the report. The host CSP must permit the DSN's origin under `connect-src`; same-origin DSNs work with the default policy.
 
 ### Node.js
 
@@ -371,6 +478,10 @@ API tokens use the `wst_` prefix and work alongside existing session-based authe
 - Set expiration dates for tokens used in temporary or rotating access scenarios
 - Revoke tokens immediately when they are no longer needed or may be compromised
 - Token management (creating, listing, revoking) requires session authentication — a compromised API token cannot create new tokens
+
+### MCP project triage
+
+An MCP client can read and triage issues and feedback for one project through a stateless HTTP endpoint using a `wst_` API token. Configure the client with `https://<sentinel-host>/api/projects/<project-slug>/mcp` and a static `Authorization: Bearer wst_…` header. This API-key auth mode is not MCP OAuth. See [docs/mcp.md](docs/mcp.md) for setup, transport behavior, tool contracts, pagination, and security boundaries.
 
 ## Architecture
 

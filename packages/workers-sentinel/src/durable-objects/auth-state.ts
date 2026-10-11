@@ -318,6 +318,10 @@ export class AuthState extends DurableObject<Env> {
 					return this.handleRevokeApiToken(request);
 				case '/validate-api-token':
 					return this.handleValidateApiToken(request);
+				case '/test/set-api-token-expiration':
+					if (this.env.ATTACHMENT_FAULT_INJECTION !== 'enabled')
+						return this.jsonResponse({ error: 'not_found' }, 404);
+					return this.handleTestSetApiTokenExpiration(request);
 				case '/list-project-members':
 					return this.handleListProjectMembers(request);
 				case '/add-project-member':
@@ -1804,6 +1808,16 @@ export class AuthState extends DurableObject<Env> {
 	}
 
 	// Test-only ceremony hooks (inert unless WEBAUTHN_TEST_HOOKS=enabled)
+
+	private async handleTestSetApiTokenExpiration(request: Request): Promise<Response> {
+		const { tokenId, expiresAt } = (await request.json()) as {
+			tokenId?: string;
+			expiresAt?: string;
+		};
+		if (!tokenId || !expiresAt) return this.jsonResponse({ error: 'missing_fields' }, 400);
+		this.sql.exec('UPDATE api_tokens SET expires_at = ? WHERE id = ?', expiresAt, tokenId);
+		return this.jsonResponse({ success: true });
+	}
 
 	private async handleWebauthnTestBackdate(request: Request): Promise<Response> {
 		if (this.env.WEBAUTHN_TEST_HOOKS !== 'enabled') {

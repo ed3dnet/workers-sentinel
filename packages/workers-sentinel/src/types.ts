@@ -14,6 +14,8 @@ export interface Env {
 	SETUP_TOKEN?: string;
 	/** Optional comma-separated list of origins allowed cross-origin access to the dashboard API. */
 	CORS_ORIGINS?: string;
+	/** Optional public DSN used by this installation's dashboard feedback widget. */
+	FEEDBACK_DSN?: string;
 	/**
 	 * Optional comma-separated list of additional origins trusted to run
 	 * WebAuthn ceremonies (e.g. `http://localhost:5173` for the vite dev
