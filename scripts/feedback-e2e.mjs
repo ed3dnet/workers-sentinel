@@ -65,11 +65,10 @@ try {
 	const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
 	await page.goto(website);
 	await page.getByRole('button', { name: 'Feedback', exact: true }).click();
-	await page.getByRole('textbox').fill('Actual browser feedback reaches the protected dashboard.');
-	await page.getByRole('button', { name: 'Select an element' }).click();
+	assert.equal(await page.getByRole('dialog').count(), 0);
 	await page.locator('#target').click();
 	assert.equal(await page.evaluate(() => window.pageActivations), 0);
-	await page.getByRole('button', { name: 'Capture screenshot' }).click();
+	await page.getByRole('textbox').fill('Actual browser feedback reaches the protected dashboard.');
 	await page.waitForFunction(
 		() =>
 			!document

@@ -6,6 +6,10 @@ const htmlToImage = vi.hoisted(() => ({ toBlob: vi.fn() }));
 vi.mock('html-to-image', () => htmlToImage);
 const installed: Array<{ destroy(): void }> = [];
 
+function hostShadow() {
+	return document.querySelector<HTMLElement>('[data-workers-sentinel-feedback]')!.shadowRoot!;
+}
+
 afterEach(() => {
 	for (const widget of installed.splice(0)) widget.destroy();
 	document.body.replaceChildren();
@@ -78,8 +82,14 @@ describe('widget lifecycle', () => {
 		expect(document.querySelector('[data-workers-sentinel-feedback]')).toBeNull();
 	});
 
-	it('does not render when selecting an element; renders only after explicit capture click', async () => {
-		htmlToImage.toBlob.mockResolvedValue(new Blob(['image-bytes'], { type: 'image/png' }));
+	it('starts selection immediately and shows no dialog until automatic capture settles', async () => {
+		let rejectCapture!: (cause: Error) => void;
+		htmlToImage.toBlob.mockImplementation(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectCapture = reject;
+				}),
+		);
 		const widget = installFeedbackWidget({
 			serverUrl: 'https://sentinel.example',
 			projectId: 'p1',
@@ -90,17 +100,101 @@ describe('widget lifecycle', () => {
 		target.dataset.testid = 'save';
 		document.body.append(target);
 		widget.open();
-		const shadow = document.querySelector<HTMLElement>('[data-workers-sentinel-feedback]')!
-			.shadowRoot!;
-		(shadow.querySelector('.description') as HTMLTextAreaElement).value =
-			'Save button did not respond';
-		shadow.querySelector<HTMLButtonElement>('.picker')!.click();
-		target.dispatchEvent(new PointerEvent('pointermove', { bubbles: true }));
-		target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+		const shadow = hostShadow();
+		expect(shadow.querySelector('.panel')).toBeNull();
+		expect(shadow.querySelector('.waiting-message')?.textContent).toContain(
+			'Select a page element',
+		);
+		widget.open(); // Duplicate open does not replace the active selection flow.
+		expect(shadow.querySelectorAll('.waiting')).toHaveLength(1);
+		target.click();
+		expect(htmlToImage.toBlob).toHaveBeenCalledTimes(1);
+		expect(shadow.querySelector('.panel')).toBeNull();
+		expect(shadow.querySelector('.waiting-message')?.textContent).toContain('Capturing');
+		rejectCapture(new Error('renderer blocked'));
+		await vi.waitFor(() => expect(shadow.querySelector('.panel')).not.toBeNull());
+		expect(shadow.querySelector('.locator')?.textContent).toContain('data-testid');
+		expect(shadow.querySelector('[role="alert"]')?.textContent).toContain('renderer blocked');
+	});
+
+	it('cancels selection and pending capture without rendering stale forms', async () => {
+		let resolveCapture!: (blob: Blob) => void;
+		htmlToImage.toBlob.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveCapture = resolve;
+				}),
+		);
+		const widget = installFeedbackWidget({
+			serverUrl: 'https://sentinel.example',
+			projectId: 'p1',
+			publicKey: 'key',
+		});
+		installed.push(widget);
+		const target = document.createElement('button');
+		document.body.append(target);
+		widget.open();
+		const shadow = hostShadow();
+		shadow.querySelector<HTMLButtonElement>('.waiting-cancel')!.click();
+		expect(shadow.querySelector('.waiting')).toBeNull();
+		expect(document.querySelectorAll('.highlight')).toHaveLength(0);
+		widget.open();
+		target.click();
+		widget.close();
+		resolveCapture(new Blob(['image-bytes'], { type: 'image/png' }));
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(shadow.querySelector('.panel')).toBeNull();
+		expect(shadow.querySelector('.waiting')).toBeNull();
+	});
+
+	it('does not render after destroy while screenshot rendering is pending', async () => {
+		let rejectCapture!: (cause: Error) => void;
+		htmlToImage.toBlob.mockImplementation(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectCapture = reject;
+				}),
+		);
+		const widget = installFeedbackWidget({
+			serverUrl: 'https://sentinel.example',
+			projectId: 'p1',
+			publicKey: 'key',
+		});
+		const target = document.createElement('button');
+		document.body.append(target);
+		widget.open();
+		target.click();
+		const shadow = hostShadow();
+		expect(htmlToImage.toBlob).toHaveBeenCalledTimes(1);
+		widget.destroy();
+		rejectCapture(new Error('late renderer failure'));
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(shadow.querySelector('.panel')).toBeNull();
+		expect(document.querySelector('[data-workers-sentinel-feedback]')).toBeNull();
+	});
+
+	it('shows the form after selection when screenshots are disabled', async () => {
+		const widget = installFeedbackWidget({
+			serverUrl: 'https://sentinel.example',
+			projectId: 'p1',
+			publicKey: 'key',
+			screenshots: false,
+		});
+		installed.push(widget);
+		const target = document.createElement('button');
+		target.dataset.testid = 'save';
+		document.body.append(target);
+		widget.open();
+		const shadow = hostShadow();
+		expect(shadow.querySelector('.panel')).toBeNull();
+		target.click();
 		expect(htmlToImage.toBlob).not.toHaveBeenCalled();
+		expect(shadow.querySelector('.panel')).not.toBeNull();
 		expect((shadow.querySelector('.locator') as HTMLElement).textContent).toContain('data-testid');
-		shadow.querySelector<HTMLButtonElement>('.capture')!.click();
-		await vi.waitFor(() => expect(htmlToImage.toBlob).toHaveBeenCalledTimes(1));
+		expect(shadow.querySelector('.text-only')).toBeNull();
+		expect(shadow.querySelector('.capture-status')?.textContent).toContain('disabled');
 	});
 
 	it('rejects installation without a browser document', () => {

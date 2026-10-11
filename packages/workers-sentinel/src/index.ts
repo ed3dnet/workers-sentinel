@@ -9,6 +9,7 @@ import { feedbackRoutes } from './routes/feedback';
 import { filterRoutes } from './routes/filters';
 import { ingestionRoutes } from './routes/ingestion';
 import { issueRoutes } from './routes/issues';
+import { mcpRoutes } from './routes/mcp';
 import { memberRoutes } from './routes/members';
 import { projectRoutes } from './routes/projects';
 import { releaseRoutes } from './routes/releases';
@@ -48,7 +49,12 @@ app.use('/api/*', async (c, next) => {
 	} else if (allowed) {
 		c.header('Access-Control-Allow-Origin', allowed);
 		c.header('Access-Control-Allow-Credentials', 'true');
-		c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+		c.header(
+			'Access-Control-Allow-Headers',
+			/^\/api\/projects\/[^/]+\/mcp$/.test(c.req.path)
+				? 'Content-Type, Authorization, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID'
+				: 'Content-Type, Authorization',
+		);
 		c.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
 		c.header('Vary', 'Origin');
 	}
@@ -84,6 +90,12 @@ app.use('*', async (c, next) => {
 // Health check
 app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
+// This deployment option is public by design; never expose other bindings here.
+app.get('/api/dashboard-config', (c) => {
+	c.header('Cache-Control', 'no-store');
+	return c.json({ feedbackDsn: c.env.FEEDBACK_DSN?.trim() || null });
+});
+
 // Public routes (no auth required)
 app.route('/api/auth', authRoutes);
 
@@ -107,6 +119,7 @@ app.route('/api', ingestionRoutes);
 
 // Protected routes (session auth required)
 app.use('/api/projects/*', authMiddleware);
+app.route('/api/projects', mcpRoutes);
 app.route('/api', feedbackRoutes);
 app.route('/api/projects', projectRoutes);
 app.route('/api/projects', memberRoutes);

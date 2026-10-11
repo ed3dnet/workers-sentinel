@@ -1,0 +1,9 @@
+mcp_servers:
+  sentinel:
+    transport: http
+    url: https://wat.tilmonengineering.com/api/projects/sentinel-itself/mcp
+    auth:
+      type: authorization-header
+      value: "Bearer ${SENTINEL_API_TOKEN}"
+    default_enabled: true
+    default_timeout_seconds: 30

@@ -88,7 +88,7 @@ Never return credentials, access tokens, session cookies, passwords, secrets, or
 - `theme`: object with optional `accentColor`, `accentTextColor`, `backgroundColor`, `textColor`, `mutedColor`, `borderColor`; use CSS color strings, not a theme-name string.
 - `styleNonce`: site's CSP nonce for the injected widget style element.
 - `privateSelectors`: additional valid CSS selectors. Invalid selectors cause installation failure rather than silently skipping privacy controls.
-- `screenshots`: default true; false disables capture and requires a deliberate text-only choice before submission.
+- `screenshots`: default true; false disables capture and the form states that no screenshot is attached.
 - `screenshotScale`: default 1; bounded to 0.25–2 and reduced to fit the 2048-pixel image-edge limit.
 - `maxPayloadBytes`: optional lower request limit; cannot exceed 2 MiB.
 - `collectMetadata`, `metadataTimeoutMs`, `maxMetadataBytes`: as above.
@@ -97,11 +97,11 @@ Never return credentials, access tokens, session cookies, passwords, secrets, or
 
 ## Visitor workflow and privacy
 
-Open launcher → describe feedback → **Select an element** → click the final page element → review description → **Capture screenshot** → review masked page image and target outline → **Send feedback**. Escape cancels selection and restores page interaction. Picker intercepts page pointerdown/up/cancel and click; do not replace its event interception with ordinary click-only handling.
+Open launcher → selection begins immediately, with no form → click the final page element → screenshot captures automatically → form opens with locator and masked image → enter description, review the image and target outline → **Send feedback**. Nothing is uploaded before Send. After success, start another report without reloading. Escape cancels selection and restores page interaction. Picker intercepts page pointerdown/up/cancel and click; do not replace its event interception with ordinary click-only handling.
 
-Password controls (`input[type="password"]`) and `[data-sentinel-feedback-private]` regions are always masked, plus `privateSelectors`. Masks are burned into the output bitmap and cannot be disabled by configuration. Other visible text/form content may contain sensitive data: mark it private explicitly. Closed shadow roots and iframe traversal are unsupported. Rendering uses MIT-licensed `html-to-image`, not native browser-tab screenshot APIs, session replay, or pixel-perfect capture.
+Password controls (`input[type="password"]`) and `[data-sentinel-feedback-private]` regions are always masked, plus `privateSelectors`. Private elements are excluded from rendering as well as having their measured rectangles masked in the output bitmap, so moving private content is not captured. These controls cannot be disabled by configuration; exclusion may affect image layout. Marking the document root private omits the screenshot. Other visible text/form content may contain sensitive data: mark it private explicitly. Closed shadow roots and iframe traversal are unsupported. Rendering uses MIT-licensed `html-to-image`, not native browser-tab screenshot APIs, session replay, or pixel-perfect capture.
 
-Cross-origin assets/fonts, tainted canvases, unsupported CSS, page geometry changes, very long pages, or CSP can make rendering incomplete or fail. On capture failure the visitor must choose **Continue with text only** before sending without an image. Do not silently treat failure as a successful capture.
+Cross-origin assets/fonts, tainted canvases, unsupported CSS, page geometry changes, very long pages, or CSP can make rendering incomplete or fail. On capture failure the form warns that no screenshot is attached and still allows **Send feedback** without an additional fallback step. Do not silently treat failure as a successful capture.
 
 ## Server contract and verification
 
@@ -113,7 +113,7 @@ After integration, verify:
 
 1. One launcher appears with the intended label/placement and without changing host styles.
 2. Selecting a nested element identifies the final clicked element; Escape cancels and page controls work normally afterward.
-3. Capture only occurs on deliberate capture action; preview masks password/default/custom-private regions and outlines the selection.
+3. Selection automatically captures before the form appears; preview masks password/default/custom-private regions and outlines the selection. Nothing uploads before Send.
 4. Callback sees current app state at submit; accepted metadata appears in the correct project's dashboard.
-5. Callback/capture failures visibly require explicit omission choices; no secret appears in metadata, URL, title, or screenshot.
-6. Destroying the widget removes its UI/listeners. Do not create production test accounts or records unless separately authorized.
+5. Capture failure warns without blocking Send; callback failure requires an explicit continue-without-metadata choice. No secret appears in metadata, URL, title, or screenshot.
+6. After success, another report starts with fresh form state without reloading. Destroying the widget removes its UI/listeners. Do not create production test accounts or records unless separately authorized.

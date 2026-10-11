@@ -46,23 +46,35 @@ try {
 		page.on('pageerror', (error) => errors.push(error.message));
 		await page.goto(`${base}/${mode}`);
 		await page.getByRole('button', { name: 'Feedback', exact: true }).click();
-		assert.equal(await page.evaluate(() => window.hookCalls), 0);
-		await page.getByRole('button', { name: 'Select an element' }).click();
+		assert.equal(await page.locator('[role="dialog"]').count(), 0);
+		await page.getByText(/Select a page element/).waitFor();
 		await page.keyboard.press('Escape');
-		await page.locator('#target span').click();
-		assert.equal(await page.evaluate(() => window.activation), 1);
-		await page
-			.getByRole('textbox', { name: 'What happened?' })
-			.fill('The nested element needs improvement.');
-		await page.getByRole('button', { name: 'Select an element' }).click();
+		assert.equal(await page.getByText(/Select a page element/).count(), 0);
 		await page.locator('#target span').click();
 		assert.equal(await page.evaluate(() => window.activation), 1);
 		assert.equal(await page.evaluate(() => window.pointerActivation), 1);
 		assert.equal(await page.evaluate(() => window.pointerUpActivation), 1);
-		assert.match(await page.locator('.locator').textContent(), /final-child/);
-		assert.equal(await page.locator('.preview-wrap').isVisible(), false);
-		await page.getByRole('button', { name: 'Capture screenshot' }).click();
+
+		await page.getByRole('button', { name: 'Feedback', exact: true }).click();
+		await page.locator('#target span').click();
 		await page.locator('.preview-wrap').waitFor({ state: 'visible' });
+		assert.equal(await page.evaluate(() => window.activation), 1);
+		assert.equal(await page.evaluate(() => window.pointerActivation), 1);
+		assert.equal(await page.evaluate(() => window.pointerUpActivation), 1);
+		assert.match(await page.locator('.locator').textContent(), /final-child/);
+		assert.equal(await page.locator('.description').count(), 1);
+		const firstDescription = 'The nested element needs improvement.';
+		await page.getByRole('textbox', { name: 'What happened?' }).fill(firstDescription);
+
+		await page.getByRole('button', { name: 'Reselect element' }).click();
+		assert.equal(await page.locator('[role="dialog"]').count(), 0);
+		await page.locator('#target span').click();
+		await page.locator('.preview-wrap').waitFor({ state: 'visible' });
+		assert.equal(
+			await page.getByRole('textbox', { name: 'What happened?' }).inputValue(),
+			firstDescription,
+		);
+		assert.match(await page.locator('.locator').textContent(), /final-child/);
 		const pixels = await page.evaluate(() => {
 			const canvas = document
 				.querySelector('[data-workers-sentinel-feedback]')
@@ -109,12 +121,50 @@ try {
 		assert.equal(submitted.credentials, 'omit');
 		assert.equal(submitted.imageType, 'image/png');
 		assert.equal(submitted.metadata.metadata.release, 'browser-release');
-		assert.equal(submitted.context.description, 'The nested element needs improvement.');
+		assert.equal(submitted.context.description, firstDescription);
 		assert.equal(await page.evaluate(() => window.hookCalls), 1);
+
+		await page.getByRole('button', { name: 'Send another report' }).click();
+		assert.equal(await page.locator('[role="dialog"]').count(), 0);
+		await page.locator('#target span').click();
+		await page.locator('.preview-wrap').waitFor({ state: 'visible' });
+		assert.equal(await page.getByRole('textbox', { name: 'What happened?' }).inputValue(), '');
+		await page.getByRole('textbox', { name: 'What happened?' }).fill('A second report');
+		await page.getByRole('button', { name: 'Send feedback', exact: true }).click();
+		await page.getByRole('button', { name: 'Close', exact: true }).click();
+		assert.equal(await page.locator('[role="dialog"]').count(), 0);
+		assert.equal(await page.evaluate(() => window.sent.length), 2);
 		assert.deepEqual(errors, []);
+		await page.evaluate(() => {
+			const privateElement = document.querySelector('#custom-private');
+			const measure = privateElement.getBoundingClientRect.bind(privateElement);
+			let moved = false;
+			privateElement.getBoundingClientRect = () => {
+				const rect = measure();
+				if (!moved) {
+					moved = true;
+					privateElement.style.top = '500px';
+				}
+				return rect;
+			};
+		});
+		await page.getByRole('button', { name: 'Feedback', exact: true }).click();
+		await page.locator('#target span').click();
+		await page.locator('.preview-wrap').waitFor({ state: 'visible' });
+		const movedPixel = await page.evaluate(() => {
+			const canvas = document
+				.querySelector('[data-workers-sentinel-feedback]')
+				.shadowRoot.querySelector('.preview');
+			return [...canvas.getContext('2d').getImageData(50, 510, 1, 1).data];
+		});
+		assert.ok(
+			movedPixel[3] === 0 || (movedPixel[1] > 200 && movedPixel[2] > 200),
+			`Moving private content was excluded: ${movedPixel}`,
+		);
+		console.log(`PASS ${mode}: moving private content excluded from renderer`);
 		await page.close();
 		console.log(
-			`PASS ${mode}: installer, final-element picker, Escape, consent, mask pixels, annotation, metadata, multipart`,
+			`PASS ${mode}: selection-first, Escape, capture, reselect, privacy pixels, annotation, metadata, sequential reports`,
 		);
 	}
 	const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
@@ -129,10 +179,9 @@ try {
 		});
 	});
 	await page.getByRole('button', { name: 'Feedback', exact: true }).click();
-	await page.getByRole('textbox', { name: 'What happened?' }).fill('Text only feedback');
-	await page.getByRole('button', { name: 'Select an element' }).click();
 	await page.locator('#target span').click();
-	await page.getByRole('button', { name: 'Continue with text only' }).click();
+	await page.getByRole('textbox', { name: 'What happened?' }).waitFor();
+	await page.getByRole('textbox', { name: 'What happened?' }).fill('Text only feedback');
 	await page.getByRole('button', { name: 'Send feedback', exact: true }).click();
 	await page.getByRole('button', { name: 'Continue without metadata' }).waitFor();
 	assert.equal(await page.evaluate(() => window.sent.length), 0);
@@ -141,7 +190,30 @@ try {
 	await page.getByRole('button', { name: 'Send feedback', exact: true }).click();
 	await page.getByText('Thank you! Your feedback was sent.').waitFor();
 	assert.equal(await page.evaluate(() => window.sent[0].body.has('screenshot')), false);
-	console.log('PASS explicit text-only and metadata-failure choice');
+	console.log('PASS screenshots disabled and explicit metadata-failure choice');
+	await page.evaluate(() => {
+		window.widget.destroy();
+		window.notificationErrors = [];
+		window.addEventListener('unhandledrejection', (event) => {
+			window.notificationErrors.push(String(event.reason));
+			event.preventDefault();
+		});
+		window.widget = window.makeWidget({
+			screenshots: false,
+			onSubmit: async () => {
+				throw new Error('Application notification failed');
+			},
+		});
+	});
+	await page.getByRole('button', { name: 'Feedback', exact: true }).click();
+	await page.locator('#target span').click();
+	await page.getByRole('textbox', { name: 'What happened?' }).fill('Notification failure');
+	await page.getByRole('button', { name: 'Send feedback', exact: true }).click();
+	await page.getByRole('button', { name: 'Send another report' }).click();
+	await page.locator('#target span').click();
+	assert.equal(await page.getByRole('textbox', { name: 'What happened?' }).inputValue(), '');
+	assert.deepEqual(await page.evaluate(() => window.notificationErrors), []);
+	console.log('PASS async notification rejection isolated from success/reset');
 	await page.close();
 } finally {
 	await browser.close();

@@ -293,7 +293,7 @@ feedbackRoutes.post('/:projectId/feedback', async (c) => {
 	}
 });
 
-function publicFeedback(row: Record<string, unknown>) {
+export function publicFeedback(row: Record<string, unknown>) {
 	return {
 		id: row.id,
 		description: row.description,
@@ -305,6 +305,7 @@ function publicFeedback(row: Record<string, unknown>) {
 		receivedAt: row.receivedAt,
 		screenshotType: row.screenshotType,
 		screenshotSize: row.screenshotSize,
+		status: row.status === 'resolved' ? 'resolved' : 'unresolved',
 	};
 }
 
@@ -313,17 +314,49 @@ feedbackRoutes.get('/projects/:slug/feedback', async (c) => {
 	if (access instanceof Response) return access;
 	const rawLimit = Number.parseInt(c.req.query('limit') ?? '', 10);
 	const limit = clampFeedbackLimit(rawLimit);
+	const status = c.req.query('status');
+	const query = c.req.query('query');
+	if (status && status !== 'unresolved' && status !== 'resolved')
+		return c.json({ error: 'invalid_status' }, 400);
+	if (query !== undefined && query.length > 200) return c.json({ error: 'invalid_query' }, 400);
 	const response = await callState(c.env, access.project.id, '/feedback/list', {
 		cursor: c.req.query('cursor'),
 		limit,
+		status,
+		query,
 	});
-	if (!response.ok) return c.json(await response.json(), response.status as 404);
+	if (!response.ok) return c.json(await response.json(), response.status as 400 | 404 | 503);
 	const result = (await response.json()) as {
 		feedback: Array<Record<string, unknown>>;
 		nextCursor?: string;
 		hasMore: boolean;
 	};
 	return c.json({ ...result, feedback: result.feedback.map(publicFeedback) });
+});
+
+feedbackRoutes.patch('/projects/:slug/feedback/:feedbackId', async (c) => {
+	const access = await getProjectWithAccess(c, c.req.param('slug'));
+	if (access instanceof Response) return access;
+	const bytes = await readBoundedBody(c.req.raw, 1024);
+	if (!bytes) return c.json({ error: 'payload_too_large' }, 413);
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes));
+	} catch {
+		return c.json({ error: 'invalid_json' }, 400);
+	}
+	if (!body || typeof body !== 'object' || Array.isArray(body))
+		return c.json({ error: 'invalid_status' }, 400);
+	const { status } = body as { status?: unknown };
+	if (Object.keys(body).length !== 1 || (status !== 'unresolved' && status !== 'resolved'))
+		return c.json({ error: 'invalid_status' }, 400);
+	const response = await callState(c.env, access.project.id, '/feedback/status', {
+		id: c.req.param('feedbackId'),
+		status,
+	});
+	if (!response.ok) return c.json(await response.json(), response.status as 400 | 404 | 503);
+	const result = (await response.json()) as { feedback: Record<string, unknown> };
+	return c.json({ feedback: publicFeedback(result.feedback) });
 });
 
 feedbackRoutes.get('/projects/:slug/feedback/:feedbackId', async (c) => {

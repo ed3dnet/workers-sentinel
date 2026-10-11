@@ -15,6 +15,7 @@ interface Feedback {
 	receivedAt: string;
 	screenshotType: string | null;
 	screenshotSize: number | null;
+	status: 'unresolved' | 'resolved';
 }
 
 const route = useRoute();
@@ -37,6 +38,41 @@ const screenshotLoading = ref(false);
 const screenshotError = ref<string | null>(null);
 let screenshotRequest = 0;
 let feedbackRequest = 0;
+const pendingStatusKeys = ref(new Set<string>());
+const statusKey = (requestId: number, projectSlug: string, id: string) =>
+	`${requestId}:${projectSlug}:${id}`;
+const updatingStatus = computed(() =>
+	pendingStatusKeys.value.has(statusKey(feedbackRequest, slug.value, feedbackId.value)),
+);
+
+async function toggleStatus() {
+	const currentItem = item.value;
+	const currentSlug = slug.value;
+	const currentId = feedbackId.value;
+	const requestId = feedbackRequest;
+	const key = statusKey(requestId, currentSlug, currentId);
+	if (!currentItem || currentItem.id !== currentId || pendingStatusKeys.value.has(key)) return;
+	const status = currentItem.status === 'resolved' ? 'unresolved' : 'resolved';
+	pendingStatusKeys.value = new Set(pendingStatusKeys.value).add(key);
+	const isCurrent = () =>
+		requestId === feedbackRequest &&
+		currentSlug === slug.value &&
+		currentId === feedbackId.value &&
+		item.value === currentItem;
+	try {
+		await api.patch(
+			`/api/projects/${encodeURIComponent(currentSlug)}/feedback/${encodeURIComponent(currentId)}`,
+			{ status },
+		);
+		if (isCurrent()) currentItem.status = status;
+	} catch (err) {
+		if (isCurrent()) error.value = err instanceof Error ? err.message : 'Failed to update feedback';
+	} finally {
+		const pending = new Set(pendingStatusKeys.value);
+		pending.delete(key);
+		pendingStatusKeys.value = pending;
+	}
+}
 
 function revokeScreenshot() {
 	if (screenshotUrl.value) URL.revokeObjectURL(screenshotUrl.value);
@@ -143,9 +179,13 @@ onBeforeUnmount(() => {
 		</div>
 		<article v-else-if="item" class="space-y-4">
 			<header>
-				<h2 id="feedback-detail-heading" class="text-xl font-bold text-gray-900 dark:text-white">
-					{{ item.pageTitle || 'Feedback' }}
-				</h2>
+				<div class="flex flex-wrap items-start justify-between gap-3">
+					<h2 id="feedback-detail-heading" class="text-xl font-bold text-gray-900 dark:text-white">{{ item.pageTitle || 'Feedback' }}</h2>
+					<div class="flex items-center gap-2">
+						<span class="badge">{{ item.status || 'unresolved' }}</span>
+						<button class="btn btn-secondary" :disabled="updatingStatus" @click="toggleStatus">{{ item.status === 'resolved' ? 'Reopen' : 'Resolve' }}</button>
+					</div>
+				</div>
 				<time class="mt-1 block text-sm text-gray-500 dark:text-gray-400" :datetime="item.receivedAt">
 					{{ formatTime(item.receivedAt) }}
 				</time>

@@ -168,7 +168,8 @@ CREATE TABLE IF NOT EXISTS feedback_items (
   received_at TEXT NOT NULL,
   screenshot_key TEXT,
   screenshot_type TEXT,
-  screenshot_size INTEGER NOT NULL DEFAULT 0
+  screenshot_size INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'unresolved'
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_received ON feedback_items(received_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS feedback_uploads (
@@ -318,6 +319,12 @@ export class ProjectState extends DurableObject<Env> {
 	private async ensureSchema(): Promise<void> {
 		if (this.initialized) return;
 		this.sql.exec(SCHEMA);
+		const feedbackColumns = this.sql.exec('PRAGMA table_info(feedback_items)').toArray();
+		if (!feedbackColumns.some((column) => column.name === 'status')) {
+			this.sql.exec(
+				"ALTER TABLE feedback_items ADD COLUMN status TEXT NOT NULL DEFAULT 'unresolved'",
+			);
+		}
 		for (const migration of MIGRATIONS) {
 			try {
 				this.sql.exec(migration);
@@ -336,6 +343,31 @@ export class ProjectState extends DurableObject<Env> {
 
 	async fetch(request: Request): Promise<Response> {
 		const path = new URL(request.url).pathname;
+		if (path === '/test/legacy-feedback-fixture') {
+			if (this.env.ATTACHMENT_FAULT_INJECTION !== 'enabled') return this.notFound();
+			const body = (await request.json()) as { id?: string };
+			if (!body.id || this.initialized) return this.jsonResponse({ error: 'invalid_fixture' }, 400);
+			// Seed an independently specified pre-upgrade table before ensureSchema runs.
+			this.sql.exec(`CREATE TABLE feedback_items (
+				id TEXT PRIMARY KEY, description TEXT NOT NULL, page_url TEXT NOT NULL,
+				page_title TEXT NOT NULL, locator TEXT NOT NULL, geometry TEXT,
+				metadata TEXT NOT NULL DEFAULT 'null', received_at TEXT NOT NULL,
+				screenshot_key TEXT, screenshot_type TEXT, screenshot_size INTEGER NOT NULL DEFAULT 0
+			)`);
+			this.sql.exec(
+				`INSERT INTO feedback_items (id, description, page_url, page_title, locator, geometry, metadata, received_at, screenshot_key, screenshot_type, screenshot_size)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)`,
+				body.id,
+				'Legacy feedback row',
+				'https://example.com',
+				'Legacy page',
+				'#legacy',
+				null,
+				'null',
+				new Date().toISOString(),
+			);
+			return this.jsonResponse({ success: true });
+		}
 		if (
 			path.startsWith('/feedback/') &&
 			(await this.ctx.storage.get('feedback_project_purged')) === true
@@ -376,6 +408,8 @@ export class ProjectState extends DurableObject<Env> {
 					return this.handleFeedbackList(request);
 				case '/feedback/detail':
 					return this.handleFeedbackDetail(request);
+				case '/feedback/status':
+					return this.handleFeedbackStatus(request);
 				case '/feedback/delete':
 					return this.handleFeedbackDelete(request);
 				case '/issues':
@@ -709,8 +743,8 @@ export class ProjectState extends DurableObject<Env> {
 				}
 				this.seedAttachmentUsage();
 				this.sql.exec(
-					`INSERT INTO feedback_items (id, description, page_url, page_title, locator, geometry, metadata, received_at, screenshot_key, screenshot_type, screenshot_size)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO feedback_items (id, description, page_url, page_title, locator, geometry, metadata, received_at, screenshot_key, screenshot_type, screenshot_size, status)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unresolved')`,
 					body.id!,
 					body.description!.slice(0, 4000),
 					body.pageUrl!.slice(0, 2048),
@@ -759,19 +793,45 @@ export class ProjectState extends DurableObject<Env> {
 			screenshotKey: row.screenshot_key as string | null,
 			screenshotType: row.screenshot_type as string | null,
 			screenshotSize: row.screenshot_size as number,
+			status: (row.status as string) ?? 'unresolved',
 		};
 	}
 
 	private async handleFeedbackList(request: Request): Promise<Response> {
-		const body = (await request.json()) as { cursor?: string; limit?: number };
+		const body = (await request.json()) as {
+			cursor?: string;
+			limit?: number;
+			status?: string;
+			query?: string;
+		};
 		const limit = clampLimit(body.limit, 25);
-		let sql = 'SELECT * FROM feedback_items';
+		if (body.status && !['unresolved', 'resolved'].includes(body.status))
+			return this.jsonResponse({ error: 'invalid_status' }, 400);
+		if (body.query !== undefined && (typeof body.query !== 'string' || body.query.length > 200))
+			return this.jsonResponse({ error: 'invalid_query' }, 400);
+		let sql = 'SELECT * FROM feedback_items WHERE 1=1';
 		const params: (string | number)[] = [];
+		if (body.status) {
+			sql += ' AND status = ?';
+			params.push(body.status);
+		}
+		if (body.query?.trim()) {
+			const escaped = body.query
+				.trim()
+				.replace(/\\/g, '\\\\')
+				.replace(/%/g, '\\%')
+				.replace(/_/g, '\\_');
+			sql +=
+				" AND (description LIKE ? ESCAPE '\\' OR page_title LIKE ? ESCAPE '\\' OR page_url LIKE ? ESCAPE '\\')";
+			params.push(`%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+		}
 		if (body.cursor) {
-			const [time, id] = body.cursor.split('|');
+			const splitAt = body.cursor.lastIndexOf('|');
+			const time = splitAt < 0 ? '' : body.cursor.slice(0, splitAt);
+			const id = splitAt < 0 ? '' : body.cursor.slice(splitAt + 1);
 			if (!time || !id || id.length > 80)
 				return this.jsonResponse({ error: 'invalid_cursor' }, 400);
-			sql += ' WHERE (received_at < ? OR (received_at = ? AND id < ?))';
+			sql += ' AND (received_at < ? OR (received_at = ? AND id < ?))';
 			params.push(time, time, id);
 		}
 		params.push(limit + 1);
@@ -779,13 +839,25 @@ export class ProjectState extends DurableObject<Env> {
 			.exec(`${sql} ORDER BY received_at DESC, id DESC LIMIT ?`, ...params)
 			.toArray();
 		const hasMore = rows.length > limit;
-		const items = rows.slice(0, limit).map((row) => this.feedbackRow(row));
-		const last = items.at(-1) as { receivedAt: string; id: string } | undefined;
+		const pageRows = rows.slice(0, limit);
+		const items = pageRows.map((row) => this.feedbackRow(row));
+		const last = pageRows.at(-1) as Record<string, SqlStorageValue> | undefined;
 		return this.jsonResponse({
 			feedback: items,
 			hasMore,
-			...(hasMore && last ? { nextCursor: `${last.receivedAt}|${last.id}` } : {}),
+			...(hasMore && last ? { nextCursor: `${String(last.received_at)}|${String(last.id)}` } : {}),
 		});
+	}
+
+	private async handleFeedbackStatus(request: Request): Promise<Response> {
+		const { id, status } = (await request.json()) as { id?: string; status?: string };
+		if (!id || id.length > 80) return this.jsonResponse({ error: 'invalid_feedback_id' }, 400);
+		if (status !== 'unresolved' && status !== 'resolved')
+			return this.jsonResponse({ error: 'invalid_status' }, 400);
+		const result = this.sql.exec('UPDATE feedback_items SET status = ? WHERE id = ?', status, id);
+		if (result.rowsWritten === 0) return this.jsonResponse({ error: 'feedback_not_found' }, 404);
+		const row = this.sql.exec('SELECT * FROM feedback_items WHERE id = ?', id).one();
+		return this.jsonResponse({ feedback: row ? this.feedbackRow(row) : null });
 	}
 
 	private async handleFeedbackDetail(request: Request): Promise<Response> {
@@ -2267,13 +2339,34 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	private async handleGetComments(request: Request): Promise<Response> {
-		const { issueId } = (await request.json()) as { issueId: string };
-
-		const rows = this.sql
-			.exec('SELECT * FROM issue_comments WHERE issue_id = ? ORDER BY created_at ASC', issueId)
-			.toArray();
-
-		const comments = rows.map((row) => ({
+		const { issueId, cursor, limit } = (await request.json()) as {
+			issueId: string;
+			cursor?: string;
+			limit?: number;
+		};
+		if (!issueId) return this.jsonResponse({ error: 'missing_issue_id' }, 400);
+		const paged = limit !== undefined || cursor !== undefined;
+		const pageLimit = paged ? clampLimit(limit, 25) : undefined;
+		let sql = 'SELECT * FROM issue_comments WHERE issue_id = ?';
+		const params: (string | number)[] = [issueId];
+		if (cursor) {
+			const splitAt = cursor.lastIndexOf('|');
+			const time = splitAt < 0 ? '' : cursor.slice(0, splitAt);
+			const id = splitAt < 0 ? '' : cursor.slice(splitAt + 1);
+			if (!time || !id || id.length > 80)
+				return this.jsonResponse({ error: 'invalid_cursor' }, 400);
+			sql += ' AND (created_at > ? OR (created_at = ? AND id > ?))';
+			params.push(time, time, id);
+		}
+		sql += ' ORDER BY created_at ASC, id ASC';
+		if (pageLimit !== undefined) {
+			sql += ' LIMIT ?';
+			params.push(pageLimit + 1);
+		}
+		const rows = this.sql.exec(sql, ...params).toArray();
+		const hasMore = pageLimit !== undefined && rows.length > pageLimit;
+		const pageRows = pageLimit === undefined ? rows : rows.slice(0, pageLimit);
+		const comments = pageRows.map((row) => ({
 			id: row.id as string,
 			issueId: row.issue_id as string,
 			userId: row.user_id as string,
@@ -2281,8 +2374,13 @@ export class ProjectState extends DurableObject<Env> {
 			body: row.body as string,
 			createdAt: row.created_at as string,
 		}));
-
-		return this.jsonResponse({ comments });
+		if (!paged) return this.jsonResponse({ comments });
+		const last = comments.at(-1);
+		return this.jsonResponse({
+			comments,
+			hasMore,
+			...(hasMore && last ? { nextCursor: `${last.createdAt}|${last.id}` } : {}),
+		});
 	}
 
 	private async handleAddComment(request: Request): Promise<Response> {
