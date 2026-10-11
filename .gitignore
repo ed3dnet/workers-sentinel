@@ -41,3 +41,6 @@ coverage/
 
 # Local supervisor state (ownership records, Durable Object persistence)
 _devenv/cloudflare/.state/
+
+# Local Polytoken MCP configuration
+.polytoken/config.yaml
