@@ -259,12 +259,18 @@ export interface AuthenticationResponseJSONLike {
 
 export class VirtualAuthenticator {
 	readonly credentialId: Uint8Array;
+	// Explicit field + constructor assignment (no TypeScript parameter
+	// properties): parameter properties need code transformation, not type
+	// stripping, and this module must stay importable by Node's native
+	// TypeScript type-stripping (integration suite, demo scripts).
+	private readonly aaguid: Uint8Array;
 	private privateKey: CryptoKey | null = null;
 	private x: Uint8Array | null = null;
 	private y: Uint8Array | null = null;
 	counter = 0;
 
-	constructor(private readonly aaguid = new Uint8Array(16)) {
+	constructor(aaguid: Uint8Array = new Uint8Array(16)) {
+		this.aaguid = aaguid;
 		this.credentialId = crypto.getRandomValues(new Uint8Array(32));
 	}
 

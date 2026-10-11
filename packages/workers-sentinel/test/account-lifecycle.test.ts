@@ -1,11 +1,13 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { createTestUser } from './utils';
+import { adminFetch, createTestUser } from './utils';
+
+const BASE = 'http://localhost';
 
 async function adminSetDisabled(userId: string, disabled: boolean): Promise<void> {
 	const id = env.AUTH_STATE.idFromName('global');
 	await env.AUTH_STATE.get(id).fetch(
-		new Request('http://internal/admin/set-user-disabled', {
+		new Request('http://internal/admin/update-user', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ requestingUserRole: 'admin', userId, disabled }),
@@ -83,6 +85,40 @@ describe('account lifecycle', () => {
 
 		// Re-enable restores access
 		await adminSetDisabled(user.id, false);
+		const relogin = await SELF.fetch('http://localhost/api/auth/login', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ email: user.email, password: 'testpassword123' }),
+		});
+		expect(relogin.status).toBe(200);
+	});
+
+	it('admin disables a user through the gated route with a passkey session', async () => {
+		const user = await createTestUser({
+			email: `route-dis-${Date.now()}@example.com`,
+			password: 'testpassword123',
+			name: 'Route Disable User',
+		});
+
+		const disable = await adminFetch(`${BASE}/api/admin/users/${user.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ disabled: true }),
+		});
+		expect(disable.status).toBe(200);
+		const data = (await disable.json()) as { user: { disabled: boolean } };
+		expect(data.user.disabled).toBe(true);
+
+		// Existing session dead
+		const me = await SELF.fetch('http://localhost/api/auth/me', {
+			headers: { Authorization: `Bearer ${user.token}` },
+		});
+		expect(me.status).toBe(401);
+
+		const enable = await adminFetch(`${BASE}/api/admin/users/${user.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ disabled: false }),
+		});
+		expect(enable.status).toBe(200);
 		const relogin = await SELF.fetch('http://localhost/api/auth/login', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },

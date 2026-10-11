@@ -2,6 +2,10 @@
 // and a few Sentry envelope events shaped like real command-line feedback.
 // Usage: node _devenv/cloudflare/demo.mjs [baseUrl]
 import { fileURLToPath } from 'node:url';
+// Shared virtual authenticator (Node's native TS type-stripping imports it
+// without a build step) — the admin surface requires a passkey-minted
+// session, so project creation runs a real ceremony.
+import { VirtualAuthenticator } from '../../packages/workers-sentinel/test/webauthn-helper.ts';
 import { localLayout } from './local.mjs';
 
 const DEMO_USER = {
@@ -69,12 +73,13 @@ function cliMessage() {
 	};
 }
 
-async function api(base, path, { method = 'GET', token, body } = {}) {
+async function api(base, path, { method = 'GET', token, body, headers = {} } = {}) {
 	const response = await fetch(`${base}${path}`, {
 		method,
 		headers: {
 			'Content-Type': 'application/json',
 			...(token ? { Authorization: `Bearer ${token}` } : {}),
+			...headers,
 		},
 		body: body === undefined ? undefined : JSON.stringify(body),
 		signal: AbortSignal.timeout(15000),
@@ -90,14 +95,62 @@ async function loginOrRegister(base) {
 			method: 'POST',
 			body: { email: DEMO_USER.email, password: DEMO_USER.password },
 		});
-		return login.token;
+		return { token: login.token, userId: login.user.id };
 	} catch {
 		const register = await api(base, '/api/auth/register', { method: 'POST', body: DEMO_USER });
-		return register.token;
+		return { token: register.token, userId: register.user.id };
 	}
 }
 
-async function findOrCreateProject(base, token) {
+/** Mint a passkey session via the real HTTP ceremonies (the admin gate). */
+async function getAdminPasskeySession(base, passwordToken) {
+	// Ceremonies use the localhost origin: workerd drops an Origin header
+	// that equals the socket origin (127.0.0.1:port), and the supervisor
+	// binds WEBAUTHN_ORIGINS to this form so the worker accepts it.
+	const origin = `http://localhost:${new URL(base).port}`;
+	const rpID = 'localhost';
+	const ceremonyHeaders = { Origin: origin };
+	const authenticator = new VirtualAuthenticator();
+	await authenticator.init();
+
+	const options = await api(base, '/api/auth/webauthn/register/options', {
+		method: 'POST',
+		token: passwordToken,
+		body: {},
+		headers: ceremonyHeaders,
+	});
+	const registration = await authenticator.createRegistrationResponse({
+		challenge: options.options.challenge,
+		origin,
+		rpID,
+	});
+	await api(base, '/api/auth/webauthn/verify/register', {
+		method: 'POST',
+		token: passwordToken,
+		body: { ceremonyId: options.ceremonyId, name: 'Demo Key', response: registration },
+		headers: ceremonyHeaders,
+	});
+
+	const loginOptions = await api(base, '/api/auth/webauthn/login/options', {
+		method: 'POST',
+		body: {},
+		headers: ceremonyHeaders,
+	});
+	const assertion = await authenticator.createAuthenticationResponse({
+		challenge: loginOptions.options.challenge,
+		origin,
+		rpID,
+		userHandle: null,
+	});
+	const login = await api(base, '/api/auth/webauthn/verify/login', {
+		method: 'POST',
+		body: { ceremonyId: loginOptions.ceremonyId, response: assertion },
+		headers: ceremonyHeaders,
+	});
+	return login.token;
+}
+
+async function findOrCreateProject(base, token, userId) {
 	const listed = await api(base, '/api/projects', { token });
 	const projects = Array.isArray(listed) ? listed : (listed.projects ?? []);
 	const existing = projects.find((p) => p.name === PROJECT_NAME);
@@ -106,10 +159,14 @@ async function findOrCreateProject(base, token) {
 		const project = detail.project ?? detail;
 		if (project.publicKey) return project;
 	}
-	const created = await api(base, '/api/projects', {
+	// Project creation is admin-only: the demo user is the first user on a
+	// fresh local stack (admin), so create with a passkey session and the
+	// demo user as the assigned owner.
+	const adminToken = await getAdminPasskeySession(base, token);
+	const created = await api(base, '/api/admin/projects', {
 		method: 'POST',
-		token,
-		body: { name: PROJECT_NAME, platform: 'node' },
+		token: adminToken,
+		body: { name: PROJECT_NAME, platform: 'node', ownerId: userId },
 	});
 	return created.project;
 }
@@ -133,8 +190,8 @@ async function sendEvent(base, project, payload) {
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const layout = await localLayout(root, 'dev');
 const base = process.argv[2] ?? `http://${layout.host}:${layout.port}`;
-const token = await loginOrRegister(base);
-const project = await findOrCreateProject(base, token);
+const { token, userId } = await loginOrRegister(base);
+const project = await findOrCreateProject(base, token, userId);
 const ids = [];
 // Two identical exceptions demonstrate fingerprint grouping into one issue.
 ids.push(await sendEvent(base, project, cliException()));

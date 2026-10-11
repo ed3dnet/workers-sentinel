@@ -27,11 +27,15 @@ interface AuthResponse {
 	user: User;
 	token: string;
 	hasPasskey?: boolean;
+	authMethod?: 'password' | 'passkey';
+	mustChangePassword?: boolean;
 }
 
 interface MeResponse {
 	user: User;
+	session?: { authMethod?: 'password' | 'passkey' };
 	hasPasskey?: boolean;
+	mustChangePassword?: boolean;
 }
 
 interface PasskeyRegisterOptionsResponse {
@@ -57,13 +61,25 @@ export const useAuthStore = defineStore('auth', () => {
 	const hasPasskey = ref(false);
 	const dismissedForThisVisit = ref(false);
 
+	// How the CURRENT session was minted ('password' | 'passkey') and the
+	// forced-password-change flag. The admin surface requires a
+	// passkey-minted session — registering a passkey while in a password
+	// session does not unlock it; the admin must sign in with the passkey.
+	const sessionAuthMethod = ref<'password' | 'passkey' | null>(null);
+	const mustChangePassword = ref(false);
+
 	const isAuthenticated = computed(() => !!user.value && !!token.value);
 	const isAdmin = computed(() => user.value?.role === 'admin');
+	const canUseAdmin = computed(
+		() => user.value?.role === 'admin' && sessionAuthMethod.value === 'passkey',
+	);
 
 	function applyAuth(response: AuthResponse) {
 		user.value = response.user;
 		token.value = response.token;
 		hasPasskey.value = response.hasPasskey ?? false;
+		sessionAuthMethod.value = response.authMethod ?? 'password';
+		mustChangePassword.value = response.mustChangePassword ?? false;
 		dismissedForThisVisit.value = false;
 		localStorage.setItem('token', response.token);
 	}
@@ -78,6 +94,8 @@ export const useAuthStore = defineStore('auth', () => {
 			const response = await api.get<MeResponse>('/api/auth/me');
 			user.value = response.user;
 			hasPasskey.value = response.hasPasskey ?? false;
+			sessionAuthMethod.value = response.session?.authMethod ?? 'password';
+			mustChangePassword.value = response.mustChangePassword ?? false;
 			dismissedForThisVisit.value = false;
 		} catch {
 			// Token is invalid, clear it
@@ -194,6 +212,8 @@ export const useAuthStore = defineStore('auth', () => {
 		user.value = null;
 		token.value = null;
 		hasPasskey.value = false;
+		sessionAuthMethod.value = null;
+		mustChangePassword.value = false;
 		dismissedForThisVisit.value = false;
 		localStorage.removeItem('token');
 	}
@@ -206,7 +226,10 @@ export const useAuthStore = defineStore('auth', () => {
 		error,
 		isAuthenticated,
 		isAdmin,
+		canUseAdmin,
 		hasPasskey,
+		sessionAuthMethod,
+		mustChangePassword,
 		dismissedForThisVisit,
 		checkAuth,
 		register,

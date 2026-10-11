@@ -107,9 +107,16 @@ const wrangler = spawn(
 		'--persist-to',
 		path.join(workDir, 'persist'),
 		// Process env does not become Worker bindings under wrangler dev;
-		// --var is the local-dev mechanism.
+		// --var is the local-dev mechanism. WEBAUTHN_ORIGINS widens the
+		// trusted ceremony origins so the suite can drive real passkey
+		// ceremonies: workerd drops an Origin header that equals the socket
+		// origin (127.0.0.1:port), so the ceremonies use the localhost form
+		// instead (the repo's custom-domain route would otherwise make the
+		// worker expect the production origin).
 		'--var',
 		`SETUP_TOKEN:${SETUP_TOKEN}`,
+		'--var',
+		`WEBAUTHN_ORIGINS:http://localhost:${port}`,
 	],
 	{
 		cwd: ROOT,

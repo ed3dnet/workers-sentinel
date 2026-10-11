@@ -259,6 +259,13 @@ export async function start({ root, mode = 'dev', timeoutMs = 180000 }) {
 				'127.0.0.1',
 				'--port',
 				String(info.port),
+				// The repo's custom-domain route makes the worker perceive its
+				// own URL as the production host, and workerd drops an Origin
+				// header equal to the socket origin — so widen the trusted
+				// WebAuthn ceremony origins to the localhost form local
+				// tooling (demo seeding's passkey bootstrap) uses.
+				'--var',
+				`WEBAUTHN_ORIGINS:http://localhost:${info.port}`,
 			],
 			{ cwd: info.wranglerDir, env, stdio: 'inherit', detached: true },
 		);

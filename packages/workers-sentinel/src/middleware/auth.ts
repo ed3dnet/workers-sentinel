@@ -52,6 +52,19 @@ export const authMiddleware = createMiddleware<{
 	}
 
 	if (!response.ok) {
+		// Surface the forced-password-change token rejection verbatim (401
+		// password_change_required); every other failure stays the generic
+		// unauthorized response.
+		let detail: { error?: string; message?: string } | null = null;
+		try {
+			detail = (await response.json()) as { error?: string; message?: string };
+		} catch {
+			detail = null;
+		}
+		if (detail?.error === 'password_change_required') {
+			await c.req.raw.body?.cancel().catch(() => undefined);
+			return c.json({ error: 'password_change_required' }, 401);
+		}
 		const message = token.startsWith('wst_')
 			? 'Invalid or expired API token'
 			: 'Invalid or expired session';
@@ -59,6 +72,20 @@ export const authMiddleware = createMiddleware<{
 	}
 
 	const auth = (await response.json()) as AuthContext;
+
+	// Server-side forced-password-change enforcement: a temp-password
+	// session may only reach the recovery paths (/api/auth/me,
+	// change-password, logout, logout-all — all outside this middleware).
+	// Everything it guards — /api/projects/*, tokens, passkey register/
+	// manage, /api/admin/*, /api/0/* — is off-limits until the change lands.
+	// The body carries only the machine-checkable error code so every
+	// surface (native and the /api/0 {detail} translator) reports it
+	// uniformly.
+	if (auth.mustChangePassword) {
+		await c.req.raw.body?.cancel().catch(() => undefined);
+		return c.json({ error: 'password_change_required' }, 403);
+	}
+
 	c.set('auth', auth);
 
 	return next();

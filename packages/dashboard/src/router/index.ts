@@ -31,11 +31,6 @@ const router = createRouter({
 					component: () => import('../views/Projects.vue'),
 				},
 				{
-					path: 'projects/new',
-					name: 'project-create',
-					component: () => import('../views/ProjectCreate.vue'),
-				},
-				{
 					path: 'projects/:slug',
 					redirect: (to) => `/projects/${to.params.slug}/overview`,
 				},
@@ -89,6 +84,30 @@ const router = createRouter({
 					name: 'project-filters',
 					component: () => import('../views/ProjectFilters.vue'),
 				},
+				{
+					path: 'admin/users',
+					name: 'admin-users',
+					component: () => import('../views/admin/AdminUsers.vue'),
+					meta: { admin: true },
+				},
+				{
+					path: 'admin/projects',
+					name: 'admin-projects',
+					component: () => import('../views/admin/AdminProjects.vue'),
+					meta: { admin: true },
+				},
+				{
+					path: 'admin/settings',
+					name: 'admin-settings',
+					component: () => import('../views/admin/AdminSettings.vue'),
+					meta: { admin: true },
+				},
+				{
+					path: 'admin/audit',
+					name: 'admin-audit',
+					component: () => import('../views/admin/AdminAudit.vue'),
+					meta: { admin: true },
+				},
 			],
 		},
 	],
@@ -112,6 +131,12 @@ router.beforeEach(async (to, _from, next) => {
 	// Protected routes - redirect to login if not authenticated
 	if (to.meta.auth && !isAuthenticated) {
 		return next('/login');
+	}
+
+	// Admin routes require a passkey-signed-in admin session (the server
+	// enforces the same gate on /api/admin/*; this keeps the URL space clean)
+	if (to.meta.admin && !authStore.canUseAdmin) {
+		return next('/projects');
 	}
 
 	next();

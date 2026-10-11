@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import { purgeProjectState } from '../lib/project-purge';
 import { buildWebhookPayload } from '../lib/webhook';
 import type { AuthContext, Env } from '../types';
 
@@ -31,42 +32,9 @@ projectRoutes.get('/', async (c) => {
 	return c.json(data);
 });
 
-// Create a new project
-projectRoutes.post('/', async (c) => {
-	const auth = c.get('auth');
-	if (!auth) {
-		return c.json({ error: 'unauthorized' }, 401);
-	}
-
-	const body = await c.req.json<{ name: string; platform?: string }>();
-
-	if (!body.name) {
-		return c.json({ error: 'missing_fields', message: 'Name is required' }, 400);
-	}
-
-	const authStateId = c.env.AUTH_STATE.idFromName('global');
-	const authState = c.env.AUTH_STATE.get(authStateId);
-
-	const response = await authState.fetch(
-		new Request('http://internal/create-project', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				name: body.name,
-				platform: body.platform,
-				userId: auth.user.id,
-			}),
-		}),
-	);
-
-	const data = (await response.json()) as { project: { id: string; publicKey: string } };
-
-	// Generate DSN
-	const host = new URL(c.req.url).host;
-	const dsn = `https://${data.project.publicKey}@${host}/${data.project.id}`;
-
-	return c.json({ ...data, dsn }, response.status as ContentfulStatusCode);
-});
+// Project creation is admin-only: POST /api/admin/projects (with an
+// assigned owner). This router keeps the member-facing read/settings
+// surface and the owner-delete path.
 
 // Get a specific project by slug
 projectRoutes.get('/:slug', async (c) => {
@@ -443,25 +411,11 @@ projectRoutes.delete('/:slug', async (c) => {
 	}
 
 	// Purge the ProjectState Durable Object so events, source maps, comments
-	// and stats do not outlive the deleted project. The DO sweeps the R2
-	// attachment prefix first (saga; retries on its alarm if the sweep
-	// cannot finish) and only then wipes its own state. Under the test
-	// fault-injection binding, a `purge-sweep` fault header is forwarded so
-	// tests can exercise the sweep-retry path; inert in production.
-	const purgeFault =
-		c.env.ATTACHMENT_FAULT_INJECTION === 'enabled' &&
-		c.req.header('X-Sentinel-Test-Fault') === 'purge-sweep'
-			? { fault: 'purge-sweep' as const }
-			: {};
-	const projectStateId = c.env.PROJECT_STATE.idFromName(projectData.project.id);
-	const projectState = c.env.PROJECT_STATE.get(projectStateId);
-	await projectState.fetch(
-		new Request('http://internal/purge', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ projectId: projectData.project.id, ...purgeFault }),
-		}),
-	);
+	// and stats do not outlive the deleted project (shared saga with the
+	// admin delete route; see lib/project-purge.ts).
+	await purgeProjectState(c.env, projectData.project.id, {
+		faultHeader: c.req.header('X-Sentinel-Test-Fault'),
+	});
 
 	const data = await deleteResponse.json();
 	return c.json(data, deleteResponse.status as ContentfulStatusCode);

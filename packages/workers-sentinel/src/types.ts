@@ -44,6 +44,13 @@ export interface Session {
 	userId: string;
 	expiresAt: string;
 	createdAt: string;
+	/**
+	 * How the session was minted: 'password' (login/register) or 'passkey'
+	 * (WebAuthn login). Absent on the synthesized session API-token
+	 * validation returns (the admin gate rejects `wst_` tokens before the
+	 * field could matter).
+	 */
+	authMethod?: 'password' | 'passkey';
 }
 
 // Project types
@@ -335,4 +342,38 @@ export interface MergeIssuesResponse {
 export interface AuthContext {
 	user: User;
 	session: Session;
+	/**
+	 * True while the account owes a password change (admin-created or
+	 * admin-reset credentials). authMiddleware rejects protected routes with
+	 * 403 `password_change_required` while set; the recovery paths
+	 * (/api/auth/me, change-password, logout, logout-all) stay usable.
+	 */
+	mustChangePassword?: boolean;
+}
+
+/** Admin-facing user shape (counts via subqueries, newest-first lists). */
+export interface AdminUser {
+	id: string;
+	email: string;
+	name: string;
+	role: 'admin' | 'member';
+	disabled: boolean;
+	mustChangePassword: boolean;
+	lastLoginAt: string | null;
+	passkeyCount: number;
+	membershipCount: number;
+	createdAt: string;
+}
+
+/** One admin-audit row (keyset-paginated, newest first). */
+export interface AdminAuditEntry {
+	id: string;
+	actorEmail: string;
+	actorName: string;
+	action: string;
+	targetType: string;
+	targetId: string | null;
+	targetLabel: string | null;
+	details: Record<string, unknown> | null;
+	createdAt: string;
 }

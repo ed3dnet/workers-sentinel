@@ -179,6 +179,16 @@ watch(
 
 		<!-- Security -->
 		<div v-else class="space-y-6">
+			<!-- Admin tools unlock note (admins on password sessions) -->
+			<div
+				v-if="authStore.isAdmin && !authStore.canUseAdmin"
+				class="bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300 px-4 py-3 rounded-lg text-sm"
+				data-testid="admin-passkey-note"
+			>
+				Sign out and back in with your passkey to unlock admin tools. Admin actions require
+				a passkey-signed-in session.
+			</div>
+
 			<!-- Change password -->
 			<div class="card space-y-4" data-testid="settings-change-password">
 				<h2 class="text-lg font-semibold text-gray-900 dark:text-white">Change password</h2>

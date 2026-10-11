@@ -13,6 +13,8 @@ import {
 import { hashPassword, hashToken, verifyPassword } from '../lib/password';
 import { validateWebhookUrl } from '../lib/webhook';
 import type {
+	AdminAuditEntry,
+	AdminUser,
 	ApiToken,
 	Env,
 	Project,
@@ -118,6 +120,20 @@ CREATE TABLE IF NOT EXISTS webauthn_challenges (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_bucket ON webauthn_challenges(kind, user_id);
+
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id TEXT PRIMARY KEY,
+  actor_user_id TEXT NOT NULL,
+  actor_email TEXT NOT NULL,
+  actor_name TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT,
+  target_label TEXT,
+  details TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_recent ON admin_audit_log(created_at DESC, id DESC);
 `;
 
 /** WebAuthn challenge lifetime (5 minutes) and issuance caps. */
@@ -198,6 +214,26 @@ export class AuthState extends DurableObject<Env> {
 		// minted lazily on first passkey registration)
 		try {
 			this.sql.exec('ALTER TABLE users ADD COLUMN webauthn_user_id TEXT');
+		} catch {
+			// Column already exists
+		}
+		// Migration: sessions record how they were minted. Pre-migration
+		// sessions default to 'password' — admins must re-login via passkey
+		// after deploy to unlock the admin surface (fail closed by design).
+		try {
+			this.sql.exec("ALTER TABLE sessions ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'password'");
+		} catch {
+			// Column already exists
+		}
+		// Migration: forced password change on admin-created/reset credentials
+		try {
+			this.sql.exec('ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0');
+		} catch {
+			// Column already exists
+		}
+		// Migration: last successful sign-in timestamp (admin user list)
+		try {
+			this.sql.exec('ALTER TABLE users ADD COLUMN last_login_at TEXT');
 		} catch {
 			// Column already exists
 		}
@@ -290,14 +326,24 @@ export class AuthState extends DurableObject<Env> {
 					return this.handleLogoutAll(request);
 				case '/change-password':
 					return this.handleChangePassword(request);
-				case '/admin/set-user-disabled':
-					return this.handleAdminSetUserDisabled(request);
+				case '/admin/create-user':
+					return this.handleAdminCreateUser(request);
+				case '/admin/update-user':
+					return this.handleAdminUpdateUser(request);
+				case '/admin/reset-user-password':
+					return this.handleAdminResetUserPassword(request);
+				case '/admin/remove-user-passkeys':
+					return this.handleAdminRemoveUserPasskeys(request);
+				case '/admin/delete-user':
+					return this.handleAdminDeleteUser(request);
+				case '/admin/get-user':
+					return this.handleAdminGetUser(request);
+				case '/admin/list-audit':
+					return this.handleAdminListAudit(request);
 				case '/validate-session':
 					return this.handleValidateSession(request);
 				case '/me':
 					return this.handleGetMe(request);
-				case '/create-project':
-					return this.handleCreateProject(request);
 				case '/list-projects':
 					return this.handleListProjects(request);
 				case '/get-project':
@@ -320,12 +366,22 @@ export class AuthState extends DurableObject<Env> {
 					return this.handleValidateApiToken(request);
 				case '/list-project-members':
 					return this.handleListProjectMembers(request);
-				case '/add-project-member':
-					return this.handleAddProjectMember(request);
-				case '/remove-project-member':
-					return this.handleRemoveProjectMember(request);
-				case '/update-project-member':
-					return this.handleUpdateProjectMember(request);
+				case '/admin/list-all-projects':
+					return this.handleAdminListAllProjects(request);
+				case '/admin/create-project':
+					return this.handleAdminCreateProject(request);
+				case '/admin/rename-project':
+					return this.handleAdminRenameProject(request);
+				case '/admin/reassign-owner':
+					return this.handleAdminReassignOwner(request);
+				case '/admin/delete-project':
+					return this.handleAdminDeleteProject(request);
+				case '/admin/add-project-member':
+					return this.handleAdminAddProjectMember(request);
+				case '/admin/remove-project-member':
+					return this.handleAdminRemoveProjectMember(request);
+				case '/admin/update-project-member-role':
+					return this.handleAdminUpdateProjectMemberRole(request);
 				case '/list-users':
 					return this.handleListUsers(request);
 				case '/get-settings':
@@ -470,8 +526,10 @@ export class AuthState extends DurableObject<Env> {
 			now,
 		);
 
-		// Create session
-		const session = await this.createSession(userId);
+		// Create session (self-registration proves a chosen password, not a
+		// passkey — even the bootstrap admin must re-login via passkey to
+		// unlock admin tools)
+		const session = await this.createSession(userId, 'password');
 
 		const user: User = {
 			id: userId,
@@ -482,7 +540,12 @@ export class AuthState extends DurableObject<Env> {
 			updatedAt: now,
 		};
 
-		return this.jsonResponse({ user, token: session.id });
+		return this.jsonResponse({
+			user,
+			token: session.id,
+			authMethod: 'password',
+			mustChangePassword: false,
+		});
 	}
 
 	private async handleLogin(request: Request): Promise<Response> {
@@ -514,7 +577,7 @@ export class AuthState extends DurableObject<Env> {
 		// Find user
 		const userRows = this.sql
 			.exec(
-				'SELECT id, email, password_hash, name, role, disabled, created_at, updated_at FROM users WHERE email = ?',
+				'SELECT id, email, password_hash, name, role, disabled, must_change_password, created_at, updated_at FROM users WHERE email = ?',
 				normalizedEmail,
 			)
 			.toArray();
@@ -553,7 +616,7 @@ export class AuthState extends DurableObject<Env> {
 		this.throttleClear(throttleKey);
 
 		// Create session
-		const session = await this.createSession(userRow.id as string);
+		const session = await this.createSession(userRow.id as string, 'password');
 
 		const user: User = {
 			id: userRow.id as string,
@@ -564,11 +627,14 @@ export class AuthState extends DurableObject<Env> {
 			updatedAt: userRow.updated_at as string,
 		};
 
-		// Additive: lets the client know the passkey nag state immediately
+		// Additive: lets the client know the passkey nag state immediately,
+		// plus the forced-password-change and session-auth-method flags
 		return this.jsonResponse({
 			user,
 			token: session.id,
 			hasPasskey: this.hasPasskey(userRow.id as string),
+			authMethod: 'password',
+			mustChangePassword: (userRow.must_change_password as number) === 1,
 		});
 	}
 
@@ -622,7 +688,7 @@ export class AuthState extends DurableObject<Env> {
 			return this.jsonResponse({ error: 'invalid_credentials' }, 401);
 		}
 		this.sql.exec(
-			'UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?',
+			'UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?',
 			hashPassword(newPassword),
 			new Date().toISOString(),
 			userId,
@@ -632,39 +698,583 @@ export class AuthState extends DurableObject<Env> {
 		return this.jsonResponse({ success: true });
 	}
 
-	private async handleAdminSetUserDisabled(request: Request): Promise<Response> {
-		const { requestingUserRole, userId, disabled } = (await request.json()) as {
-			requestingUserRole?: string;
-			userId?: string;
-			disabled?: boolean;
-		};
+	// -------------------------------------------------------------------------
+	// Administration: user CRUD (admin role + audit)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Create a user on behalf of an admin. The credentials are temporary:
+	 * the account starts with `must_change_password = 1` and no session is
+	 * minted. Validations mirror self-registration.
+	 */
+	private async handleAdminCreateUser(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, name, email, password, role } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				name?: string;
+				email?: string;
+				password?: string;
+				role?: string;
+			};
+
 		if (requestingUserRole !== 'admin') {
 			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
 		}
-		if (!userId || typeof disabled !== 'boolean') {
+
+		const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+		const trimmedName = typeof name === 'string' ? name.trim() : '';
+		if (!normalizedEmail || typeof password !== 'string' || !password || !trimmedName) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'Email, password, and name are required' },
+				400,
+			);
+		}
+		if (normalizedEmail.length > 254 || !AuthState.EMAIL_PATTERN.test(normalizedEmail)) {
+			return this.jsonResponse({ error: 'invalid_email', message: 'Invalid email address' }, 400);
+		}
+		if (password.length < 8 || password.length > 1024) {
+			return this.jsonResponse(
+				{ error: 'invalid_password', message: 'Password must be between 8 and 1024 characters' },
+				400,
+			);
+		}
+		if (trimmedName.length > 100) {
+			return this.jsonResponse(
+				{ error: 'invalid_name', message: 'Name must be at most 100 characters' },
+				400,
+			);
+		}
+		const assignedRole = role ?? 'member';
+		if (assignedRole !== 'admin' && assignedRole !== 'member') {
+			return this.jsonResponse(
+				{ error: 'invalid_role', message: 'Role must be admin or member' },
+				400,
+			);
+		}
+
+		const existing = this.sql
+			.exec('SELECT id FROM users WHERE email = ?', normalizedEmail)
+			.toArray();
+		if (existing.length > 0) {
+			return this.jsonResponse(
+				{ error: 'user_exists', message: 'User with this email already exists' },
+				409,
+			);
+		}
+
+		// Hash before the transaction (argon2 costs ~250ms CPU)
+		const passwordHash = hashPassword(password);
+		const userId = crypto.randomUUID();
+		const now = new Date().toISOString();
+
+		const user = this.ctx.storage.transactionSync(() => {
+			this.sql.exec(
+				'INSERT INTO users (id, email, password_hash, name, role, must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
+				userId,
+				normalizedEmail,
+				passwordHash,
+				trimmedName,
+				assignedRole,
+				now,
+				now,
+			);
+			this.audit(requestingUserId, 'user.created', 'user', userId, normalizedEmail, {
+				role: assignedRole,
+			});
+			return this.adminUserById(userId);
+		});
+
+		return this.jsonResponse({ user }, 201);
+	}
+
+	/**
+	 * One atomic handler for every mutable user field (name, email, role,
+	 * disabled). All validations and guards run against the FINAL state
+	 * before any write; only changed fields are written and audited.
+	 */
+	private async handleAdminUpdateUser(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, userId, name, email, role, disabled } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				userId?: string;
+				name?: string;
+				email?: string;
+				role?: string;
+				disabled?: boolean;
+			};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!userId) {
 			return this.jsonResponse({ error: 'missing_fields' }, 400);
 		}
-		const rows = this.sql.exec('SELECT id, role FROM users WHERE id = ?', userId).toArray();
+
+		const hasName = name !== undefined;
+		const hasEmail = email !== undefined;
+		const hasRole = role !== undefined;
+		const hasDisabled = disabled !== undefined;
+		if (!hasName && !hasEmail && !hasRole && !hasDisabled) {
+			return this.jsonResponse(
+				{
+					error: 'missing_fields',
+					message: 'At least one of name, email, role, or disabled is required',
+				},
+				400,
+			);
+		}
+
+		const rows = this.sql
+			.exec('SELECT id, email, name, role, disabled FROM users WHERE id = ?', userId)
+			.toArray();
 		if (rows.length === 0) {
 			return this.jsonResponse({ error: 'not_found' }, 404);
 		}
-		if (rows[0].role === 'admin') {
+		const current = rows[0];
+
+		// Field validations — every guard runs before any write
+		let newName: string | null = null;
+		if (hasName) {
+			const trimmed = typeof name === 'string' ? name.trim() : '';
+			if (!trimmed || trimmed.length > 100) {
+				return this.jsonResponse(
+					{ error: 'invalid_name', message: 'Name must be 1 to 100 characters' },
+					400,
+				);
+			}
+			newName = trimmed;
+		}
+		let newEmail: string | null = null;
+		if (hasEmail) {
+			const normalized = typeof email === 'string' ? email.trim().toLowerCase() : '';
+			if (normalized.length > 254 || !AuthState.EMAIL_PATTERN.test(normalized)) {
+				return this.jsonResponse({ error: 'invalid_email', message: 'Invalid email address' }, 400);
+			}
+			const clash = this.sql
+				.exec('SELECT id FROM users WHERE email = ? AND id != ?', normalized, userId)
+				.toArray();
+			if (clash.length > 0) {
+				return this.jsonResponse(
+					{ error: 'email_in_use', message: 'Another user already uses that email' },
+					409,
+				);
+			}
+			newEmail = normalized;
+		}
+		let newRole: string | null = null;
+		if (hasRole) {
+			if (role !== 'admin' && role !== 'member') {
+				return this.jsonResponse(
+					{ error: 'invalid_role', message: 'Role must be admin or member' },
+					400,
+				);
+			}
+			newRole = role;
+		}
+		if (hasDisabled && typeof disabled !== 'boolean') {
 			return this.jsonResponse(
-				{ error: 'forbidden', message: 'Admins cannot be disabled by this endpoint' },
+				{ error: 'invalid_disabled', message: 'disabled must be a boolean' },
+				400,
+			);
+		}
+
+		// Final-state evaluation: every guard sees the state the request
+		// would produce, not just the supplied deltas.
+		const currentRole = current.role as string;
+		const finalRole = hasRole ? (newRole as string) : currentRole;
+		const finalDisabled = hasDisabled ? (disabled as boolean) : (current.disabled as number) === 1;
+
+		// An omitted role is not a demotion: a self rename/email-change/enable
+		// with role omitted keeps finalRole 'admin' and succeeds.
+		if (userId === requestingUserId && finalRole !== 'admin') {
+			return this.jsonResponse(
+				{ error: 'cannot_demote_self', message: 'Admins cannot demote themselves' },
 				403,
 			);
 		}
-		this.sql.exec(
-			'UPDATE users SET disabled = ?, updated_at = ? WHERE id = ?',
-			disabled ? 1 : 0,
-			new Date().toISOString(),
-			userId,
-		);
-		if (disabled) {
-			// Kill live sessions immediately
-			this.sql.exec('DELETE FROM sessions WHERE user_id = ?', userId);
+		if (currentRole === 'admin' && finalRole !== 'admin') {
+			const adminCount = this.sql
+				.exec("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'")
+				.one();
+			if ((adminCount?.count as number) <= 1) {
+				return this.jsonResponse(
+					{ error: 'last_admin', message: 'Cannot demote the last admin' },
+					403,
+				);
+			}
 		}
-		return this.jsonResponse({ success: true, userId, disabled });
+		if (finalRole === 'admin' && finalDisabled) {
+			return this.jsonResponse(
+				{
+					error: 'cannot_disable_admin',
+					message: 'A disabled admin cannot exist; enable the user or keep the member role',
+				},
+				400,
+			);
+		}
+
+		// Only changed fields are written (and audited); a no-op writes nothing
+		const nameChanged = hasName && newName !== (current.name as string);
+		const emailChanged = hasEmail && newEmail !== (current.email as string);
+		const roleChanged = hasRole && newRole !== currentRole;
+		const disabledChanged =
+			hasDisabled && (disabled as boolean) !== ((current.disabled as number) === 1);
+		if (!nameChanged && !emailChanged && !roleChanged && !disabledChanged) {
+			return this.jsonResponse({ user: this.adminUserById(userId) });
+		}
+
+		const now = new Date().toISOString();
+		const labelEmail = emailChanged ? (newEmail as string) : (current.email as string);
+		const user = this.ctx.storage.transactionSync(() => {
+			const sets: string[] = [];
+			const params: (string | number)[] = [];
+			if (nameChanged) {
+				sets.push('name = ?');
+				params.push(newName as string);
+			}
+			if (emailChanged) {
+				sets.push('email = ?');
+				params.push(newEmail as string);
+			}
+			if (roleChanged) {
+				sets.push('role = ?');
+				params.push(newRole as string);
+			}
+			if (disabledChanged) {
+				sets.push('disabled = ?');
+				params.push(disabled ? 1 : 0);
+			}
+			sets.push('updated_at = ?');
+			params.push(now);
+			params.push(userId);
+			this.sql.exec(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...params);
+
+			// Disabling kills live sessions immediately (existing semantics)
+			if (disabledChanged && disabled) {
+				this.sql.exec('DELETE FROM sessions WHERE user_id = ?', userId);
+			}
+
+			// One audit row per changed field
+			if (nameChanged) {
+				this.audit(requestingUserId, 'user.renamed', 'user', userId, labelEmail, {
+					from: current.name as string,
+					to: newName,
+				});
+			}
+			if (emailChanged) {
+				this.audit(requestingUserId, 'user.email_changed', 'user', userId, labelEmail, {
+					from: current.email as string,
+					to: newEmail,
+				});
+			}
+			if (roleChanged) {
+				this.audit(requestingUserId, 'user.role_changed', 'user', userId, labelEmail, {
+					from: currentRole,
+					to: newRole,
+				});
+			}
+			if (disabledChanged) {
+				this.audit(
+					requestingUserId,
+					disabled ? 'user.disabled' : 'user.enabled',
+					'user',
+					userId,
+					labelEmail,
+				);
+			}
+
+			return this.adminUserById(userId);
+		});
+
+		return this.jsonResponse({ user });
+	}
+
+	/**
+	 * Reset a user's password: new temporary credentials, forced change at
+	 * next sign-in, every existing session revoked. API tokens are kept,
+	 * mirroring self-service change-password semantics.
+	 */
+	private async handleAdminResetUserPassword(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, userId, newPassword } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				userId?: string;
+				newPassword?: string;
+			};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!userId || !newPassword) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		if (typeof newPassword !== 'string' || newPassword.length < 8 || newPassword.length > 1024) {
+			return this.jsonResponse(
+				{ error: 'invalid_password', message: 'Password must be between 8 and 1024 characters' },
+				400,
+			);
+		}
+
+		const rows = this.sql.exec('SELECT id FROM users WHERE id = ?', userId).toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+
+		const passwordHash = hashPassword(newPassword);
+		const user = this.ctx.storage.transactionSync(() => {
+			this.sql.exec(
+				'UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? WHERE id = ?',
+				passwordHash,
+				new Date().toISOString(),
+				userId,
+			);
+			// Sign out everywhere (tokens survive, paused by the flag)
+			this.sql.exec('DELETE FROM sessions WHERE user_id = ?', userId);
+			this.audit(requestingUserId, 'user.password_reset', 'user', userId);
+			return this.adminUserById(userId);
+		});
+
+		return this.jsonResponse({ user });
+	}
+
+	/** Remove every passkey for a user (falls back to password + the nag). */
+	private async handleAdminRemoveUserPasskeys(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, userId } = (await request.json()) as {
+			requestingUserId?: string;
+			requestingUserRole?: string;
+			userId?: string;
+		};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!userId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		const rows = this.sql.exec('SELECT id FROM users WHERE id = ?', userId).toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+
+		const removedCount = this.ctx.storage.transactionSync(() => {
+			const count = this.sql
+				.exec('SELECT COUNT(*) AS count FROM webauthn_credentials WHERE user_id = ?', userId)
+				.one();
+			const n = (count?.count as number) ?? 0;
+			this.sql.exec('DELETE FROM webauthn_credentials WHERE user_id = ?', userId);
+			if (n > 0) {
+				this.audit(requestingUserId, 'user.passkeys_removed', 'user', userId, undefined, {
+					count: n,
+				});
+			}
+			return n;
+		});
+
+		return this.jsonResponse({ removedCount });
+	}
+
+	/**
+	 * Delete a user. Blocked while the user owns projects (reassign or
+	 * delete those first); otherwise cascades sessions, API tokens,
+	 * passkeys, and project memberships.
+	 */
+	private async handleAdminDeleteUser(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, userId } = (await request.json()) as {
+			requestingUserId?: string;
+			requestingUserRole?: string;
+			userId?: string;
+		};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		// The acting admin is required: they become the creator of record
+		// for any project the deleted user created (projects.created_by is
+		// NOT NULL with no cascade), and audit attribution needs them.
+		if (!userId || !requestingUserId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		if (userId === requestingUserId) {
+			return this.jsonResponse(
+				{ error: 'cannot_delete_self', message: 'Admins cannot delete themselves' },
+				403,
+			);
+		}
+
+		const rows = this.sql
+			.exec('SELECT id, email, name, role FROM users WHERE id = ?', userId)
+			.toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+		const target = rows[0];
+
+		if (target.role === 'admin') {
+			const adminCount = this.sql
+				.exec("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'")
+				.one();
+			if ((adminCount?.count as number) <= 1) {
+				return this.jsonResponse(
+					{ error: 'last_admin', message: 'Cannot delete the last admin' },
+					403,
+				);
+			}
+		}
+
+		const ownedProjects = this.sql
+			.exec(
+				`SELECT p.id, p.name, p.slug FROM projects p
+				 JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ? AND pm.role = 'owner'`,
+				userId,
+			)
+			.toArray();
+		if (ownedProjects.length > 0) {
+			return this.jsonResponse(
+				{
+					error: 'owns_projects',
+					message: 'User owns projects; reassign or delete them first',
+					projects: ownedProjects.map((row) => ({
+						id: row.id as string,
+						name: row.name as string,
+						slug: row.slug as string,
+					})),
+				},
+				409,
+			);
+		}
+
+		this.ctx.storage.transactionSync(() => {
+			// projects.created_by has no ON DELETE CASCADE; the acting admin
+			// becomes the creator of record for anything the deleted user
+			// created (the audit log preserves the true history)
+			if (requestingUserId) {
+				this.sql.exec(
+					'UPDATE projects SET created_by = ? WHERE created_by = ?',
+					requestingUserId,
+					userId,
+				);
+			}
+			this.sql.exec('DELETE FROM sessions WHERE user_id = ?', userId);
+			this.sql.exec('DELETE FROM api_tokens WHERE user_id = ?', userId);
+			this.sql.exec('DELETE FROM webauthn_credentials WHERE user_id = ?', userId);
+			this.sql.exec('DELETE FROM project_members WHERE user_id = ?', userId);
+			this.sql.exec('DELETE FROM users WHERE id = ?', userId);
+			this.audit(requestingUserId, 'user.deleted', 'user', userId, target.email as string);
+		});
+
+		return this.jsonResponse({ success: true });
+	}
+
+	/** Richer per-user shape for the admin detail view. */
+	private async handleAdminGetUser(request: Request): Promise<Response> {
+		const { requestingUserRole, userId } = (await request.json()) as {
+			requestingUserRole?: string;
+			userId?: string;
+		};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!userId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+
+		const user = this.adminUserById(userId);
+		if (!user) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+
+		const membershipRows = this.sql
+			.exec(
+				`SELECT pm.project_id, pm.role, p.name, p.slug
+				 FROM project_members pm
+				 JOIN projects p ON p.id = pm.project_id
+				 WHERE pm.user_id = ?
+				 ORDER BY p.created_at DESC`,
+				userId,
+			)
+			.toArray();
+		const memberships = membershipRows.map((row) => ({
+			projectId: row.project_id as string,
+			name: row.name as string,
+			slug: row.slug as string,
+			role: row.role as string,
+		}));
+
+		return this.jsonResponse({ user, memberships });
+	}
+
+	/**
+	 * Keyset-paginated audit log, newest first. `limit` clamps to 1..100
+	 * (default 25; below-1/non-numeric falls back to the default); the
+	 * cursor is the composite `created_at|id`; a malformed cursor is
+	 * treated as absent (first page). `nextCursor` is omitted at the end.
+	 */
+	private async handleAdminListAudit(request: Request): Promise<Response> {
+		const { requestingUserRole, limit, cursor } = (await request.json()) as {
+			requestingUserRole?: string;
+			limit?: number;
+			cursor?: string;
+		};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+
+		let pageSize = 25;
+		if (typeof limit === 'number' && Number.isFinite(limit)) {
+			if (limit >= 1) pageSize = Math.min(100, Math.floor(limit));
+		}
+
+		const params: string[] = [];
+		let where = '';
+		if (typeof cursor === 'string' && cursor.includes('|')) {
+			const separator = cursor.indexOf('|');
+			const createdAt = cursor.slice(0, separator);
+			const id = cursor.slice(separator + 1);
+			if (createdAt && id) {
+				where = 'WHERE (created_at < ? OR (created_at = ? AND id < ?))';
+				params.push(createdAt, createdAt, id);
+			}
+		}
+
+		const rows = this.sql
+			.exec(
+				`SELECT id, actor_email, actor_name, action, target_type, target_id, target_label, details, created_at
+				 FROM admin_audit_log ${where}
+				 ORDER BY created_at DESC, id DESC
+				 LIMIT ?`,
+				...params,
+				pageSize + 1,
+			)
+			.toArray();
+
+		const hasMore = rows.length > pageSize;
+		const page = rows.slice(0, pageSize);
+		const entries: AdminAuditEntry[] = page.map((row) => ({
+			id: row.id as string,
+			actorEmail: row.actor_email as string,
+			actorName: row.actor_name as string,
+			action: row.action as string,
+			targetType: row.target_type as string,
+			targetId: (row.target_id as string) || null,
+			targetLabel: (row.target_label as string) || null,
+			details: row.details ? (JSON.parse(row.details as string) as Record<string, unknown>) : null,
+			createdAt: row.created_at as string,
+		}));
+
+		const response: { entries: AdminAuditEntry[]; nextCursor?: string; hasMore: boolean } = {
+			entries,
+			hasMore,
+		};
+		if (hasMore && page.length > 0) {
+			const last = page[page.length - 1];
+			response.nextCursor = `${last.created_at as string}|${last.id as string}`;
+		}
+		return this.jsonResponse(response);
 	}
 
 	private async handleValidateSession(request: Request): Promise<Response> {
@@ -680,8 +1290,8 @@ export class AuthState extends DurableObject<Env> {
 		// Get session with user
 		const rows = this.sql
 			.exec(
-				`SELECT s.id as session_id, s.expires_at, s.created_at as session_created,
-              u.id as user_id, u.email, u.name, u.role, u.created_at, u.updated_at
+				`SELECT s.id as session_id, s.expires_at, s.created_at as session_created, s.auth_method,
+              u.id as user_id, u.email, u.name, u.role, u.created_at, u.updated_at, u.must_change_password
        FROM sessions s
        JOIN users u ON s.user_id = u.id
        WHERE s.id = ? AND s.expires_at > ? AND u.disabled = 0`,
@@ -710,9 +1320,15 @@ export class AuthState extends DurableObject<Env> {
 			userId: row.user_id as string,
 			expiresAt: row.expires_at as string,
 			createdAt: row.session_created as string,
+			authMethod: row.auth_method as 'password' | 'passkey',
 		};
 
-		return this.jsonResponse({ user, session, hasPasskey: this.hasPasskey(row.user_id as string) });
+		return this.jsonResponse({
+			user,
+			session,
+			hasPasskey: this.hasPasskey(row.user_id as string),
+			mustChangePassword: (row.must_change_password as number) === 1,
+		});
 	}
 
 	private async handleGetMe(request: Request): Promise<Response> {
@@ -723,68 +1339,6 @@ export class AuthState extends DurableObject<Env> {
 				body: JSON.stringify({ token }),
 			}),
 		);
-	}
-
-	private async handleCreateProject(request: Request): Promise<Response> {
-		const { name, platform, userId } = (await request.json()) as {
-			name: string;
-			platform?: string;
-			userId: string;
-		};
-
-		if (!name || !userId) {
-			return this.jsonResponse(
-				{ error: 'missing_fields', message: 'Name and userId are required' },
-				400,
-			);
-		}
-
-		// Generate unique slug
-		const baseSlug = this.slugify(name);
-		let slug = baseSlug;
-		let counter = 1;
-		while (this.sql.exec('SELECT id FROM projects WHERE slug = ?', slug).toArray().length > 0) {
-			slug = `${baseSlug}-${counter}`;
-			counter++;
-		}
-
-		// Generate public key for DSN
-		const publicKey = this.generateKey(32);
-
-		const projectId = crypto.randomUUID();
-		const now = new Date().toISOString();
-
-		this.sql.exec(
-			'INSERT INTO projects (id, name, slug, platform, public_key, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
-			projectId,
-			name,
-			slug,
-			platform || 'javascript',
-			publicKey,
-			now,
-			userId,
-		);
-
-		// Add creator as owner
-		this.sql.exec(
-			'INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, ?, ?)',
-			projectId,
-			userId,
-			'owner',
-			now,
-		);
-
-		const project: Project = {
-			id: projectId,
-			name,
-			slug,
-			platform: platform || 'javascript',
-			publicKey,
-			createdAt: now,
-			createdBy: userId,
-		};
-
-		return this.jsonResponse({ project });
 	}
 
 	private async handleListProjects(request: Request): Promise<Response> {
@@ -909,7 +1463,10 @@ export class AuthState extends DurableObject<Env> {
 	}
 
 	private async handleDeleteProject(request: Request): Promise<Response> {
-		const { projectId, userId } = (await request.json()) as { projectId: string; userId: string };
+		const { projectId, userId } = (await request.json()) as {
+			projectId: string;
+			userId: string;
+		};
 
 		if (!projectId || !userId) {
 			return this.jsonResponse({ error: 'missing_fields' }, 400);
@@ -931,8 +1488,19 @@ export class AuthState extends DurableObject<Env> {
 			);
 		}
 
-		// Delete project (cascade deletes members)
-		this.sql.exec('DELETE FROM projects WHERE id = ?', projectId);
+		const projectRows = this.sql
+			.exec('SELECT name FROM projects WHERE id = ?', projectId)
+			.toArray();
+
+		// Delete project (members removed explicitly; the mutation and its
+		// audit row commit together)
+		this.ctx.storage.transactionSync(() => {
+			this.sql.exec('DELETE FROM project_members WHERE project_id = ?', projectId);
+			this.sql.exec('DELETE FROM projects WHERE id = ?', projectId);
+			if (projectRows.length > 0) {
+				this.audit(userId, 'project.deleted', 'project', projectId, projectRows[0].name as string);
+			}
+		});
 
 		return this.jsonResponse({ success: true });
 	}
@@ -1167,7 +1735,7 @@ export class AuthState extends DurableObject<Env> {
 		const rows = this.sql
 			.exec(
 				`SELECT t.id as token_id, t.user_id, t.expires_at,
-				u.id as uid, u.email, u.name, u.role, u.created_at, u.updated_at
+				u.id as uid, u.email, u.name, u.role, u.created_at, u.updated_at, u.must_change_password
 				FROM api_tokens t
 				JOIN users u ON t.user_id = u.id
 				WHERE t.token_hash = ? AND u.disabled = 0`,
@@ -1185,6 +1753,13 @@ export class AuthState extends DurableObject<Env> {
 		const expiresAt = row.expires_at as string | null;
 		if (expiresAt && new Date(expiresAt) < new Date()) {
 			return this.jsonResponse({ error: 'token_expired' }, 401);
+		}
+
+		// API tokens pause while the account owes a password change: the
+		// forced-change policy covers every credential the user holds. The
+		// token resumes (this check stops rejecting) once the change lands.
+		if ((row.must_change_password as number) === 1) {
+			return this.jsonResponse({ error: 'password_change_required' }, 401);
 		}
 
 		// Update last_used_at
@@ -1243,20 +1818,371 @@ export class AuthState extends DurableObject<Env> {
 		return this.jsonResponse({ members });
 	}
 
-	private async handleAddProjectMember(request: Request): Promise<Response> {
-		const { projectId, email, role } = (await request.json()) as {
-			projectId: string;
-			email: string;
-			role: string;
+	// -------------------------------------------------------------------------
+	// Administration: projects + centralized membership (admin role + audit)
+	// -------------------------------------------------------------------------
+
+	/** Every project with its owner and member count — no membership requirement. */
+	private async handleAdminListAllProjects(request: Request): Promise<Response> {
+		const { requestingUserRole } = (await request.json()) as { requestingUserRole?: string };
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+
+		const rows = this.sql
+			.exec(
+				`SELECT p.id, p.name, p.slug, p.platform, p.public_key, p.created_at, p.created_by,
+					ou.id AS owner_id, ou.email AS owner_email, ou.name AS owner_name,
+					(SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) AS member_count
+				 FROM projects p
+				 LEFT JOIN project_members om ON om.project_id = p.id AND om.role = 'owner'
+				 LEFT JOIN users ou ON ou.id = om.user_id
+				 ORDER BY p.created_at DESC`,
+			)
+			.toArray();
+
+		const projects = rows.map((row) => ({
+			id: row.id as string,
+			name: row.name as string,
+			slug: row.slug as string,
+			platform: row.platform as string,
+			publicKey: row.public_key as string,
+			createdAt: row.created_at as string,
+			owner: row.owner_id
+				? {
+						userId: row.owner_id as string,
+						email: row.owner_email as string,
+						name: row.owner_name as string,
+					}
+				: null,
+			memberCount: (row.member_count as number) ?? 0,
+		}));
+
+		return this.jsonResponse({ projects });
+	}
+
+	/**
+	 * Create a project with an assigned owner. The creating admin is NOT
+	 * auto-added as a member — membership is theirs to grant.
+	 */
+	private async handleAdminCreateProject(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, name, platform, ownerId } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				name?: string;
+				platform?: string;
+				ownerId?: string;
+			};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!name || !ownerId || typeof name !== 'string' || typeof ownerId !== 'string') {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'Name and ownerId are required' },
+				400,
+			);
+		}
+		if (name.length > 200) {
+			return this.jsonResponse(
+				{ error: 'invalid_name', message: 'Name must be at most 200 characters' },
+				400,
+			);
+		}
+		if (platform !== undefined && typeof platform !== 'string') {
+			return this.jsonResponse(
+				{ error: 'invalid_platform', message: 'Platform must be a string' },
+				400,
+			);
+		}
+
+		const ownerRows = this.sql
+			.exec('SELECT id, email, name FROM users WHERE id = ?', ownerId)
+			.toArray();
+		if (ownerRows.length === 0) {
+			return this.jsonResponse(
+				{ error: 'user_not_found', message: 'No user found with that id' },
+				404,
+			);
+		}
+		const owner = ownerRows[0];
+
+		// Generate unique slug (existing minting rules)
+		const baseSlug = this.slugify(name);
+		let slug = baseSlug;
+		let counter = 1;
+		while (this.sql.exec('SELECT id FROM projects WHERE slug = ?', slug).toArray().length > 0) {
+			slug = `${baseSlug}-${counter}`;
+			counter++;
+		}
+
+		const publicKey = this.generateKey(32);
+		const projectId = crypto.randomUUID();
+		const now = new Date().toISOString();
+
+		const project = this.ctx.storage.transactionSync(() => {
+			this.sql.exec(
+				'INSERT INTO projects (id, name, slug, platform, public_key, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+				projectId,
+				name,
+				slug,
+				platform || 'javascript',
+				publicKey,
+				now,
+				// The acting admin is the creator of record; ownership is the
+				// assigned owner's (membership below), and the audit row keeps
+				// the full attribution.
+				requestingUserId ?? ownerId,
+			);
+			this.sql.exec(
+				'INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, ?, ?)',
+				projectId,
+				ownerId,
+				'owner',
+				now,
+			);
+			this.audit(requestingUserId, 'project.created', 'project', projectId, name, {
+				slug,
+				ownerEmail: owner.email as string,
+			});
+			return {
+				id: projectId,
+				name,
+				slug,
+				platform: platform || 'javascript',
+				publicKey,
+				createdAt: now,
+				createdBy: requestingUserId ?? ownerId,
+			} satisfies Project;
+		});
+
+		return this.jsonResponse({ project }, 201);
+	}
+
+	/** Rename a project. The slug is immutable — display name only. */
+	private async handleAdminRenameProject(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId, name } = (await request.json()) as {
+			requestingUserId?: string;
+			requestingUserRole?: string;
+			projectId?: string;
+			name?: string;
 		};
 
-		if (!projectId || !email || !role) {
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!projectId || !name || typeof name !== 'string') {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'projectId and name are required' },
+				400,
+			);
+		}
+		if (name.length > 200) {
+			return this.jsonResponse(
+				{ error: 'invalid_name', message: 'Name must be at most 200 characters' },
+				400,
+			);
+		}
+
+		const rows = this.sql
+			.exec(
+				'SELECT id, name, slug, platform, public_key, created_at, created_by FROM projects WHERE id = ?',
+				projectId,
+			)
+			.toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
+		const current = rows[0];
+
+		if (name !== (current.name as string)) {
+			this.ctx.storage.transactionSync(() => {
+				this.sql.exec('UPDATE projects SET name = ? WHERE id = ?', name, projectId);
+				this.audit(requestingUserId, 'project.renamed', 'project', projectId, name, {
+					from: current.name as string,
+					to: name,
+					slug: current.slug as string,
+				});
+			});
+		}
+
+		return this.jsonResponse({
+			project: {
+				id: current.id as string,
+				name,
+				slug: current.slug as string,
+				platform: current.platform as string,
+				publicKey: current.public_key as string,
+				createdAt: current.created_at as string,
+				createdBy: current.created_by as string,
+			} satisfies Project,
+		});
+	}
+
+	/**
+	 * Reassign project ownership: the previous owner stays as project-admin,
+	 * the new owner is upserted to owner (auto-added when not a member).
+	 */
+	private async handleAdminReassignOwner(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId, newOwnerId } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				projectId?: string;
+				newOwnerId?: string;
+			};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!projectId || !newOwnerId) {
+			return this.jsonResponse(
+				{ error: 'missing_fields', message: 'projectId and newOwnerId are required' },
+				400,
+			);
+		}
+
+		const projectRows = this.sql
+			.exec('SELECT id, name, slug FROM projects WHERE id = ?', projectId)
+			.toArray();
+		if (projectRows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
+		const project = projectRows[0];
+
+		const newOwnerRows = this.sql
+			.exec('SELECT id, email, name FROM users WHERE id = ?', newOwnerId)
+			.toArray();
+		if (newOwnerRows.length === 0) {
+			return this.jsonResponse(
+				{ error: 'user_not_found', message: 'No user found with that id' },
+				404,
+			);
+		}
+		const newOwner = newOwnerRows[0];
+
+		const currentOwnerRows = this.sql
+			.exec(
+				`SELECT pm.user_id, u.email, u.name FROM project_members pm
+				 JOIN users u ON u.id = pm.user_id
+				 WHERE pm.project_id = ? AND pm.role = 'owner'`,
+				projectId,
+			)
+			.toArray();
+		const currentOwner = currentOwnerRows.length > 0 ? currentOwnerRows[0] : null;
+
+		if (currentOwner && (currentOwner.user_id as string) === newOwnerId) {
+			return this.jsonResponse(
+				{ error: 'already_owner', message: 'That user already owns this project' },
+				400,
+			);
+		}
+
+		const now = new Date().toISOString();
+		this.ctx.storage.transactionSync(() => {
+			if (currentOwner) {
+				this.sql.exec(
+					"UPDATE project_members SET role = 'admin' WHERE project_id = ? AND user_id = ?",
+					projectId,
+					currentOwner.user_id as string,
+				);
+			}
+			this.sql.exec(
+				`INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)
+				 ON CONFLICT(project_id, user_id) DO UPDATE SET role = 'owner'`,
+				projectId,
+				newOwnerId,
+				now,
+			);
+			this.audit(
+				requestingUserId,
+				'project.owner_changed',
+				'project',
+				projectId,
+				project.name as string,
+				{
+					from: currentOwner ? (currentOwner.email as string) : null,
+					to: newOwner.email as string,
+				},
+			);
+		});
+
+		return this.jsonResponse({
+			project: {
+				id: project.id as string,
+				name: project.name as string,
+				slug: project.slug as string,
+			},
+			owner: {
+				userId: newOwner.id as string,
+				email: newOwner.email as string,
+				name: newOwner.name as string,
+			},
+			previousOwner: currentOwner
+				? {
+						userId: currentOwner.user_id as string,
+						email: currentOwner.email as string,
+						name: currentOwner.name as string,
+					}
+				: null,
+		});
+	}
+
+	/**
+	 * Delete a project's registry rows. The route layer then runs the same
+	 * ProjectState purge saga as the owner-delete path (R2 sweep first,
+	 * alarm retry, 503 ingest rejection while pending).
+	 */
+	private async handleAdminDeleteProject(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId } = (await request.json()) as {
+			requestingUserId?: string;
+			requestingUserRole?: string;
+			projectId?: string;
+		};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!projectId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+
+		const rows = this.sql.exec('SELECT id, name FROM projects WHERE id = ?', projectId).toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
+		const project = rows[0];
+
+		this.ctx.storage.transactionSync(() => {
+			this.sql.exec('DELETE FROM project_members WHERE project_id = ?', projectId);
+			this.sql.exec('DELETE FROM projects WHERE id = ?', projectId);
+			this.audit(requestingUserId, 'project.deleted', 'project', projectId, project.name as string);
+		});
+
+		return this.jsonResponse({ success: true });
+	}
+
+	/** Add a member (admin|member) to any project — owner assignment goes through reassign. */
+	private async handleAdminAddProjectMember(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId, email, role } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				projectId?: string;
+				email?: string;
+				role?: string;
+			};
+
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
+		if (!projectId || typeof email !== 'string' || !email.trim() || !role) {
 			return this.jsonResponse(
 				{ error: 'missing_fields', message: 'projectId, email, and role are required' },
 				400,
 			);
 		}
-
 		if (role !== 'admin' && role !== 'member') {
 			return this.jsonResponse(
 				{ error: 'invalid_role', message: 'Role must be admin or member' },
@@ -1264,26 +2190,28 @@ export class AuthState extends DurableObject<Env> {
 			);
 		}
 
-		// Look up user by email
-		const userRows = this.sql
-			.exec('SELECT id, email, name FROM users WHERE email = ?', email.toLowerCase())
+		const projectRows = this.sql
+			.exec('SELECT id, slug FROM projects WHERE id = ?', projectId)
 			.toArray();
+		if (projectRows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
 
+		const userRows = this.sql
+			.exec('SELECT id, email, name FROM users WHERE email = ?', email.trim().toLowerCase())
+			.toArray();
 		if (userRows.length === 0) {
 			return this.jsonResponse(
 				{ error: 'user_not_found', message: 'No user found with that email' },
 				404,
 			);
 		}
-
 		const user = userRows[0];
 		const userId = user.id as string;
 
-		// Check if already a member
 		const existing = this.sql
 			.exec('SELECT 1 FROM project_members WHERE project_id = ? AND user_id = ?', projectId, userId)
 			.toArray();
-
 		if (existing.length > 0) {
 			return this.jsonResponse(
 				{ error: 'already_member', message: 'User is already a member of this project' },
@@ -1292,78 +2220,113 @@ export class AuthState extends DurableObject<Env> {
 		}
 
 		const now = new Date().toISOString();
-		this.sql.exec(
-			'INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, ?, ?)',
-			projectId,
-			userId,
-			role,
-			now,
-		);
+		const member = this.ctx.storage.transactionSync(() => {
+			this.sql.exec(
+				'INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, ?, ?)',
+				projectId,
+				userId,
+				role,
+				now,
+			);
+			this.audit(requestingUserId, 'member.added', 'member', userId, user.email as string, {
+				project: projectRows[0].slug as string,
+				role,
+			});
+			return {
+				userId,
+				email: user.email as string,
+				name: user.name as string,
+				role: role as 'admin' | 'member',
+				createdAt: now,
+			} satisfies ProjectMember;
+		});
 
-		const member: ProjectMember = {
-			userId,
-			email: user.email as string,
-			name: user.name as string,
-			role: role as 'admin' | 'member',
-			createdAt: now,
-		};
-
-		return this.jsonResponse({ member });
+		return this.jsonResponse({ member }, 201);
 	}
 
-	private async handleRemoveProjectMember(request: Request): Promise<Response> {
-		const { projectId, userId } = (await request.json()) as {
-			projectId: string;
-			userId: string;
+	/** Remove a member from any project; the owner must be reassigned, not removed. */
+	private async handleAdminRemoveProjectMember(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId, userId } = (await request.json()) as {
+			requestingUserId?: string;
+			requestingUserRole?: string;
+			projectId?: string;
+			userId?: string;
 		};
 
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
 		if (!projectId || !userId) {
 			return this.jsonResponse({ error: 'missing_fields' }, 400);
 		}
 
-		// Check that the user being removed is NOT the owner
+		const projectRows = this.sql
+			.exec('SELECT id, slug FROM projects WHERE id = ?', projectId)
+			.toArray();
+		if (projectRows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
+
 		const memberRows = this.sql
 			.exec(
-				'SELECT role FROM project_members WHERE project_id = ? AND user_id = ?',
+				`SELECT pm.role, u.email FROM project_members pm
+				 JOIN users u ON u.id = pm.user_id
+				 WHERE pm.project_id = ? AND pm.user_id = ?`,
 				projectId,
 				userId,
 			)
 			.toArray();
-
 		if (memberRows.length === 0) {
 			return this.jsonResponse(
 				{ error: 'not_found', message: 'User is not a member of this project' },
 				404,
 			);
 		}
-
 		if (memberRows[0].role === 'owner') {
 			return this.jsonResponse(
-				{ error: 'cannot_remove_owner', message: 'Cannot remove the project owner' },
+				{ error: 'cannot_remove_owner', message: 'Reassign ownership before removing the owner' },
 				400,
 			);
 		}
 
-		this.sql.exec(
-			'DELETE FROM project_members WHERE project_id = ? AND user_id = ?',
-			projectId,
-			userId,
-		);
+		this.ctx.storage.transactionSync(() => {
+			this.sql.exec(
+				'DELETE FROM project_members WHERE project_id = ? AND user_id = ?',
+				projectId,
+				userId,
+			);
+			this.audit(
+				requestingUserId,
+				'member.removed',
+				'member',
+				userId,
+				memberRows[0].email as string,
+				{
+					project: projectRows[0].slug as string,
+				},
+			);
+		});
 
 		return this.jsonResponse({ success: true });
 	}
 
-	private async handleUpdateProjectMember(request: Request): Promise<Response> {
-		const { projectId, userId, role } = (await request.json()) as {
-			projectId: string;
-			userId: string;
-			role: string;
-		};
+	/** Change a member's role (admin|member); the owner's role is fixed. */
+	private async handleAdminUpdateProjectMemberRole(request: Request): Promise<Response> {
+		const { requestingUserId, requestingUserRole, projectId, userId, role } =
+			(await request.json()) as {
+				requestingUserId?: string;
+				requestingUserRole?: string;
+				projectId?: string;
+				userId?: string;
+				role?: string;
+			};
 
+		if (requestingUserRole !== 'admin') {
+			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
+		}
 		if (!projectId || !userId || !role) {
 			return this.jsonResponse({ error: 'missing_fields' }, 400);
 		}
-
 		if (role !== 'admin' && role !== 'member') {
 			return this.jsonResponse(
 				{ error: 'invalid_role', message: 'Role must be admin or member' },
@@ -1371,22 +2334,28 @@ export class AuthState extends DurableObject<Env> {
 			);
 		}
 
-		// Check that target user is not the owner
+		const projectRows = this.sql
+			.exec('SELECT id, slug FROM projects WHERE id = ?', projectId)
+			.toArray();
+		if (projectRows.length === 0) {
+			return this.jsonResponse({ error: 'project_not_found' }, 404);
+		}
+
 		const memberRows = this.sql
 			.exec(
-				'SELECT role FROM project_members WHERE project_id = ? AND user_id = ?',
+				`SELECT pm.role, u.email FROM project_members pm
+				 JOIN users u ON u.id = pm.user_id
+				 WHERE pm.project_id = ? AND pm.user_id = ?`,
 				projectId,
 				userId,
 			)
 			.toArray();
-
 		if (memberRows.length === 0) {
 			return this.jsonResponse(
 				{ error: 'not_found', message: 'User is not a member of this project' },
 				404,
 			);
 		}
-
 		if (memberRows[0].role === 'owner') {
 			return this.jsonResponse(
 				{ error: 'cannot_modify_owner', message: 'Cannot change the owner role' },
@@ -1394,25 +2363,40 @@ export class AuthState extends DurableObject<Env> {
 			);
 		}
 
-		this.sql.exec(
-			'UPDATE project_members SET role = ? WHERE project_id = ? AND user_id = ?',
-			role,
-			projectId,
-			userId,
-		);
+		const previousRole = memberRows[0].role as string;
+		if (role !== previousRole) {
+			this.ctx.storage.transactionSync(() => {
+				this.sql.exec(
+					'UPDATE project_members SET role = ? WHERE project_id = ? AND user_id = ?',
+					role,
+					projectId,
+					userId,
+				);
+				this.audit(
+					requestingUserId,
+					'member.role_changed',
+					'member',
+					userId,
+					memberRows[0].email as string,
+					{
+						project: projectRows[0].slug as string,
+						from: previousRole,
+						to: role,
+					},
+				);
+			});
+		}
 
-		// Fetch updated member with user info
 		const rows = this.sql
 			.exec(
 				`SELECT pm.user_id, pm.role, pm.created_at, u.email, u.name
-				FROM project_members pm
-				JOIN users u ON pm.user_id = u.id
-				WHERE pm.project_id = ? AND pm.user_id = ?`,
+				 FROM project_members pm
+				 JOIN users u ON pm.user_id = u.id
+				 WHERE pm.project_id = ? AND pm.user_id = ?`,
 				projectId,
 				userId,
 			)
 			.toArray();
-
 		const row = rows[0];
 		const member: ProjectMember = {
 			userId: row.user_id as string,
@@ -1431,15 +2415,37 @@ export class AuthState extends DurableObject<Env> {
 	}
 
 	private async handleSetSettings(request: Request): Promise<Response> {
-		const { requestingUserRole, registrationOpen } = (await request.json()) as {
+		const { requestingUserId, requestingUserRole, registrationOpen } = (await request.json()) as {
+			requestingUserId?: string;
 			requestingUserRole?: string;
 			registrationOpen?: boolean;
 		};
 		if (requestingUserRole !== 'admin') {
 			return this.jsonResponse({ error: 'forbidden', message: 'Admin role required' }, 403);
 		}
+		if (registrationOpen !== undefined && typeof registrationOpen !== 'boolean') {
+			return this.jsonResponse(
+				{ error: 'invalid_fields', message: 'registrationOpen must be a boolean' },
+				400,
+			);
+		}
 		if (typeof registrationOpen === 'boolean') {
-			this.setSetting('registration_open', registrationOpen ? 'true' : 'false');
+			const current = this.getSetting('registration_open');
+			const next = registrationOpen ? 'true' : 'false';
+			// Only the actual change is written (and audited)
+			if (current !== next) {
+				this.ctx.storage.transactionSync(() => {
+					this.setSetting('registration_open', next);
+					this.audit(
+						requestingUserId,
+						'settings.registration_changed',
+						'settings',
+						'registration_open',
+						undefined,
+						{ registrationOpen },
+					);
+				});
+			}
 		}
 		const open = this.getSetting('registration_open') !== 'false';
 		return this.jsonResponse({ settings: { registrationOpen: open } });
@@ -1705,7 +2711,7 @@ export class AuthState extends DurableObject<Env> {
 
 		const userRows = this.sql
 			.exec(
-				'SELECT id, email, name, role, disabled, created_at, updated_at FROM users WHERE id = ?',
+				'SELECT id, email, name, role, disabled, must_change_password, created_at, updated_at FROM users WHERE id = ?',
 				credentialRow.user_id,
 			)
 			.toArray();
@@ -1744,8 +2750,9 @@ export class AuthState extends DurableObject<Env> {
 			credentialRow.id as string,
 		);
 
-		// Mint a session via the same path as password login (same 20-session cap)
-		const session = await this.createSession(userRows[0].id as string);
+		// Mint a session via the same path as password login (same 20-session
+		// cap) — stamped 'passkey' so the admin gate can trust it
+		const session = await this.createSession(userRows[0].id as string, 'passkey');
 
 		const user: User = {
 			id: userRows[0].id as string,
@@ -1756,7 +2763,13 @@ export class AuthState extends DurableObject<Env> {
 			updatedAt: userRows[0].updated_at as string,
 		};
 
-		return this.jsonResponse({ user, token: session.id, hasPasskey: true });
+		return this.jsonResponse({
+			user,
+			token: session.id,
+			hasPasskey: true,
+			authMethod: 'passkey',
+			mustChangePassword: (userRows[0].must_change_password as number) === 1,
+		});
 	}
 
 	private async handleWebauthnListCredentials(request: Request): Promise<Response> {
@@ -1842,21 +2855,83 @@ export class AuthState extends DurableObject<Env> {
 		}
 
 		const rows = this.sql
-			.exec('SELECT id, email, name, role, created_at FROM users ORDER BY created_at ASC')
+			.exec(`${AuthState.ADMIN_USER_SELECT} ORDER BY u.created_at DESC`)
 			.toArray();
-
-		const users = rows.map((row) => ({
-			id: row.id as string,
-			email: row.email as string,
-			name: row.name as string,
-			role: row.role as string,
-			createdAt: row.created_at as string,
-		}));
+		const users: AdminUser[] = rows.map((row) => this.mapAdminUser(row));
 
 		return this.jsonResponse({ users });
 	}
 
-	private async createSession(userId: string): Promise<Session> {
+	/** Shared SELECT for the admin user shape (counts via subqueries). */
+	private static readonly ADMIN_USER_SELECT =
+		`SELECT u.id, u.email, u.name, u.role, u.disabled, u.must_change_password, u.last_login_at, u.created_at,
+		(SELECT COUNT(*) FROM webauthn_credentials wc WHERE wc.user_id = u.id) AS passkey_count,
+		(SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = u.id) AS membership_count
+		FROM users u`;
+
+	private adminUserById(userId: string): AdminUser | null {
+		const rows = this.sql.exec(`${AuthState.ADMIN_USER_SELECT} WHERE u.id = ?`, userId).toArray();
+		return rows.length > 0 ? this.mapAdminUser(rows[0]) : null;
+	}
+
+	private mapAdminUser(row: Record<string, unknown>): AdminUser {
+		return {
+			id: row.id as string,
+			email: row.email as string,
+			name: row.name as string,
+			role: row.role as 'admin' | 'member',
+			disabled: (row.disabled as number) === 1,
+			mustChangePassword: (row.must_change_password as number) === 1,
+			lastLoginAt: (row.last_login_at as string) || null,
+			passkeyCount: (row.passkey_count as number) ?? 0,
+			membershipCount: (row.membership_count as number) ?? 0,
+			createdAt: row.created_at as string,
+		};
+	}
+
+	/**
+	 * Append one audit row. Callers run this inside the same
+	 * `transactionSync` boundary as the mutation it describes, so an
+	 * audit-write failure rolls the mutation back with it.
+	 */
+	private audit(
+		actorUserId: string | null | undefined,
+		action: string,
+		targetType: string,
+		targetId?: string | null,
+		targetLabel?: string | null,
+		details?: unknown,
+	): void {
+		let actorEmail = 'unknown';
+		let actorName = 'unknown';
+		if (actorUserId) {
+			const actor = this.sql.exec('SELECT email, name FROM users WHERE id = ?', actorUserId).one();
+			if (actor) {
+				actorEmail = actor.email as string;
+				actorName = actor.name as string;
+			}
+		}
+		this.sql.exec(
+			`INSERT INTO admin_audit_log
+			 (id, actor_user_id, actor_email, actor_name, action, target_type, target_id, target_label, details, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			crypto.randomUUID(),
+			actorUserId ?? 'unknown',
+			actorEmail,
+			actorName,
+			action,
+			targetType,
+			targetId ?? null,
+			targetLabel ?? null,
+			details === undefined ? null : JSON.stringify(details),
+			new Date().toISOString(),
+		);
+	}
+
+	private async createSession(
+		userId: string,
+		authMethod: 'password' | 'passkey' = 'password',
+	): Promise<Session> {
 		const sessionToken = this.generateKey(64);
 		const now = new Date();
 		const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
@@ -1864,12 +2939,16 @@ export class AuthState extends DurableObject<Env> {
 		// Store only the hash of the session token; the raw token is returned
 		// to the client exactly once and never persisted
 		this.sql.exec(
-			'INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)',
+			'INSERT INTO sessions (id, user_id, expires_at, created_at, auth_method) VALUES (?, ?, ?, ?, ?)',
 			hashToken(sessionToken),
 			userId,
 			expiresAt.toISOString(),
 			now.toISOString(),
+			authMethod,
 		);
+
+		// Track the most recent successful sign-in (shown in the admin user list)
+		this.sql.exec('UPDATE users SET last_login_at = ? WHERE id = ?', now.toISOString(), userId);
 
 		// Prune: keep at most 20 concurrent sessions per user (oldest dropped)
 		this.sql.exec(
@@ -1883,6 +2962,7 @@ export class AuthState extends DurableObject<Env> {
 			userId,
 			expiresAt: expiresAt.toISOString(),
 			createdAt: now.toISOString(),
+			authMethod,
 		};
 	}
 

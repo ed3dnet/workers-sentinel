@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, watch } from 'vue';
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router';
+import ForcePasswordChange from '../components/ForcePasswordChange.vue';
 import PasskeyNag from '../components/PasskeyNag.vue';
 import { useAuthStore } from '../stores/auth';
 import { useProjectsStore } from '../stores/projects';
@@ -34,6 +35,11 @@ watch(
 
 <template>
 	<div class="flex h-screen">
+		<!-- Blocking forced-password-change screen: replaces all app content
+		     until the temp password is replaced (the server enforces the same
+		     policy on every authenticated route) -->
+		<ForcePasswordChange v-if="authStore.mustChangePassword" />
+		<template v-else>
 		<!-- Persistent passkey adoption prompt (per-visit dismissal, in-memory only) -->
 		<PasskeyNag />
 
@@ -51,14 +57,9 @@ watch(
 
 			<!-- Projects -->
 			<nav class="flex-1 overflow-y-auto p-4">
-				<div class="flex items-center justify-between mb-4">
-					<h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Projects</h2>
-					<RouterLink to="/projects/new" class="text-gray-400 hover:text-white">
-						<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-						</svg>
-					</RouterLink>
-				</div>
+				<h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">
+					Projects
+				</h2>
 
 				<div v-if="projectsStore.loading" class="text-gray-400 text-sm">Loading...</div>
 
@@ -78,13 +79,76 @@ watch(
 					</li>
 				</ul>
 
-				<RouterLink
+				<div
 					v-if="!projectsStore.loading && projectsStore.projects.length === 0"
-					to="/projects/new"
-					class="block text-center py-8 text-gray-400 hover:text-white"
+					class="text-gray-400 text-sm text-center py-8"
 				>
-					Create your first project
-				</RouterLink>
+					No projects yet. An administrator can create one for you.
+				</div>
+
+				<!-- Administration (passkey-signed-in admins only; project
+				     creation and membership live here) -->
+				<div v-if="authStore.canUseAdmin" class="mt-6" data-testid="admin-nav">
+					<h2
+						class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2"
+					>
+						Administration
+					</h2>
+					<ul class="space-y-1">
+						<li>
+							<RouterLink
+								to="/admin/users"
+								class="flex items-center px-3 py-2 rounded-lg text-sm"
+								:class="
+									route.name === 'admin-users'
+										? 'bg-gray-800 text-white'
+										: 'text-gray-300 hover:bg-gray-800 hover:text-white'
+								"
+							>
+								Users
+							</RouterLink>
+						</li>
+						<li>
+							<RouterLink
+								to="/admin/projects"
+								class="flex items-center px-3 py-2 rounded-lg text-sm"
+								:class="
+									route.name === 'admin-projects'
+										? 'bg-gray-800 text-white'
+										: 'text-gray-300 hover:bg-gray-800 hover:text-white'
+								"
+							>
+								Projects
+							</RouterLink>
+						</li>
+						<li>
+							<RouterLink
+								to="/admin/settings"
+								class="flex items-center px-3 py-2 rounded-lg text-sm"
+								:class="
+									route.name === 'admin-settings'
+										? 'bg-gray-800 text-white'
+										: 'text-gray-300 hover:bg-gray-800 hover:text-white'
+								"
+							>
+								Settings
+							</RouterLink>
+						</li>
+						<li>
+							<RouterLink
+								to="/admin/audit"
+								class="flex items-center px-3 py-2 rounded-lg text-sm"
+								:class="
+									route.name === 'admin-audit'
+										? 'bg-gray-800 text-white'
+										: 'text-gray-300 hover:bg-gray-800 hover:text-white'
+								"
+							>
+								Audit
+							</RouterLink>
+						</li>
+					</ul>
+				</div>
 			</nav>
 
 			<!-- User -->
@@ -201,5 +265,6 @@ watch(
 				<RouterView />
 			</div>
 		</main>
+		</template>
 	</div>
 </template>

@@ -10,7 +10,13 @@ export interface SeededAuth {
 
 /** Fresh pinia + auth store seeded as an authenticated session. */
 export function seedAuth(
-	options: { hasPasskey?: boolean; authenticated?: boolean } = {},
+	options: {
+		hasPasskey?: boolean;
+		authenticated?: boolean;
+		role?: 'admin' | 'member';
+		sessionAuthMethod?: 'password' | 'passkey' | null;
+		mustChangePassword?: boolean;
+	} = {},
 ): SeededAuth {
 	const pinia = createPinia();
 	setActivePinia(pinia);
@@ -20,7 +26,7 @@ export function seedAuth(
 			id: 'user-1',
 			email: 'dev@example.com',
 			name: 'Dev User',
-			role: 'member',
+			role: options.role ?? 'member',
 			createdAt: '2026-01-01T00:00:00Z',
 			updatedAt: '2026-01-01T00:00:00Z',
 		};
@@ -29,6 +35,8 @@ export function seedAuth(
 		localStorage.setItem('token', 'session-token');
 	}
 	store.hasPasskey = options.hasPasskey ?? false;
+	store.sessionAuthMethod = options.sessionAuthMethod ?? 'password';
+	store.mustChangePassword = options.mustChangePassword ?? false;
 	return { store, pinia };
 }
 
@@ -40,6 +48,14 @@ export function testRouter(): Router {
 			{ path: '/login', component: { template: '<div>login</div>' } },
 			{ path: '/settings', component: { template: '<div>settings</div>' } },
 			{ path: '/projects', component: { template: '<div>projects</div>' } },
+			{ path: '/admin/users', component: { template: '<div>admin users</div>' } },
+			{ path: '/admin/projects', component: { template: '<div>admin projects</div>' } },
+			{ path: '/admin/settings', component: { template: '<div>admin settings</div>' } },
+			{ path: '/admin/audit', component: { template: '<div>admin audit</div>' } },
+			{
+				path: '/projects/:slug/settings',
+				component: { template: '<div>project settings</div>' },
+			},
 			{ path: '/', component: { template: '<div>home</div>' } },
 		],
 	});

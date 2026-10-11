@@ -1,5 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { authFetch, createTestProject, createTestUser, type TestProject } from './utils';
+import {
+	adminFetch,
+	authFetch,
+	createTestProject,
+	createTestUser,
+	type TestProject,
+} from './utils';
+
+const BASE = 'http://localhost';
 
 describe('security config role gating', () => {
 	let owner: Awaited<ReturnType<typeof createTestUser>>;
@@ -22,15 +30,11 @@ describe('security config role gating', () => {
 			platform: 'javascript',
 		});
 
-		// Add the second user as a plain member
-		const add = await authFetch(
-			owner.token!,
-			`http://localhost/api/projects/${project.slug}/members`,
-			{
-				method: 'POST',
-				body: JSON.stringify({ email: member.email, role: 'member' }),
-			},
-		);
+		// Add the second user as a plain member (membership is admin-managed)
+		const add = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+			method: 'POST',
+			body: JSON.stringify({ email: member.email, role: 'member' }),
+		});
 		expect(add.status).toBeLessThan(300);
 	});
 

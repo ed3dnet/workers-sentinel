@@ -99,8 +99,9 @@ Workers Sentinel gives you a private, self-hosted error tracking solution with a
 - **⏰ Issue Snooze**: Temporarily hide issues for a configurable duration (1h, 1d, 3d, 1w) with automatic un-snooze via Durable Object alarms
 - **🌍 Environment Filtering**: View errors from specific environments (production, staging, development) separately
 - **💬 Comments & Activity Timeline**: Post comments on issues and view a unified activity feed of comments and status changes
-- **🌐 Multi-Project**: Create multiple projects with isolated data storage
-- **👥 Team Management**: Add members to projects with role-based access control (owner/admin/member)
+- **🌐 Multi-Project**: Multiple projects with isolated data storage
+- **🛠️ Administration**: A passkey-gated admin area (Users, Projects, Settings, Audit) where admins create users and projects, reassign project ownership, manage all project membership centrally, and toggle registration — with every action recorded in an audit log
+- **👥 Team Membership**: Project rosters are visible to members and managed centrally by administrators with role-based access control (owner/admin/member)
 - **🔔 Webhook Notifications**: Get notified when new issues are detected via Slack, Discord, or any HTTP endpoint
 - **⚡ Rate Limiting**: Configurable per-project event quotas to prevent runaway error loops from overwhelming the system
 - **🗑️ Data Retention**: Configurable per-project retention policies with automatic cleanup

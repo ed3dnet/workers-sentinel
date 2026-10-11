@@ -13,61 +13,27 @@ describe('Project Routes', () => {
 		});
 	});
 
-	describe('POST /api/projects', () => {
-		it('should create a new project', async () => {
+	describe('POST /api/projects (removed — creation is admin-only)', () => {
+		it('should answer 404 for authenticated users', async () => {
 			const response = await authFetch(testUser.token!, 'http://localhost/api/projects', {
 				method: 'POST',
 				body: JSON.stringify({
-					name: 'Test Project',
+					name: 'Should Not Create',
 					platform: 'javascript',
 				}),
 			});
 
-			expect(response.status).toBe(200);
-			const data = (await response.json()) as {
-				project: { id: string; name: string; slug: string; platform: string; publicKey: string };
-				dsn: string;
-			};
+			expect(response.status).toBe(404);
+			const data = (await response.json()) as { error: string };
+			expect(data.error).toBe('not_found');
 
-			expect(data.project).toBeDefined();
-			expect(data.project.name).toBe('Test Project');
-			expect(data.project.slug).toBe('test-project');
-			expect(data.project.platform).toBe('javascript');
-			expect(data.project.publicKey).toBeDefined();
-			expect(data.dsn).toBeDefined();
-			expect(data.dsn).toContain(data.project.publicKey);
+			// And nothing was created
+			const list = await authFetch(testUser.token!, 'http://localhost/api/projects');
+			const listData = (await list.json()) as { projects: Array<{ name: string }> };
+			expect(listData.projects.some((p) => p.name === 'Should Not Create')).toBe(false);
 		});
 
-		it('should create project with unique slug', async () => {
-			// Create first project
-			await authFetch(testUser.token!, 'http://localhost/api/projects', {
-				method: 'POST',
-				body: JSON.stringify({ name: 'Duplicate Name', platform: 'javascript' }),
-			});
-
-			// Create second project with same name
-			const response = await authFetch(testUser.token!, 'http://localhost/api/projects', {
-				method: 'POST',
-				body: JSON.stringify({ name: 'Duplicate Name', platform: 'javascript' }),
-			});
-
-			expect(response.status).toBe(200);
-			const data = (await response.json()) as { project: { slug: string } };
-
-			// Should have different slug (e.g., duplicate-name-1)
-			expect(data.project.slug).toMatch(/duplicate-name-\d+/);
-		});
-
-		it('should reject project creation without name', async () => {
-			const response = await authFetch(testUser.token!, 'http://localhost/api/projects', {
-				method: 'POST',
-				body: JSON.stringify({ platform: 'javascript' }),
-			});
-
-			expect(response.status).toBe(400);
-		});
-
-		it('should reject unauthenticated requests', async () => {
+		it('should answer 401 for anonymous requests (auth middleware precedes the 404)', async () => {
 			const response = await SELF.fetch('http://localhost/api/projects', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },

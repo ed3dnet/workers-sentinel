@@ -12,6 +12,8 @@ export class MockApiError extends Error {
 		message: string,
 		public status: number,
 		public code?: string,
+		/** The full parsed error body (mirrors the real ApiError). */
+		public body?: Record<string, unknown>,
 	) {
 		super(message);
 		this.name = 'ApiError';
@@ -23,18 +25,28 @@ export type RouteHandler = (body?: unknown) => unknown;
 export interface MockApiState {
 	get: Map<string, RouteHandler>;
 	post: Map<string, RouteHandler>;
+	put: Map<string, RouteHandler>;
+	patch: Map<string, RouteHandler>;
 	delete: Map<string, RouteHandler>;
-	calls: Array<{ method: 'get' | 'post' | 'delete'; url: string; body?: unknown }>;
+	calls: Array<{
+		method: 'get' | 'post' | 'put' | 'patch' | 'delete';
+		url: string;
+		body?: unknown;
+	}>;
 }
 
 export const mockApi: MockApiState = {
 	get: new Map(),
 	post: new Map(),
+	put: new Map(),
+	patch: new Map(),
 	delete: new Map(),
 	calls: [],
 };
 
-function dispatch(method: 'get' | 'post' | 'delete', url: string, body?: unknown): unknown {
+type Method = 'get' | 'post' | 'put' | 'patch' | 'delete';
+
+function dispatch(method: Method, url: string, body?: unknown): unknown {
 	mockApi.calls.push({ method, url, body });
 	const handler = mockApi[method].get(url);
 	if (!handler) {
@@ -48,9 +60,8 @@ function dispatch(method: 'get' | 'post' | 'delete', url: string, body?: unknown
 export const api = {
 	get: vi.fn((url: string) => Promise.resolve(dispatch('get', url))),
 	post: vi.fn((url: string, body?: unknown) => Promise.resolve(dispatch('post', url, body))),
-	patch: vi.fn((url: string, body?: unknown) =>
-		Promise.resolve(dispatch('patch' as never, url, body)),
-	),
+	put: vi.fn((url: string, body?: unknown) => Promise.resolve(dispatch('put', url, body))),
+	patch: vi.fn((url: string, body?: unknown) => Promise.resolve(dispatch('patch', url, body))),
 	delete: vi.fn((url: string) => Promise.resolve(dispatch('delete', url))),
 };
 
@@ -63,6 +74,8 @@ export const startAuthentication = vi.fn();
 export function resetMocks(): void {
 	mockApi.get.clear();
 	mockApi.post.clear();
+	mockApi.put.clear();
+	mockApi.patch.clear();
 	mockApi.delete.clear();
 	mockApi.calls.length = 0;
 	try {
@@ -79,6 +92,12 @@ export function onGet(url: string, handler: RouteHandler): void {
 }
 export function onPost(url: string, handler: RouteHandler): void {
 	mockApi.post.set(url, handler);
+}
+export function onPut(url: string, handler: RouteHandler): void {
+	mockApi.put.set(url, handler);
+}
+export function onPatch(url: string, handler: RouteHandler): void {
+	mockApi.patch.set(url, handler);
 }
 export function onDelete(url: string, handler: RouteHandler): void {
 	mockApi.delete.set(url, handler);

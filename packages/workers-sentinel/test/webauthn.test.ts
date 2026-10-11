@@ -125,7 +125,7 @@ async function challengeCount(): Promise<number> {
 }
 
 async function setUserDisabled(userId: string, disabled: boolean): Promise<void> {
-	await AUTH_STATE().fetch('http://internal/admin/set-user-disabled', {
+	await AUTH_STATE().fetch('http://internal/admin/update-user', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ requestingUserRole: 'admin', userId, disabled }),

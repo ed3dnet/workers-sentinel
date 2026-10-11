@@ -39,12 +39,6 @@ function formatDate(dateString: string): string {
 	<div>
 		<div class="flex items-center justify-between mb-6">
 			<h1 class="text-2xl font-bold text-gray-900 dark:text-white">Projects</h1>
-			<RouterLink to="/projects/new" class="btn btn-primary">
-				<svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-				</svg>
-				New Project
-			</RouterLink>
 		</div>
 
 		<div v-if="loading" class="text-center py-12">
@@ -66,15 +60,9 @@ function formatDate(dateString: string): string {
 				/>
 			</svg>
 			<h3 class="mt-2 text-sm font-medium text-gray-900 dark:text-white">No projects</h3>
-			<p class="mt-1 text-sm text-gray-500">Get started by creating a new project.</p>
-			<div class="mt-6">
-				<RouterLink to="/projects/new" class="btn btn-primary">
-					<svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-					</svg>
-					New Project
-				</RouterLink>
-			</div>
+			<p class="mt-1 text-sm text-gray-500">
+				Project creation is managed by administrators — ask one to create a project for you.
+			</p>
 		</div>
 
 		<div v-else class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

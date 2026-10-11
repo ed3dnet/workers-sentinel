@@ -5,6 +5,10 @@
 import { strict as assert } from 'node:assert';
 import { request } from 'node:http';
 import { test } from 'node:test';
+// Native TS type-stripping import (Node 26): the virtual authenticator is
+// plain erasable TypeScript, so the .mjs suite drives real passkey
+// ceremonies without a build step.
+import { VirtualAuthenticator } from '../test/webauthn-helper.ts';
 
 const BASE = process.env.SENTINEL_INTEGRATION_URL;
 const SETUP_TOKEN = process.env.SENTINEL_SETUP_TOKEN;
@@ -14,6 +18,13 @@ if (!BASE || !SETUP_TOKEN) {
 }
 
 const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const FIRST_EMAIL = `first-${runId}@example.com`;
+const FIRST_PASSWORD = 'testpassword123';
+// Ceremonies use the localhost origin: workerd drops an Origin header that
+// equals the socket origin (127.0.0.1:port), and the runner binds
+// WEBAUTHN_ORIGINS to this form so the worker accepts it.
+const CEREMONY_ORIGIN = `http://localhost:${new URL(BASE).port}`;
+const CEREMONY_RP_ID = 'localhost';
 
 async function api(path, { method = 'GET', token, body, headers = {} } = {}) {
 	const response = await fetch(`${BASE}${path}`, {
@@ -73,29 +84,115 @@ async function ingest(project, payload, eventId) {
 }
 
 test('fresh install requires the setup token for the first (admin) registration', async () => {
-	const email = `first-${runId}@example.com`;
+	const email = FIRST_EMAIL;
 	const denied = await api('/api/auth/register', {
 		method: 'POST',
-		body: { email, password: 'testpassword123', name: 'First User' },
+		body: { email, password: FIRST_PASSWORD, name: 'First User' },
 	});
 	assert.equal(denied.status, 403);
 	assert.equal(denied.data.error, 'setup_token_required');
 
 	const granted = await api('/api/auth/register', {
 		method: 'POST',
-		body: { email, password: 'testpassword123', name: 'First User', setupToken: SETUP_TOKEN },
+		body: { email, password: FIRST_PASSWORD, name: 'First User', setupToken: SETUP_TOKEN },
 	});
 	assert.equal(granted.status, 200);
 	assert.equal(granted.data.user.role, 'admin');
 });
 
-test('admin can close and reopen registration', async () => {
+/**
+ * The first user is the (deterministic) admin on this pristine instance.
+ * This bootstrap signs them in and mints a passkey session through the real
+ * HTTP ceremonies — the credential the admin surface now requires. Cached
+ * for the run.
+ */
+let adminPasskeyPromise = null;
+async function getAdminPasskeySession() {
+	adminPasskeyPromise ??= bootstrapAdminPasskey();
+	return adminPasskeyPromise;
+}
+
+async function firstUserPasswordToken() {
 	const login = await api('/api/auth/login', {
 		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
+		body: { email: FIRST_EMAIL, password: FIRST_PASSWORD },
 	});
 	assert.equal(login.status, 200);
-	const adminToken = login.data.token;
+	return login.data.token;
+}
+
+async function bootstrapAdminPasskey() {
+	const passwordToken = await firstUserPasswordToken();
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email: FIRST_EMAIL, password: FIRST_PASSWORD },
+	});
+	const userId = login.data.user.id;
+
+	const authenticator = new VirtualAuthenticator();
+	await authenticator.init();
+	// The ceremony calls carry the loopback Origin explicitly: the runner
+	// binds WEBAUTHN_ORIGINS to it (the repo's custom-domain route would
+	// otherwise make the worker expect the production origin).
+	const ceremonyHeaders = { Origin: CEREMONY_ORIGIN };
+
+	const options = await api('/api/auth/webauthn/register/options', {
+		method: 'POST',
+		token: passwordToken,
+		body: {},
+		headers: ceremonyHeaders,
+	});
+	assert.equal(options.status, 200);
+	const registration = await authenticator.createRegistrationResponse({
+		challenge: options.data.options.challenge,
+		origin: CEREMONY_ORIGIN,
+		rpID: CEREMONY_RP_ID,
+	});
+	const verify = await api('/api/auth/webauthn/verify/register', {
+		method: 'POST',
+		token: passwordToken,
+		body: { ceremonyId: options.data.ceremonyId, name: 'Integration Key', response: registration },
+		headers: ceremonyHeaders,
+	});
+	assert.equal(verify.status, 200, `register verify failed: ${JSON.stringify(verify.data)}`);
+
+	const loginOptions = await api('/api/auth/webauthn/login/options', {
+		method: 'POST',
+		body: {},
+		headers: ceremonyHeaders,
+	});
+	assert.equal(loginOptions.status, 200);
+	const assertion = await authenticator.createAuthenticationResponse({
+		challenge: loginOptions.data.options.challenge,
+		origin: CEREMONY_ORIGIN,
+		rpID: CEREMONY_RP_ID,
+		userHandle: null,
+	});
+	const loginVerify = await api('/api/auth/webauthn/verify/login', {
+		method: 'POST',
+		body: { ceremonyId: loginOptions.data.ceremonyId, response: assertion },
+		headers: ceremonyHeaders,
+	});
+	assert.equal(loginVerify.status, 200, `login verify failed: ${JSON.stringify(loginVerify.data)}`);
+	assert.equal(loginVerify.data.authMethod, 'passkey');
+	return { userId, token: loginVerify.data.token, email: FIRST_EMAIL };
+}
+
+/** Project creation is admin-only: assign the first user as owner. */
+async function createProjectAsAdmin(name) {
+	const admin = await getAdminPasskeySession();
+	const created = await api('/api/admin/projects', {
+		method: 'POST',
+		token: admin.token,
+		body: { name, platform: 'node', ownerId: admin.userId },
+	});
+	assert.equal(created.status, 201);
+	assert.ok(created.data.dsn);
+	return created.data.project;
+}
+
+test('admin can close and reopen registration', async () => {
+	const adminToken = (await getAdminPasskeySession()).token;
 
 	const closed = await api('/api/admin/settings', {
 		method: 'PUT',
@@ -150,20 +247,8 @@ test('login lockout engages after five failures', async () => {
 });
 
 test('ingestion groups duplicates, redacts secrets and clamps pagination', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	assert.equal(login.status, 200);
-	const token = login.data.token;
-
-	const created = await api('/api/projects', {
-		method: 'POST',
-		token,
-		body: { name: `Integration ${runId}`, platform: 'node' },
-	});
-	assert.equal(created.status, 200);
-	const project = created.data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`Integration ${runId}`);
 
 	// Same exception twice: one issue, count 2
 	const exception = {
@@ -225,17 +310,7 @@ test('CORS and security headers behave through the real stack', async () => {
 	assert.equal(evil.status, 204);
 	assert.equal(evil.headers.get('Access-Control-Allow-Origin'), null);
 
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token: login.data.token,
-			body: { name: `CORS ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const project = await createProjectAsAdmin(`CORS ${runId}`);
 
 	const sdk = await fetch(`${BASE}/api/${project.id}/envelope/`, {
 		method: 'OPTIONS',
@@ -356,18 +431,8 @@ async function postEnvelopeBytes(project, bytes) {
 }
 
 test('attachments round-trip byte-identically through the real stack', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const token = login.data.token;
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token,
-			body: { name: `Attach ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`Attach ${runId}`);
 
 	// Framing variant A: final trailing newline after the attachment payload
 	const eventIdA = crypto.randomUUID().replaceAll('-', '');
@@ -439,18 +504,8 @@ test('attachments round-trip byte-identically through the real stack', async () 
 });
 
 test('integration: /api/0 list and download round-trip', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const token = login.data.token;
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token,
-			body: { name: `Compat0 ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`Compat0 ${runId}`);
 
 	// One event, one nonempty R2 payload and one zero-length R2 payload —
 	// both creatable through public ingestion
@@ -550,18 +605,8 @@ test('integration: /api/0 list and download round-trip', async () => {
 });
 
 test('dashed UUID event ids round-trip normalized with idempotent resends', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const token = login.data.token;
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token,
-			body: { name: `UUID ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`UUID ${runId}`);
 
 	const dashed = crypto.randomUUID();
 	const normalized = dashed.replaceAll('-', '');
@@ -592,18 +637,8 @@ test('dashed UUID event ids round-trip normalized with idempotent resends', asyn
 });
 
 test('binary attachments store and download byte-identically', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const token = login.data.token;
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token,
-			body: { name: `BinStore ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`BinStore ${runId}`);
 
 	const eventId = crypto.randomUUID().replaceAll('-', '');
 	const binary = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00]);
@@ -664,18 +699,8 @@ test('binary attachments store and download byte-identically', async () => {
 });
 
 test('gzip envelope with a binary attachment round-trips through real HTTP', async () => {
-	const login = await api('/api/auth/login', {
-		method: 'POST',
-		body: { email: `first-${runId}@example.com`, password: 'testpassword123' },
-	});
-	const token = login.data.token;
-	const project = (
-		await api('/api/projects', {
-			method: 'POST',
-			token,
-			body: { name: `GzBin ${runId}`, platform: 'node' },
-		})
-	).data.project;
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`GzBin ${runId}`);
 
 	const eventId = crypto.randomUUID().replaceAll('-', '');
 	const payload = new Uint8Array(2048);
@@ -720,4 +745,119 @@ test('gzip envelope with a binary attachment round-trips through real HTTP', asy
 	);
 	assert.equal(download.status, 200);
 	assert.deepEqual(new Uint8Array(await download.arrayBuffer()), payload);
+});
+
+test('gate rejects password-session admin with passkey_required', async () => {
+	const admin = await getAdminPasskeySession();
+
+	// The same admin on a password session cannot act as admin
+	const passwordToken = await firstUserPasswordToken();
+	const blocked = await api('/api/admin/settings', {
+		method: 'PUT',
+		token: passwordToken,
+		body: { registrationOpen: true },
+	});
+	assert.equal(blocked.status, 403);
+	assert.equal(blocked.data.error, 'passkey_required');
+
+	// The passkey session reaches the same endpoint
+	const allowed = await api('/api/admin/settings', {
+		method: 'PUT',
+		token: admin.token,
+		body: { registrationOpen: true },
+	});
+	assert.equal(allowed.status, 200);
+});
+
+test('removed project-creation route answers 404 authenticated', async () => {
+	const token = await firstUserPasswordToken();
+	const response = await api('/api/projects', {
+		method: 'POST',
+		token,
+		body: { name: `Removed ${runId}`, platform: 'node' },
+	});
+	assert.equal(response.status, 404);
+	assert.equal(response.data.error, 'not_found');
+});
+
+test('must-change flag on first login of an admin-created user', async () => {
+	const admin = await getAdminPasskeySession();
+	const email = `created-${runId}@example.com`;
+
+	const created = await api('/api/admin/users', {
+		method: 'POST',
+		token: admin.token,
+		body: { name: 'Created User', email, password: 'temppassword123' },
+	});
+	assert.equal(created.status, 201);
+	assert.equal(created.data.user.mustChangePassword, true);
+
+	// First sign-in works and reports the flag
+	const login = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email, password: 'temppassword123' },
+	});
+	assert.equal(login.status, 200);
+	assert.equal(login.data.mustChangePassword, true);
+
+	// The flagged session is restricted server-side…
+	const blocked = await api('/api/projects', { token: login.data.token });
+	assert.equal(blocked.status, 403);
+	assert.equal(blocked.data.error, 'password_change_required');
+
+	// …while the recovery paths stay open
+	const me = await api('/api/auth/me', { token: login.data.token });
+	assert.equal(me.status, 200);
+
+	const changed = await api('/api/auth/change-password', {
+		method: 'POST',
+		token: login.data.token,
+		body: { currentPassword: 'temppassword123', newPassword: 'freshpassword456' },
+	});
+	assert.equal(changed.status, 200);
+
+	// A fresh login is unencumbered
+	const fresh = await api('/api/auth/login', {
+		method: 'POST',
+		body: { email, password: 'freshpassword456' },
+	});
+	assert.equal(fresh.status, 200);
+	assert.equal(fresh.data.mustChangePassword, false);
+	const projects = await api('/api/projects', { token: fresh.data.token });
+	assert.equal(projects.status, 200);
+});
+
+test('owner deletion still works', async () => {
+	const token = await firstUserPasswordToken();
+	const project = await createProjectAsAdmin(`OwnerDel ${runId}`);
+
+	const removed = await api(`/api/projects/${project.slug}`, {
+		method: 'DELETE',
+		token,
+	});
+	assert.equal(removed.status, 200);
+
+	// The DSN key is gone with the project
+	const postDelete = await ingest(
+		project,
+		{ message: 'post-delete probe' },
+		crypto.randomUUID().replaceAll('-', ''),
+	);
+	assert.equal(postDelete.status, 401);
+	assert.equal(postDelete.data.error, 'invalid_auth');
+});
+
+test('admin non-owner deletion succeeds', async () => {
+	const admin = await getAdminPasskeySession();
+	const project = await createProjectAsAdmin(`AdminDel ${runId}`);
+
+	const removed = await api(`/api/admin/projects/${project.id}`, {
+		method: 'DELETE',
+		token: admin.token,
+	});
+	assert.equal(removed.status, 200);
+
+	const projects = await api('/api/admin/projects', { token: admin.token });
+	const list = projects.data.projects ?? projects.data;
+	assert.ok(!list.some((p) => p.id === project.id));
 });

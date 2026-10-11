@@ -1,5 +1,6 @@
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server';
 import { Hono } from 'hono';
+import { readCappedJson } from '../lib/capped-json';
 import { extractBearerToken } from '../middleware/auth';
 import type { AuthContext, Env } from '../types';
 
@@ -106,60 +107,6 @@ async function rejectOrigin(c: {
 	return c.json({ ...originNotAllowed, message: 'Origin is not trusted' }, 403);
 }
 
-type PublicBody = { ok: true; body: Record<string, unknown> } | { ok: false; response: Response };
-
-/**
- * Read a JSON request body while enforcing the size cap DURING streaming —
- * the body is never buffered beyond the cap (early Content-Length rejection
- * is only an optimization; chunked bodies are bounded chunk by chunk).
- */
-async function readCappedBody(
-	c: { req: { header: (name: string) => string | undefined; raw: Request } },
-	maxBytes: number,
-): Promise<PublicBody> {
-	const declared = c.req.header('Content-Length');
-	if (declared && Number(declared) > maxBytes) {
-		await c.req.raw.body?.cancel().catch(() => undefined);
-		return { ok: false, response: Response.json(tooLarge, { status: 413 }) };
-	}
-
-	const reader = c.req.raw.body?.getReader();
-	if (!reader) {
-		return { ok: false, response: Response.json(badJson, { status: 400 }) };
-	}
-	const chunks: Uint8Array[] = [];
-	let received = 0;
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		received += value.byteLength;
-		if (received > maxBytes) {
-			await reader.cancel().catch(() => undefined);
-			return { ok: false, response: Response.json(tooLarge, { status: 413 }) };
-		}
-		chunks.push(value);
-	}
-
-	const assembled = new Uint8Array(received);
-	let offset = 0;
-	for (const chunk of chunks) {
-		assembled.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	try {
-		const parsed = JSON.parse(new TextDecoder().decode(assembled)) as unknown;
-		if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-			return { ok: false, response: Response.json(badJson, { status: 400 }) };
-		}
-		return { ok: true, body: parsed as Record<string, unknown> };
-	} catch {
-		return { ok: false, response: Response.json(badJson, { status: 400 }) };
-	}
-}
-
-const tooLarge = { error: 'body_too_large', message: 'Request body exceeds the size limit' };
-const badJson = { error: 'invalid_json', message: 'Request body must be a valid JSON object' };
-
 function authStateFetcher(env: Env) {
 	const id = env.AUTH_STATE.idFromName('global');
 	const stub = env.AUTH_STATE.get(id);
@@ -178,7 +125,7 @@ webauthnRoutes.post('/login/options', async (c) => {
 	const trusted = resolveTrustedOrigin(c.env, c.req.url, c.req.header('Origin'));
 	if (!trusted) return rejectOrigin(c);
 
-	const parsed = await readCappedBody(c, MAX_PUBLIC_BODY_BYTES);
+	const parsed = await readCappedJson(c, MAX_PUBLIC_BODY_BYTES);
 	if (!parsed.ok) return parsed.response;
 
 	const response = await authStateFetcher(c.env)('/webauthn/login/options', {
@@ -195,7 +142,7 @@ webauthnRoutes.post('/verify/login', async (c) => {
 	const trusted = resolveTrustedOrigin(c.env, c.req.url, c.req.header('Origin'));
 	if (!trusted) return rejectOrigin(c);
 
-	const parsed = await readCappedBody(c, MAX_PUBLIC_BODY_BYTES);
+	const parsed = await readCappedJson(c, MAX_PUBLIC_BODY_BYTES);
 	if (!parsed.ok) return parsed.response;
 
 	const response = await authStateFetcher(c.env)('/webauthn/login/verify', {
@@ -214,7 +161,7 @@ webauthnRoutes.post('/register/options', async (c) => {
 	if (!trusted) return rejectOrigin(c);
 
 	// Consume and validate the (empty) body under the session-side cap
-	const parsed = await readCappedBody(c, MAX_REGISTER_BODY_BYTES);
+	const parsed = await readCappedJson(c, MAX_REGISTER_BODY_BYTES);
 	if (!parsed.ok) return parsed.response;
 
 	const auth = c.get('auth') as AuthContext;
@@ -233,7 +180,7 @@ webauthnRoutes.post('/verify/register', async (c) => {
 	if (!trusted) return rejectOrigin(c);
 
 	const auth = c.get('auth') as AuthContext;
-	const parsed = await readCappedBody(c, MAX_REGISTER_BODY_BYTES);
+	const parsed = await readCappedJson(c, MAX_REGISTER_BODY_BYTES);
 	if (!parsed.ok) return parsed.response;
 	const body = parsed.body as {
 		ceremonyId?: string;
@@ -270,7 +217,7 @@ webauthnRoutes.get('/credentials', async (c) => {
  */
 webauthnRoutes.post('/credentials/delete', async (c) => {
 	const auth = c.get('auth') as AuthContext;
-	const parsed = await readCappedBody(c, MAX_REGISTER_BODY_BYTES);
+	const parsed = await readCappedJson(c, MAX_REGISTER_BODY_BYTES);
 	if (!parsed.ok) return parsed.response;
 
 	const response = await authStateFetcher(c.env)('/webauthn/credential/delete', {

@@ -1,6 +1,8 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { authFetch, createTestProject, createTestUser } from './utils';
+import { adminFetch, authFetch, createTestProject, createTestUser } from './utils';
+
+const BASE = 'http://localhost';
 
 describe('Project Members', () => {
 	let owner: Awaited<ReturnType<typeof createTestUser>>;
@@ -23,8 +25,8 @@ describe('Project Members', () => {
 		project = await createTestProject(owner.token!, { name: 'Members Test Project' });
 	});
 
-	describe('GET /api/projects/:slug/members', () => {
-		it('should list the creator as owner after project creation', async () => {
+	describe('GET /api/projects/:slug/members (read-only roster)', () => {
+		it('should list the assigned owner after project creation', async () => {
 			const response = await authFetch(
 				owner.token!,
 				`http://localhost/api/projects/${project.slug}/members`,
@@ -50,26 +52,43 @@ describe('Project Members', () => {
 
 			expect(response.status).toBe(401);
 		});
+
+		it('should work for plain members (visibility stays, management moved)', async () => {
+			const memberUser = await createTestUser({
+				email: `roster-plain-${Date.now()}@example.com`,
+				password: 'testpassword123',
+				name: 'Roster Plain',
+			});
+
+			await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({ email: memberUser.email, role: 'member' }),
+			});
+
+			const response = await authFetch(
+				memberUser.token!,
+				`http://localhost/api/projects/${project.slug}/members`,
+			);
+			expect(response.status).toBe(200);
+			const data = (await response.json()) as { members: Array<{ userId: string }> };
+			expect(data.members.some((m) => m.userId === memberUser.id)).toBe(true);
+		});
 	});
 
-	describe('POST /api/projects/:slug/members', () => {
-		it('should add a user by email', async () => {
+	describe('POST /api/admin/projects/:projectId/members (admin-managed)', () => {
+		it('should add a user by email as an admin who is not a member', async () => {
 			const newUser = await createTestUser({
 				email: `add-member-${Date.now()}@example.com`,
 				password: 'testpassword123',
 				name: 'New Member',
 			});
 
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members`,
-				{
-					method: 'POST',
-					body: JSON.stringify({ email: newUser.email, role: 'member' }),
-				},
-			);
+			const response = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({ email: newUser.email, role: 'member' }),
+			});
 
-			expect(response.status).toBe(200);
+			expect(response.status).toBe(201);
 			const data = (await response.json()) as {
 				member: { userId: string; email: string; name: string; role: string };
 			};
@@ -81,17 +100,13 @@ describe('Project Members', () => {
 		});
 
 		it('should return 404 for non-existent email', async () => {
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members`,
-				{
-					method: 'POST',
-					body: JSON.stringify({
-						email: 'nonexistent@example.com',
-						role: 'member',
-					}),
-				},
-			);
+			const response = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({
+					email: 'nonexistent@example.com',
+					role: 'member',
+				}),
+			});
 
 			expect(response.status).toBe(404);
 			const data = (await response.json()) as { error: string };
@@ -106,73 +121,47 @@ describe('Project Members', () => {
 			});
 
 			// Add first time
-			await authFetch(owner.token!, `http://localhost/api/projects/${project.slug}/members`, {
+			await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
 				method: 'POST',
 				body: JSON.stringify({ email: dupUser.email, role: 'member' }),
 			});
 
 			// Add second time
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members`,
-				{
-					method: 'POST',
-					body: JSON.stringify({ email: dupUser.email, role: 'member' }),
-				},
-			);
+			const response = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({ email: dupUser.email, role: 'member' }),
+			});
 
 			expect(response.status).toBe(409);
 			const data = (await response.json()) as { error: string };
 			expect(data.error).toBe('already_member');
 		});
 
-		it('should reject owner role', async () => {
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members`,
-				{
-					method: 'POST',
-					body: JSON.stringify({ email: otherUser.email, role: 'owner' }),
-				},
-			);
+		it('should reject the owner role (owner assignment is a reassign)', async () => {
+			const response = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({ email: otherUser.email, role: 'owner' }),
+			});
 
 			expect(response.status).toBe(400);
 			const data = (await response.json()) as { error: string };
 			expect(data.error).toBe('invalid_role');
 		});
 
-		it('should reject requests from non-owner/non-admin members', async () => {
-			// Create a project and add otherUser as a regular member
-			const proj2 = await createTestProject(owner.token!, {
-				name: 'RBAC Members Project',
-			});
-
-			await authFetch(owner.token!, `http://localhost/api/projects/${proj2.slug}/members`, {
-				method: 'POST',
-				body: JSON.stringify({ email: otherUser.email, role: 'member' }),
-			});
-
-			const thirdUser = await createTestUser({
-				email: `third-user-${Date.now()}@example.com`,
-				password: 'testpassword123',
-				name: 'Third User',
-			});
-
-			// otherUser (member role) tries to add thirdUser
-			const response = await authFetch(
-				otherUser.token!,
-				`http://localhost/api/projects/${proj2.slug}/members`,
+		it('old project-level mutation routes answer 404 for authenticated owners', async () => {
+			const post = await authFetch(
+				owner.token!,
+				`http://localhost/api/projects/${project.slug}/members`,
 				{
 					method: 'POST',
-					body: JSON.stringify({ email: thirdUser.email, role: 'member' }),
+					body: JSON.stringify({ email: otherUser.email, role: 'member' }),
 				},
 			);
-
-			expect(response.status).toBe(403);
+			expect(post.status).toBe(404);
 		});
 	});
 
-	describe('DELETE /api/projects/:slug/members/:userId', () => {
+	describe('DELETE /api/admin/projects/:projectId/members/:userId', () => {
 		it('should remove a non-owner member', async () => {
 			const removeUser = await createTestUser({
 				email: `remove-member-${Date.now()}@example.com`,
@@ -183,15 +172,14 @@ describe('Project Members', () => {
 			const proj = await createTestProject(owner.token!, { name: 'Remove Member Project' });
 
 			// Add member
-			await authFetch(owner.token!, `http://localhost/api/projects/${proj.slug}/members`, {
+			await adminFetch(`${BASE}/api/admin/projects/${proj.id}/members`, {
 				method: 'POST',
 				body: JSON.stringify({ email: removeUser.email, role: 'member' }),
 			});
 
 			// Remove member
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${proj.slug}/members/${removeUser.id}`,
+			const response = await adminFetch(
+				`${BASE}/api/admin/projects/${proj.id}/members/${removeUser.id}`,
 				{ method: 'DELETE' },
 			);
 
@@ -212,9 +200,8 @@ describe('Project Members', () => {
 		});
 
 		it('should return 400 when trying to remove the owner', async () => {
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members/${owner.id}`,
+			const response = await adminFetch(
+				`${BASE}/api/admin/projects/${project.id}/members/${owner.id}`,
 				{ method: 'DELETE' },
 			);
 
@@ -224,7 +211,7 @@ describe('Project Members', () => {
 		});
 	});
 
-	describe('PATCH /api/projects/:slug/members/:userId', () => {
+	describe('PATCH /api/admin/projects/:projectId/members/:userId', () => {
 		it('should change role from member to admin', async () => {
 			const patchUser = await createTestUser({
 				email: `patch-member-${Date.now()}@example.com`,
@@ -234,14 +221,13 @@ describe('Project Members', () => {
 
 			const proj = await createTestProject(owner.token!, { name: 'Patch Member Project' });
 
-			await authFetch(owner.token!, `http://localhost/api/projects/${proj.slug}/members`, {
+			await adminFetch(`${BASE}/api/admin/projects/${proj.id}/members`, {
 				method: 'POST',
 				body: JSON.stringify({ email: patchUser.email, role: 'member' }),
 			});
 
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${proj.slug}/members/${patchUser.id}`,
+			const response = await adminFetch(
+				`${BASE}/api/admin/projects/${proj.id}/members/${patchUser.id}`,
 				{
 					method: 'PATCH',
 					body: JSON.stringify({ role: 'admin' }),
@@ -256,9 +242,8 @@ describe('Project Members', () => {
 		});
 
 		it('should reject changing the owner role', async () => {
-			const response = await authFetch(
-				owner.token!,
-				`http://localhost/api/projects/${project.slug}/members/${owner.id}`,
+			const response = await adminFetch(
+				`${BASE}/api/admin/projects/${project.id}/members/${owner.id}`,
 				{
 					method: 'PATCH',
 					body: JSON.stringify({ role: 'member' }),
@@ -288,8 +273,8 @@ describe('Project Members', () => {
 			);
 			expect(beforeResponse.status).toBe(404);
 
-			// Add member
-			await authFetch(owner.token!, `http://localhost/api/projects/${proj.slug}/members`, {
+			// Add member (admin-managed)
+			await adminFetch(`${BASE}/api/admin/projects/${proj.id}/members`, {
 				method: 'POST',
 				body: JSON.stringify({ email: memberUser.email, role: 'member' }),
 			});
