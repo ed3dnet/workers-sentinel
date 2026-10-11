@@ -62,7 +62,6 @@ export const authMiddleware = createMiddleware<{
 			detail = null;
 		}
 		if (detail?.error === 'password_change_required') {
-			await c.req.raw.body?.cancel().catch(() => undefined);
 			return c.json({ error: 'password_change_required' }, 401);
 		}
 		const message = token.startsWith('wst_')
@@ -82,7 +81,6 @@ export const authMiddleware = createMiddleware<{
 	// surface (native and the /api/0 {detail} translator) reports it
 	// uniformly.
 	if (auth.mustChangePassword) {
-		await c.req.raw.body?.cancel().catch(() => undefined);
 		return c.json({ error: 'password_change_required' }, 403);
 	}
 

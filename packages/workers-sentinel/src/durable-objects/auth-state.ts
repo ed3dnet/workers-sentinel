@@ -1066,6 +1066,11 @@ export class AuthState extends DurableObject<Env> {
 			const n = (count?.count as number) ?? 0;
 			this.sql.exec('DELETE FROM webauthn_credentials WHERE user_id = ?', userId);
 			if (n > 0) {
+				// Sessions minted by the (removed) passkeys are revoked with
+				// it: removing passkeys is the compromise-response workflow,
+				// and a stolen passkey-minted session must not outlive the
+				// credential. Password-minted sessions are unaffected.
+				this.sql.exec("DELETE FROM sessions WHERE user_id = ? AND auth_method = 'passkey'", userId);
 				this.audit(requestingUserId, 'user.passkeys_removed', 'user', userId, undefined, {
 					count: n,
 				});
@@ -2052,12 +2057,18 @@ export class AuthState extends DurableObject<Env> {
 		const project = projectRows[0];
 
 		const newOwnerRows = this.sql
-			.exec('SELECT id, email, name FROM users WHERE id = ?', newOwnerId)
+			.exec('SELECT id, email, name, disabled FROM users WHERE id = ?', newOwnerId)
 			.toArray();
 		if (newOwnerRows.length === 0) {
 			return this.jsonResponse(
 				{ error: 'user_not_found', message: 'No user found with that id' },
 				404,
+			);
+		}
+		if ((newOwnerRows[0].disabled as number) === 1) {
+			return this.jsonResponse(
+				{ error: 'user_disabled', message: 'That user is disabled; enable them first' },
+				400,
 			);
 		}
 		const newOwner = newOwnerRows[0];
@@ -2198,12 +2209,21 @@ export class AuthState extends DurableObject<Env> {
 		}
 
 		const userRows = this.sql
-			.exec('SELECT id, email, name FROM users WHERE email = ?', email.trim().toLowerCase())
+			.exec(
+				'SELECT id, email, name, disabled FROM users WHERE email = ?',
+				email.trim().toLowerCase(),
+			)
 			.toArray();
 		if (userRows.length === 0) {
 			return this.jsonResponse(
 				{ error: 'user_not_found', message: 'No user found with that email' },
 				404,
+			);
+		}
+		if ((userRows[0].disabled as number) === 1) {
+			return this.jsonResponse(
+				{ error: 'user_disabled', message: 'That user is disabled; enable them first' },
+				400,
 			);
 		}
 		const user = userRows[0];

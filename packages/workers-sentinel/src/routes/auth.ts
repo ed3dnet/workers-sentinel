@@ -189,9 +189,11 @@ authRoutes.get('/me', async (c) => {
 
 // Session-only guard: API tokens cannot manage API tokens
 tokenRoutes.use('*', async (c, next) => {
-	const authHeader = c.req.header('Authorization');
-	const token = authHeader?.substring(7) || '';
-	if (token.startsWith('wst_')) {
+	// Same tolerant parser as authMiddleware (case-insensitive scheme,
+	// whitespace-trimmed) — a fixed substring(7) would miss "Bearer  wst_…"
+	// and let an API token slip past this guard.
+	const token = extractBearerToken(c.req.header('Authorization'));
+	if (token?.startsWith('wst_')) {
 		return c.json(
 			{
 				error: 'forbidden',

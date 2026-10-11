@@ -32,15 +32,20 @@ export const adminRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 //   3. session not minted by a passkey login → 403 `passkey_required`
 //      (registering a passkey inside a password session does NOT unlock
 //      admin tools — re-login via passkey is required)
+// NOTE: do NOT explicitly cancel unconsumed request bodies on these early
+// returns. Empirically (repro: PUT + gate rejection + follow-up request), a
+// body.cancel() issued after authMiddleware's AuthState subrequest wedges
+// the workerd isolate for minutes and 503s the next request ("worker
+// restarted mid-request"); the pre-existing pattern of returning without
+// touching the body is safe — workerd reclaims unconsumed bodies — and the
+// WebAuthn routes' mid-stream cancels (before any subrequest) are fine.
 adminRoutes.use('*', async (c, next) => {
 	const auth = c.get('auth');
 	if (!auth) {
-		await c.req.raw.body?.cancel().catch(() => undefined);
 		return c.json({ error: 'unauthorized' }, 401);
 	}
 	const token = extractBearerToken(c.req.header('Authorization'));
 	if (token?.startsWith('wst_')) {
-		await c.req.raw.body?.cancel().catch(() => undefined);
 		return c.json(
 			{
 				error: 'session_required',
@@ -50,11 +55,9 @@ adminRoutes.use('*', async (c, next) => {
 		);
 	}
 	if (auth.user.role !== 'admin') {
-		await c.req.raw.body?.cancel().catch(() => undefined);
 		return c.json({ error: 'forbidden', message: 'Admin role required' }, 403);
 	}
 	if (auth.session.authMethod !== 'passkey') {
-		await c.req.raw.body?.cancel().catch(() => undefined);
 		return c.json(
 			{
 				error: 'passkey_required',
@@ -86,11 +89,6 @@ function auth(c: AppContext): AuthContext {
 	return c.get('auth') as AuthContext;
 }
 
-/** Fully discard the request body (workerd hygiene: never leave it unread). */
-async function discardBody(c: AppContext): Promise<void> {
-	await c.req.raw.body?.cancel().catch(() => undefined);
-}
-
 /** Read an admin request body under the shared streaming cap. */
 async function adminBody(c: AppContext): Promise<Record<string, unknown> | Response> {
 	const parsed = await readCappedJson(c, MAX_ADMIN_BODY_BYTES);
@@ -116,10 +114,16 @@ adminRoutes.get('/users', async (c) => {
 adminRoutes.post('/users', async (c) => {
 	const body = await adminBody(c);
 	if (body instanceof Response) return body;
+	// Explicit field whitelist — never spread the body over the trusted
+	// actor fields (a caller could otherwise spoof requestingUserId/
+	// requestingUserRole and misattribute audit rows)
 	const response = await authStateFetch(c.env, '/admin/create-user', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,
-		...body,
+		name: body.name,
+		email: body.email,
+		password: body.password,
+		role: body.role,
 	});
 	const data = await response.json();
 	return c.json(data, response.status as ContentfulStatusCode);
@@ -141,11 +145,15 @@ adminRoutes.get('/users/:userId', async (c) => {
 adminRoutes.patch('/users/:userId', async (c) => {
 	const body = await adminBody(c);
 	if (body instanceof Response) return body;
+	// Explicit field whitelist (see the create route's note)
 	const response = await authStateFetch(c.env, '/admin/update-user', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,
 		userId: c.req.param('userId'),
-		...body,
+		name: body.name,
+		email: body.email,
+		role: body.role,
+		disabled: body.disabled,
 	});
 	const data = await response.json();
 	return c.json(data, response.status as ContentfulStatusCode);
@@ -169,7 +177,6 @@ adminRoutes.post('/users/:userId/reset-password', async (c) => {
 // Remove every passkey for a user
 // DELETE /api/admin/users/:userId/passkeys
 adminRoutes.delete('/users/:userId/passkeys', async (c) => {
-	await discardBody(c);
 	const response = await authStateFetch(c.env, '/admin/remove-user-passkeys', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,
@@ -182,7 +189,6 @@ adminRoutes.delete('/users/:userId/passkeys', async (c) => {
 // Delete a user (blocked while they own projects)
 // DELETE /api/admin/users/:userId
 adminRoutes.delete('/users/:userId', async (c) => {
-	await discardBody(c);
 	const response = await authStateFetch(c.env, '/admin/delete-user', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,
@@ -265,7 +271,6 @@ adminRoutes.post('/projects/:projectId/owner', async (c) => {
 adminRoutes.delete('/projects/:projectId', async (c) => {
 	const projectId = c.req.param('projectId');
 	const faultHeader = c.req.header('X-Sentinel-Test-Fault');
-	await discardBody(c);
 	const response = await authStateFetch(c.env, '/admin/delete-project', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,
@@ -326,7 +331,6 @@ adminRoutes.patch('/projects/:projectId/members/:userId', async (c) => {
 // Remove a member from any project (owner must be reassigned first)
 // DELETE /api/admin/projects/:projectId/members/:userId
 adminRoutes.delete('/projects/:projectId/members/:userId', async (c) => {
-	await discardBody(c);
 	const response = await authStateFetch(c.env, '/admin/remove-project-member', {
 		requestingUserId: auth(c).user.id,
 		requestingUserRole: auth(c).user.role,

@@ -6,6 +6,7 @@ import {
 	createTestProject,
 	createTestUser,
 	getAdminPasskeySession,
+	passkeyLoginCeremony,
 	registerPasskeyCeremony,
 } from './utils';
 import { VirtualAuthenticator } from './webauthn-helper';
@@ -148,6 +149,29 @@ describe('admin user administration', () => {
 			});
 			expect(response.status).toBe(201);
 			expect(user?.role).toBe('admin');
+		});
+
+		it('ignores spoofed actor fields in request bodies (audit integrity)', async () => {
+			// A passkey admin tries to override the trusted actor fields via
+			// the body: the request must still act as the real caller
+			const email = `spoof-${Date.now()}@example.com`;
+			const response = await adminFetch(`${BASE}/api/admin/users`, {
+				method: 'POST',
+				body: JSON.stringify({
+					name: 'Spoofed Actor',
+					email,
+					password: 'temppassword123',
+					requestingUserId: '00000000-0000-0000-0000-0000000000aa',
+					requestingUserRole: 'member',
+				}),
+			});
+			expect(response.status).toBe(201);
+			const data = (await response.json()) as { user: { id: string } };
+
+			// The audit row is attributed to the real caller, not the spoof
+			const rows = await auditFor(data.user.id);
+			const created = rows.find((row) => row.action === 'user.created');
+			expect(created?.actorEmail).toBe('admin-fixture@example.com');
 		});
 
 		it('validates inputs and rejects duplicates', async () => {
@@ -606,6 +630,38 @@ describe('admin user administration', () => {
 			expect(response.status).toBe(400);
 			expect(((await response.json()) as { error: string }).error).toBe('invalid_password');
 		});
+
+		it('passkey removal revokes passkey-minted sessions but not password sessions', async () => {
+			const user = await createTestUser({
+				email: `passkey-revoke-${Date.now()}@example.com`,
+				password: 'testpassword123',
+				name: 'Passkey Revoke',
+			});
+			const authenticator = new VirtualAuthenticator();
+			await authenticator.init();
+			const register = await registerPasskeyCeremony(user.token!, authenticator);
+			expect(register.status).toBe(200);
+			const passwordSession = user.token!;
+
+			const login = await passkeyLoginCeremony(authenticator);
+			expect(login.verify.status).toBe(200);
+			const passkeySession = login.data.token!;
+
+			// Both sessions are live before the removal
+			expect((await authFetch(passwordSession, `${BASE}/api/auth/me`)).status).toBe(200);
+			expect((await authFetch(passkeySession, `${BASE}/api/auth/me`)).status).toBe(200);
+
+			const remove = await adminFetch(`${BASE}/api/admin/users/${user.id}/passkeys`, {
+				method: 'DELETE',
+			});
+			expect(remove.status).toBe(200);
+			expect(((await remove.json()) as { removedCount: number }).removedCount).toBe(1);
+
+			// The passkey-minted session (the compromise vector) is revoked;
+			// the password-minted session survives
+			expect((await authFetch(passkeySession, `${BASE}/api/auth/me`)).status).toBe(401);
+			expect((await authFetch(passwordSession, `${BASE}/api/auth/me`)).status).toBe(200);
+		});
 	});
 
 	describe('user delete cascades and blocks on owned projects', () => {
@@ -864,6 +920,49 @@ describe('admin user administration', () => {
 			);
 			expect(unknownProject.status).toBe(404);
 			expect(((await unknownProject.json()) as { error: string }).error).toBe('project_not_found');
+		});
+
+		it('rejects disabled targets for ownership and membership', async () => {
+			const owner = await createTestUser({
+				email: `disabled-owner-${Date.now()}@example.com`,
+				password: 'testpassword123',
+				name: 'Disabled Owner',
+			});
+			const project = await createTestProject(owner.token!, {
+				name: `Disabled Target ${Date.now()}`,
+			});
+
+			// Disable the prospective owner/member
+			const disable = await adminFetch(`${BASE}/api/admin/users/${owner.id}`, {
+				method: 'PATCH',
+				body: JSON.stringify({ disabled: true }),
+			});
+			expect(disable.status).toBe(200);
+
+			// Ownership reassignment to a disabled user is rejected
+			const reassign = await adminFetch(`${BASE}/api/admin/projects/${project.id}/owner`, {
+				method: 'POST',
+				body: JSON.stringify({ userId: owner.id }),
+			});
+			expect(reassign.status).toBe(400);
+			expect(((await reassign.json()) as { error: string }).error).toBe('user_disabled');
+
+			// So is adding a disabled user as a member (use another disabled user)
+			const other = await createTestUser({
+				email: `disabled-other-${Date.now()}@example.com`,
+				password: 'testpassword123',
+				name: 'Disabled Other',
+			});
+			await adminFetch(`${BASE}/api/admin/users/${other.id}`, {
+				method: 'PATCH',
+				body: JSON.stringify({ disabled: true }),
+			});
+			const add = await adminFetch(`${BASE}/api/admin/projects/${project.id}/members`, {
+				method: 'POST',
+				body: JSON.stringify({ email: other.email, role: 'member' }),
+			});
+			expect(add.status).toBe(400);
+			expect(((await add.json()) as { error: string }).error).toBe('user_disabled');
 		});
 
 		it('admin deletion purges the ProjectState DO', async () => {
