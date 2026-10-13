@@ -261,14 +261,18 @@ export function sanitizeEvent(event: SentryEvent): SentryEvent {
 		event.event_id = crypto.randomUUID().replace(/-/g, '');
 	}
 
-	// timestamp: must parse and be within ±1 day of receipt, otherwise use now
+	// timestamp: must parse and be within ±1 day of receipt, otherwise use now.
+	// Non-string values are neither ISO nor skew-checkable — the envelope spec
+	// permits numeric (unix epoch) timestamps — so they are replaced with the
+	// receipt time under the same policy, never stored raw (the events table's
+	// timestamp column is TEXT and event JSON is echoed verbatim).
 	if (typeof event.timestamp === 'string') {
 		const parsed = new Date(event.timestamp).getTime();
 		const skew = Math.abs(Date.now() - parsed);
 		if (!Number.isFinite(parsed) || skew > 24 * 60 * 60 * 1000) {
 			event.timestamp = new Date().toISOString();
 		}
-	} else if (event.timestamp === undefined || event.timestamp === null) {
+	} else {
 		event.timestamp = new Date().toISOString();
 	}
 
