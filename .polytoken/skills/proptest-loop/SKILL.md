@@ -94,4 +94,6 @@ One `proptest/fix/<slug>` branch per distinct bug: standalone deterministic regr
 
 Write each fix around the concrete trigger, wrong behavior, expected behavior, and repair — understandable to a reviewer who has never seen this skill. State validation accurately; distinguish demonstrated contract violations from unproven application-level impact.
 
+**Surface findings with recommendations — the ledger is a record, never the reporting channel.** Every confirmed bug, recorded divergence, and consequential ambiguity reaches the operator with a recommendation: severity, the suggested fix shape, and its trade-offs (including the cost of NOT fixing). Raise findings as they land — or batched at session close at the latest — and when a decision gates further work, ask with the recommended option first. A finding that lives only in the ledger is an unreported finding.
+
 Keep exploring. Feed confirmed failures and suspicious patterns back into target selection, and bring the operator findings, consequential ambiguities, and questions requiring repository context as they arise.
