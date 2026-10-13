@@ -13,6 +13,43 @@ function setTab(next: 'general' | 'security') {
 	router.replace({ query: { ...route.query, tab: next } });
 }
 
+// --- Profile (General tab) ---
+const profileName = ref(authStore.user?.name ?? '');
+const profileEmail = ref(authStore.user?.email ?? '');
+const savingProfile = ref(false);
+const profileError = ref<string | null>(null);
+const profileSuccess = ref(false);
+
+const profileDirty = computed(
+	() =>
+		profileName.value !== (authStore.user?.name ?? '') ||
+		profileEmail.value !== (authStore.user?.email ?? ''),
+);
+
+async function saveProfile() {
+	if (!profileDirty.value || savingProfile.value) return;
+	profileError.value = null;
+	profileSuccess.value = false;
+	savingProfile.value = true;
+	try {
+		await authStore.updateProfile(profileName.value, profileEmail.value);
+		// Re-sync from the store so the server's normalization (trim,
+		// lowercase) is reflected in the inputs
+		profileName.value = authStore.user?.name ?? profileName.value;
+		profileEmail.value = authStore.user?.email ?? profileEmail.value;
+		profileSuccess.value = true;
+	} catch (err) {
+		profileError.value = err instanceof Error ? err.message : 'Failed to update profile';
+	} finally {
+		savingProfile.value = false;
+	}
+}
+
+// A fresh edit invalidates the previous success note
+watch(profileDirty, (dirty) => {
+	if (dirty) profileSuccess.value = false;
+});
+
 // --- Change password ---
 const currentPassword = ref('');
 const newPassword = ref('');
@@ -158,22 +195,68 @@ watch(
 		<!-- General -->
 		<div v-if="tab === 'general'" class="card space-y-4" data-testid="settings-general">
 			<h2 class="text-lg font-semibold text-gray-900 dark:text-white">Profile</h2>
-			<dl class="space-y-3 text-sm">
-				<div class="flex justify-between">
-					<dt class="text-gray-500 dark:text-gray-400">Display name</dt>
-					<dd class="font-medium text-gray-900 dark:text-white">{{ authStore.user?.name }}</dd>
+			<form class="space-y-4" @submit.prevent="saveProfile">
+				<div
+					v-if="profileError"
+					class="bg-error-50 dark:bg-error-900/20 text-error-700 dark:text-error-400 px-4 py-3 rounded-lg text-sm"
+					data-testid="profile-error"
+				>
+					{{ profileError }}
 				</div>
-				<div class="flex justify-between">
-					<dt class="text-gray-500 dark:text-gray-400">Email</dt>
-					<dd class="font-medium text-gray-900 dark:text-white">{{ authStore.user?.email }}</dd>
+				<div
+					v-if="profileSuccess"
+					class="bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300 px-4 py-3 rounded-lg text-sm"
+					data-testid="profile-success"
+				>
+					Profile updated
 				</div>
-				<div class="flex justify-between">
-					<dt class="text-gray-500 dark:text-gray-400">Role</dt>
-					<dd class="font-medium text-gray-900 dark:text-white">{{ authStore.user?.role }}</dd>
+				<div>
+					<label for="profile-name" class="label">Display name</label>
+					<input
+						id="profile-name"
+						v-model="profileName"
+						type="text"
+						class="input"
+						maxlength="100"
+						required
+						data-testid="profile-name-input"
+					/>
 				</div>
-			</dl>
+				<div>
+					<label for="profile-email" class="label">Email</label>
+					<!-- type="text" on purpose: the server deliberately applies no
+						email-format validation, and a type="email" input would impose
+						browser constraint validation the endpoint doesn't have -->
+					<input
+						id="profile-email"
+						v-model="profileEmail"
+						type="text"
+						autocomplete="username"
+						inputmode="email"
+						class="input"
+						maxlength="254"
+						required
+						data-testid="profile-email-input"
+					/>
+				</div>
+				<div class="flex justify-between text-sm">
+					<span class="text-gray-500 dark:text-gray-400">Role</span>
+					<span class="font-medium text-gray-900 dark:text-white">{{
+						authStore.user?.role
+					}}</span>
+				</div>
+				<button
+					type="submit"
+					class="btn btn-primary"
+					:disabled="savingProfile || !profileDirty"
+					data-testid="profile-save"
+				>
+					{{ savingProfile ? 'Saving…' : 'Save changes' }}
+				</button>
+			</form>
 			<p class="text-xs text-gray-400">
-				Profile details are read-only for now; passkeys and passwords live under Security.
+				Your email is your sign-in identifier — you'll use the new one next time you sign in.
+				Passkeys and passwords live under Security.
 			</p>
 		</div>
 

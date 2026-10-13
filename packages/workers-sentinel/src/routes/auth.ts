@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { invalidJsonBody } from '../lib/capped-json';
 import { extractBearerToken } from '../middleware/auth';
 import type { AuthContext, Env } from '../types';
 
@@ -156,6 +157,70 @@ authRoutes.post('/change-password', async (c) => {
 	);
 	const data = await change.json();
 	return c.json(data, change.status as 200 | 400 | 401 | 404);
+});
+
+// Update the signed-in user's own profile (display name / email).
+// Session-only: API tokens are rejected (they must not change the login
+// identity of the account that minted them), and a forced-password-change
+// flagged session gets recovery paths only — this is not one of them.
+authRoutes.patch('/profile', async (c) => {
+	const token = extractBearerToken(c.req.header('Authorization'));
+	if (!token) {
+		return c.json({ error: 'unauthorized', message: 'Missing authorization header' }, 401);
+	}
+	if (token.startsWith('wst_')) {
+		return c.json(
+			{ error: 'session_required', message: 'Profile updates require session authentication' },
+			403,
+		);
+	}
+
+	const authStateId = c.env.AUTH_STATE.idFromName('global');
+	const authState = c.env.AUTH_STATE.get(authStateId);
+	const response = await authState.fetch(
+		new Request('http://internal/validate-session', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ token }),
+		}),
+	);
+	if (!response.ok) {
+		return c.json({ error: 'unauthorized', message: 'Invalid or expired session' }, 401);
+	}
+	const { user, mustChangePassword } = (await response.json()) as {
+		user: { id: string };
+		mustChangePassword: boolean;
+	};
+	if (mustChangePassword) {
+		return c.json({ error: 'password_change_required' }, 403);
+	}
+
+	// Plain parse with an object guard (no readCappedJson here by design:
+	// this route's body is tiny and uncapped like register/login, and a
+	// capped reader's cancel paths would run after the validate-session
+	// subrequest — the documented workerd body-cancel trap). Malformed or
+	// non-object bodies answer 400 invalid_json, the shared vocabulary.
+	let parsed: unknown;
+	try {
+		parsed = await c.req.json();
+	} catch {
+		return c.json(invalidJsonBody, 400);
+	}
+	if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		return c.json(invalidJsonBody, 400);
+	}
+	const body = parsed as { name?: string; email?: string };
+	const update = await authState.fetch(
+		new Request('http://internal/update-profile', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			// Explicit field whitelist: the acting identity comes from the
+			// validated session, never from the request body.
+			body: JSON.stringify({ userId: user.id, name: body.name, email: body.email }),
+		}),
+	);
+	const data = await update.json();
+	return c.json(data, update.status as 200 | 400 | 404 | 409 | 500);
 });
 
 // Get current user

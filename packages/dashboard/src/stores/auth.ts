@@ -198,6 +198,19 @@ export const useAuthStore = defineStore('auth', () => {
 		await logout();
 	}
 
+	/**
+	 * Self-service profile edit (display name + email). The server
+	 * normalizes (trims, lowercases the email) and returns the updated
+	 * user; assigning it here updates the sidebar and every consumer
+	 * reactively. Sessions stay alive — the email is the login
+	 * identifier, not a credential. Throws on error for the component
+	 * to surface.
+	 */
+	async function updateProfile(name: string, email: string) {
+		const response = await api.patch<{ user: User }>('/api/auth/profile', { name, email });
+		user.value = response.user;
+	}
+
 	function dismissPasskeyNag() {
 		dismissedForThisVisit.value = true;
 	}
@@ -239,6 +252,7 @@ export const useAuthStore = defineStore('auth', () => {
 		listPasskeys,
 		deletePasskey,
 		changePassword,
+		updateProfile,
 		dismissPasskeyNag,
 		logout,
 	};

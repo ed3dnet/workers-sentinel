@@ -326,6 +326,8 @@ export class AuthState extends DurableObject<Env> {
 					return this.handleLogoutAll(request);
 				case '/change-password':
 					return this.handleChangePassword(request);
+				case '/update-profile':
+					return this.handleUpdateProfile(request);
 				case '/admin/create-user':
 					return this.handleAdminCreateUser(request);
 				case '/admin/update-user':
@@ -696,6 +698,128 @@ export class AuthState extends DurableObject<Env> {
 		// Revoke every session: other sessions must re-authenticate
 		this.sql.exec('DELETE FROM sessions WHERE user_id = ?', userId);
 		return this.jsonResponse({ success: true });
+	}
+
+	/**
+	 * Self-service profile update (display name + email) for the acting
+	 * user. The `userId` arrives exclusively from the route's validated
+	 * session — never from the request body — and the internal surface
+	 * trusts it like every other handler.
+	 *
+	 * Deliberately no email-format validation or verification (operator
+	 * decision): only integrity guards apply — typed, non-empty after
+	 * trim/lowercase normalization, length caps, and uniqueness. Changing
+	 * the email changes the login identifier; sessions are NOT revoked
+	 * (they validate by user id, not by email — the user stays signed in
+	 * and can self-correct a typo).
+	 */
+	private async handleUpdateProfile(request: Request): Promise<Response> {
+		const { userId, name, email } = (await request.json()) as {
+			userId?: string;
+			name?: string;
+			email?: string;
+		};
+
+		if (!userId) {
+			return this.jsonResponse({ error: 'missing_fields' }, 400);
+		}
+		const hasName = name !== undefined;
+		const hasEmail = email !== undefined;
+		if (!hasName && !hasEmail) {
+			return this.jsonResponse(
+				{
+					error: 'missing_fields',
+					message: 'At least one of name or email is required',
+				},
+				400,
+			);
+		}
+
+		const rows = this.sql.exec('SELECT id, email, name FROM users WHERE id = ?', userId).toArray();
+		if (rows.length === 0) {
+			return this.jsonResponse({ error: 'not_found' }, 404);
+		}
+		const current = rows[0];
+
+		// Field validations — every guard runs before any write. Note: no
+		// email-format check here by design (see the doc comment above).
+		let newName: string | null = null;
+		if (hasName) {
+			const trimmed = typeof name === 'string' ? name.trim() : '';
+			if (!trimmed || trimmed.length > 100) {
+				return this.jsonResponse(
+					{ error: 'invalid_name', message: 'Name must be 1 to 100 characters' },
+					400,
+				);
+			}
+			newName = trimmed;
+		}
+		let newEmail: string | null = null;
+		if (hasEmail) {
+			const normalized = typeof email === 'string' ? email.trim().toLowerCase() : '';
+			if (!normalized || normalized.length > 254) {
+				return this.jsonResponse(
+					{ error: 'invalid_email', message: 'Email must be 1 to 254 characters' },
+					400,
+				);
+			}
+			const clash = this.sql
+				.exec('SELECT id FROM users WHERE email = ? AND id != ?', normalized, userId)
+				.toArray();
+			if (clash.length > 0) {
+				return this.jsonResponse(
+					{ error: 'email_in_use', message: 'Another user already uses that email' },
+					409,
+				);
+			}
+			newEmail = normalized;
+		}
+
+		// Only changed fields are written (and audited); a no-op writes nothing
+		const nameChanged = hasName && newName !== (current.name as string);
+		const emailChanged = hasEmail && newEmail !== (current.email as string);
+		if (!nameChanged && !emailChanged) {
+			return this.jsonResponse({ user: this.wireUserById(userId) });
+		}
+
+		const now = new Date().toISOString();
+		const labelEmail = emailChanged ? (newEmail as string) : (current.email as string);
+		const user = this.ctx.storage.transactionSync(() => {
+			const sets: string[] = [];
+			const params: (string | number)[] = [];
+			if (nameChanged) {
+				sets.push('name = ?');
+				params.push(newName as string);
+			}
+			if (emailChanged) {
+				sets.push('email = ?');
+				params.push(newEmail as string);
+			}
+			sets.push('updated_at = ?');
+			params.push(now);
+			params.push(userId);
+			this.sql.exec(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...params);
+
+			// One audit row per changed field, actor = the user themselves
+			// (same row shape as the admin update path). Sessions are NOT
+			// revoked: the email is the login identifier, not a credential.
+			if (nameChanged) {
+				this.audit(userId, 'user.renamed', 'user', userId, labelEmail, {
+					from: current.name as string,
+					to: newName,
+				});
+			}
+			if (emailChanged) {
+				this.audit(userId, 'user.email_changed', 'user', userId, labelEmail, {
+					from: current.email as string,
+					to: newEmail,
+				});
+			}
+
+			return this.wireUserById(userId);
+		});
+
+		return this.jsonResponse({ user });
 	}
 
 	// -------------------------------------------------------------------------
@@ -2892,6 +3016,23 @@ export class AuthState extends DurableObject<Env> {
 	private adminUserById(userId: string): AdminUser | null {
 		const rows = this.sql.exec(`${AuthState.ADMIN_USER_SELECT} WHERE u.id = ?`, userId).toArray();
 		return rows.length > 0 ? this.mapAdminUser(rows[0]) : null;
+	}
+
+	/** The plain wire `User` shape (`/api/auth/me` parity) by user id. */
+	private wireUserById(userId: string): User | null {
+		const rows = this.sql
+			.exec('SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = ?', userId)
+			.toArray();
+		if (rows.length === 0) return null;
+		const row = rows[0];
+		return {
+			id: row.id as string,
+			email: row.email as string,
+			name: row.name as string,
+			role: row.role as 'admin' | 'member',
+			createdAt: row.created_at as string,
+			updatedAt: row.updated_at as string,
+		};
 	}
 
 	private mapAdminUser(row: Record<string, unknown>): AdminUser {

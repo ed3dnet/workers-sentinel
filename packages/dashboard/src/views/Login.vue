@@ -97,11 +97,17 @@ async function handlePasskey() {
 				<div class="space-y-4">
 					<div>
 						<label for="email" class="label">Email address</label>
+						<!-- type="text" on purpose: profile edits deliberately accept
+							format-free identifiers (the profile endpoint applies no
+							email-format validation), and a type="email" input would let
+							the browser block signing in with one. The server only
+							trims/lowercases. -->
 						<input
 							id="email"
 							v-model="email"
-							type="email"
-							autocomplete="email"
+							type="text"
+							autocomplete="username"
+							inputmode="email"
 							required
 							class="input"
 							placeholder="you@example.com"

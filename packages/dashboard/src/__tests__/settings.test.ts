@@ -1,9 +1,10 @@
 import { flushPromises, mount } from '@vue/test-utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../stores/auth';
+import Layout from '../views/Layout.vue';
 import Settings from '../views/Settings.vue';
 import { atRoute, mockPasskeyCeremony, seedAuth, testRouter } from './helpers';
-import { MockApiError, mockApi, onGet, onPost, startRegistration } from './mocks';
+import { MockApiError, mockApi, onGet, onPatch, onPost, startRegistration } from './mocks';
 
 vi.mock('../api/client', () =>
 	import('./mocks').then((m) => ({ api: m.api, ApiError: m.ApiError })),
@@ -145,8 +146,22 @@ describe('settings lists adds and deletes passkeys with required names', () => {
 	});
 });
 
-describe('settings general pane renders placeholder', () => {
-	it('shows read-only profile details', async () => {
+describe('settings general pane edits the profile', () => {
+	it('profile form saves and updates the signed-in display', async () => {
+		onPatch('/api/auth/profile', (body) => {
+			expect(body).toEqual({ name: 'New Display Name', email: 'new@example.com' });
+			return {
+				user: {
+					id: 'user-1',
+					email: 'new@example.com',
+					name: 'New Display Name',
+					role: 'member',
+					createdAt: '2026-01-01T00:00:00Z',
+					updatedAt: '2026-02-02T00:00:00Z',
+				},
+			};
+		});
+
 		const { pinia } = seedAuth({ hasPasskey: true });
 		const router = testRouter();
 		await atRoute(router, '/settings');
@@ -155,7 +170,67 @@ describe('settings general pane renders placeholder', () => {
 
 		const pane = wrapper.find('[data-testid="settings-general"]');
 		expect(pane.exists()).toBe(true);
-		expect(pane.text()).toContain('Dev User');
-		expect(pane.text()).toContain('dev@example.com');
+
+		// The form renders prefilled from the store
+		const nameInput = wrapper.find('[data-testid="profile-name-input"]');
+		const emailInput = wrapper.find('[data-testid="profile-email-input"]');
+		expect((nameInput.element as HTMLInputElement).value).toBe('Dev User');
+		expect((emailInput.element as HTMLInputElement).value).toBe('dev@example.com');
+
+		// Save is disabled until a value differs from the store
+		const save = wrapper.find('[data-testid="profile-save"]');
+		expect(save.attributes('disabled')).toBeDefined();
+
+		await nameInput.setValue('New Display Name');
+		await emailInput.setValue('new@example.com');
+		expect(save.attributes('disabled')).toBeUndefined();
+
+		await save.trigger('submit');
+		await flushPromises();
+
+		// The PATCH carried the new values
+		const call = mockApi.calls.find((c) => c.method === 'patch' && c.url === '/api/auth/profile');
+		expect(call?.body).toEqual({ name: 'New Display Name', email: 'new@example.com' });
+
+		// The store's user updates and the success note shows
+		const store = useAuthStore(pinia);
+		expect(store.user?.name).toBe('New Display Name');
+		expect(store.user?.email).toBe('new@example.com');
+		expect(wrapper.find('[data-testid="profile-success"]').text()).toContain('Profile updated');
+
+		// A Layout mounted with the same pinia renders the new name/email
+		// in the sidebar's signed-in display
+		onGet('/api/projects', () => ({ projects: [] }));
+		const layoutRouter = testRouter();
+		await atRoute(layoutRouter, '/settings');
+		const layout = mount(Layout, {
+			global: { plugins: [pinia, layoutRouter], stubs: { RouterView: true } },
+		});
+		await flushPromises();
+		expect(layout.text()).toContain('New Display Name');
+		expect(layout.text()).toContain('new@example.com');
+	});
+
+	it('profile form surfaces save errors', async () => {
+		onPatch('/api/auth/profile', () => {
+			throw new MockApiError('Another user already uses that email', 409, 'email_in_use');
+		});
+
+		const { pinia } = seedAuth({ hasPasskey: true });
+		const router = testRouter();
+		await atRoute(router, '/settings');
+		const wrapper = mount(Settings, { global: { plugins: [pinia, router] } });
+		await flushPromises();
+
+		await wrapper.find('[data-testid="profile-email-input"]').setValue('taken@example.com');
+		await wrapper.find('[data-testid="profile-save"]').trigger('submit');
+		await flushPromises();
+
+		const error = wrapper.find('[data-testid="profile-error"]');
+		expect(error.exists()).toBe(true);
+		expect(error.text()).toContain('Another user already uses that email');
+		expect(wrapper.find('[data-testid="profile-success"]').exists()).toBe(false);
+		const store = useAuthStore(pinia);
+		expect(store.user?.email).toBe('dev@example.com');
 	});
 });
