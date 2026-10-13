@@ -67,19 +67,34 @@ export function validateWebhookUrl(
 		return { ok: false, reason: 'only https URLs are allowed' };
 	}
 	const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+	// The URL parser canonicalizes embedded dotted IPv4 to hex, so IPv4-mapped
+	// (`::ffff:7f00:1`) and deprecated IPv4-compatible (`::7f00:1`) forms only
+	// ever arrive as two trailing hex groups. Decode those 32 bits and apply
+	// the same IPv4 deny checks (mapped public passes, mapped private does not).
+	const embeddedV4 = /^::(?:(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(host);
+	let ipv4Host = host;
+	if (embeddedV4) {
+		const hi = Number.parseInt(embeddedV4[1], 16);
+		const lo = Number.parseInt(embeddedV4[2], 16);
+		ipv4Host = `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+	}
 	if (
 		host === 'localhost' ||
 		host.endsWith('.localhost') ||
 		host.endsWith('.local') ||
 		host.endsWith('.internal') ||
-		/^127\./.test(host) ||
-		/^0\./.test(host) ||
-		/^10\./.test(host) ||
-		/^192\.168\./.test(host) ||
-		/^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-		/^169\.254\./.test(host) ||
+		/^127\./.test(ipv4Host) ||
+		/^0\./.test(ipv4Host) ||
+		/^10\./.test(ipv4Host) ||
+		/^192\.168\./.test(ipv4Host) ||
+		/^172\.(1[6-9]|2\d|3[01])\./.test(ipv4Host) ||
+		/^169\.254\./.test(ipv4Host) ||
 		/^::1$/.test(host) ||
-		/^f[cd][0-9a-f]{2}:/.test(host)
+		/^f[cd][0-9a-f]{2}:/.test(host) ||
+		// Unspecified address (`::`) is treated as loopback by most stacks.
+		host === '::' ||
+		// IPv6 link-local fe80::/10 (fe80–febf).
+		/^fe[89ab]/.test(host)
 	) {
 		return { ok: false, reason: 'webhook host must not be a private or loopback address' };
 	}
