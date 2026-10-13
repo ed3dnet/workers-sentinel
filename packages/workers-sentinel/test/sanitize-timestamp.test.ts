@@ -14,7 +14,7 @@ describe('sanitizeEvent: non-string timestamps are replaced with receipt time', 
 	test('numeric timestamps become ISO strings near now', () => {
 		for (const bad of [1234, 1760000000, 1760000000.5, -1]) {
 			const before = Date.now();
-			const out = sanitizeEvent({ timestamp: bad } as SentryEvent);
+			const out = sanitizeEvent({ timestamp: bad } as unknown as SentryEvent);
 			expect(typeof out.timestamp, `timestamp ${bad}`).toBe('string');
 			const parsed = new Date(out.timestamp as string).getTime();
 			expect(Math.abs(parsed - before)).toBeLessThanOrEqual(60_000);
