@@ -197,8 +197,12 @@ function normalizeMessage(message: string): string {
 		message
 			// Remove UUIDs
 			.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
-			// Remove hex strings (likely IDs)
-			.replace(/\b[0-9a-f]{24,}\b/gi, '<id>')
+			// Remove hex strings (likely IDs). The lookahead requires at least
+			// one a-f letter: a pure-decimal run is a NUMBER, not a hex id, and
+			// must take the <num> path below regardless of length — otherwise
+			// the same template splits into different issues when an embedded
+			// decimal crosses 24 digits (e.g. BigInt error messages).
+			.replace(/\b(?=[0-9a-f]*[a-f])[0-9a-f]{24,}\b/gi, '<id>')
 			// Remove numbers (but keep error codes like "404")
 			.replace(/\b\d{6,}\b/g, '<num>')
 			// Remove timestamps
