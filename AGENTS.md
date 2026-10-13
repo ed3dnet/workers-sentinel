@@ -16,7 +16,8 @@ pnpm dev
 pnpm build
 
 # Deploy to Cloudflare
-pnpm deploy
+# (`run` is required: pnpm's built-in `deploy` command shadows the script)
+pnpm run deploy
 
 # Lint with Biome
 pnpm lint
@@ -310,7 +311,7 @@ Env vars: `SETUP_TOKEN` (first-registration gate), `CORS_ORIGINS` (dashboard API
 
 Known accepted limitations: the DO `http://internal/*` surface remains a zero-auth trust boundary (reachable only via service bindings, mitigated by uniform route-level checks); session tokens still live in localStorage (XSS-verified-negative + CSP backstop); no email infrastructure, so no self-service password reset (admin reset + forced change at next sign-in is the workflow); the audit log has no retention policy yet (low volume; a prune can be added later without migration pain).
 
-Tests: 372 across 36 files (`just test`; vitest 4 + `@cloudflare/vitest-plugin`, one shared workerd with shared storage — `maxWorkers: 1, isolate: false` — because files depend on globally-shared state like first-user-admin) + 3 WebAuthn origin-variant tests (`test:webauthn-origins`, own worker with `WEBAUTHN_ORIGINS` bound) + 31 dashboard component tests (`just test-dashboard`) + 16 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/the vitest configs — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters. The deterministic admin fixture lives in `test/utils.ts` (`getAdminPasskeySession()`): it registers/logs in a dedicated user, promotes it to admin via a **direct AuthState DO call** to the real `/admin/update-user` handler with a claimed `requestingUserRole` (the internal `http://internal/*` surface is service-binding-only and trusts the claimed role — the same direct-DO pattern `webauthn.test.ts` uses), then mints its passkey session through the real HTTP ceremonies; `createTestProject` creates via `POST /api/admin/projects` with the caller as assigned owner.
+Tests: 377 across 36 files (`just test`; vitest 4 + `@cloudflare/vitest-plugin`, one shared workerd with shared storage — `maxWorkers: 1, isolate: false` — because files depend on globally-shared state like first-user-admin) + 3 WebAuthn origin-variant tests (`test:webauthn-origins`, own worker with `WEBAUTHN_ORIGINS` bound) + 39 dashboard component tests (`just test-dashboard`) + 16 black-box integration tests (`just test-integration`; R2 and the fault-injection switch are simulated by miniflare from `wrangler.jsonc`/the vitest configs — the fault vocabulary is inert without the test-only `ATTACHMENT_FAULT_INJECTION` binding). Argon2 costs ~250ms CPU per hash — tests that repeatedly register/login carry raised timeouts; keep an eye on Workers CPU limits if you raise parameters. The deterministic admin fixture lives in `test/utils.ts` (`getAdminPasskeySession()`): it registers/logs in a dedicated user, promotes it to admin via a **direct AuthState DO call** to the real `/admin/update-user` handler with a claimed `requestingUserRole` (the internal `http://internal/*` surface is service-binding-only and trusts the claimed role — the same direct-DO pattern `webauthn.test.ts` uses), then mints its passkey session through the real HTTP ceremonies; `createTestProject` creates via `POST /api/admin/projects` with the caller as assigned owner.
 
 ## Polytoken harness sessions
 
