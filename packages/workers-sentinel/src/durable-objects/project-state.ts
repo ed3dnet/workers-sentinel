@@ -2922,6 +2922,18 @@ export class ProjectState extends DurableObject<Env> {
 					'$1$2=[Filtered]',
 				);
 			}
+			// SDKs that embed the query in request.url (python-style) instead of a
+			// separate query_string get the same scrub applied to the url's query
+			// portion — scheme, path, and non-secret params are preserved.
+			if (typeof request.url === 'string' && request.url.includes('?')) {
+				const queryStart = request.url.indexOf('?');
+				const base = request.url.slice(0, queryStart + 1);
+				const query = request.url.slice(queryStart + 1);
+				request.url = `${base}${query.replace(
+					/([&]?)([^?&=#]*?(?:secret|token|key|password|credential)[^?&=#]*)=([^?&]*)/gi,
+					'$1$2=[Filtered]',
+				)}`;
+			}
 		}
 
 		// Strip credentials from structured user data
