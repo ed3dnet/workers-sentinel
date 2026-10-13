@@ -2918,6 +2918,7 @@ export class ProjectState extends DurableObject<Env> {
 					cookies?: unknown;
 					env?: Record<string, string>;
 					query_string?: string;
+					url?: string;
 			  }
 			| undefined;
 		if (request) {
