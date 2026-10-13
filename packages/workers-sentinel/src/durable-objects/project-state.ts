@@ -3252,6 +3252,57 @@ export class ProjectState extends DurableObject<Env> {
 			);
 		}
 
+		// Migrate secondary issues' comments, activity, and release links to the
+		// primary BEFORE deletion: the schema's ON DELETE CASCADE would otherwise
+		// silently destroy user-authored triage notes and release associations.
+		this.sql.exec(
+			`UPDATE issue_comments SET issue_id = ? WHERE issue_id IN (${placeholders})`,
+			primaryIssueId,
+			...secondaryIds,
+		);
+		this.sql.exec(
+			`UPDATE issue_activity SET issue_id = ? WHERE issue_id IN (${placeholders})`,
+			primaryIssueId,
+			...secondaryIds,
+		);
+		const affectedReleases: string[] = [];
+		for (const row of this.sql
+			.exec(
+				`SELECT release_version, first_seen_in_release, event_count FROM release_issues WHERE issue_id IN (${placeholders})`,
+				...secondaryIds,
+			)
+			.toArray()) {
+			if (!affectedReleases.includes(row.release_version as string)) {
+				affectedReleases.push(row.release_version as string);
+			}
+			this.sql.exec(
+				`INSERT INTO release_issues (release_version, issue_id, first_seen_in_release, event_count)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT (release_version, issue_id) DO UPDATE SET
+				   event_count = event_count + excluded.event_count`,
+				row.release_version,
+				primaryIssueId,
+				row.first_seen_in_release,
+				row.event_count,
+			);
+		}
+		this.sql.exec(
+			`DELETE FROM release_issues WHERE issue_id IN (${placeholders})`,
+			...secondaryIds,
+		);
+		if (affectedReleases.length > 0) {
+			// releases.issue_count is a derived counter (bumped per new
+			// issue at ingest); recompute it from surviving links so
+			// merges do not leave it stale.
+			const releasePlaceholders = affectedReleases.map(() => '?').join(',');
+			this.sql.exec(
+				`UPDATE releases SET issue_count =
+					(SELECT COUNT(*) FROM release_issues WHERE release_issues.release_version = releases.version)
+				 WHERE version IN (${releasePlaceholders})`,
+				...affectedReleases,
+			);
+		}
+
 		// Delete secondary issues (CASCADE removes their stats, users, environments)
 		this.sql.exec(`DELETE FROM issues WHERE id IN (${placeholders})`, ...secondaryIds);
 
