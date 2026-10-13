@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { api } from '../api/client';
 import AttachmentList from '../components/AttachmentList.vue';
+import { renderMarkdown } from '../lib/markdown';
 import { type ResolvedFrame, resolveFrame } from '../lib/sourcemap-resolver';
 import { useAuthStore } from '../stores/auth';
 
@@ -42,6 +43,7 @@ interface Event {
 	platform: string;
 	environment?: string;
 	release?: string;
+	message?: string;
 	tags?: Record<string, string>;
 	user?: {
 		id?: string;
@@ -105,6 +107,27 @@ function handleClickOutside(event: MouseEvent) {
 const isSnoozed = computed(
 	() => issue.value?.snoozedUntil && new Date(issue.value.snoozedUntil) > new Date(),
 );
+
+/**
+ * The selected event's message — the exception value, or a message-only
+ * event's top-level message (same priority the ingest-side metadata
+ * extraction uses). The full text lives in the Message box; the page
+ * title carries only its first 80 characters.
+ */
+const eventMessage = computed(() => {
+	const event = selectedEvent.value;
+	if (!event) return '';
+	return event.exception?.values?.[0]?.value || event.message || '';
+});
+
+const renderedMessage = computed(() =>
+	eventMessage.value ? renderMarkdown(eventMessage.value) : '',
+);
+
+const titleValue = computed(() => {
+	const value = issue.value?.metadata.value ?? '';
+	return value.length > 80 ? `${value.slice(0, 80)}…` : value;
+});
 
 async function snoozeIssue(duration: string) {
 	if (!issue.value) return;
@@ -301,7 +324,7 @@ onBeforeUnmount(() => {
 
 				<h1 class="text-xl font-bold text-gray-900 dark:text-white mb-2">
 					<span :class="getLevelClass(issue.level)">{{ issue.metadata.type }}:</span>
-					{{ issue.metadata.value }}
+					{{ titleValue }}
 				</h1>
 
 				<p v-if="issue.culprit" class="text-sm text-gray-500">{{ issue.culprit }}</p>
@@ -428,6 +451,14 @@ onBeforeUnmount(() => {
 			<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 				<!-- Stack trace -->
 				<div class="lg:col-span-2 space-y-4">
+					<!-- Message (full, rendered as markdown; the title above carries only its first 80 chars) -->
+					<div v-if="renderedMessage" class="card" data-testid="issue-message">
+						<div class="p-4 border-b border-gray-200 dark:border-gray-700">
+							<h2 class="font-semibold text-gray-900 dark:text-white">Message</h2>
+						</div>
+						<div class="p-4 markdown-body text-sm" v-html="renderedMessage"></div>
+					</div>
+
 					<!-- Exception -->
 					<div class="card">
 						<div class="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
@@ -690,3 +721,114 @@ onBeforeUnmount(() => {
 		</div>
 	</div>
 </template>
+
+<style scoped>
+/*
+ * Rendered markdown (the event Message box). The v-html content does not
+ * receive the scoped attribute, hence the :deep() selectors. Sizes are
+ * deliberately modest — this is a message inside a card, not a document.
+ *
+ * The base color is explicit in both themes: nothing in the ancestor
+ * chain (body / .card) sets a text color, and without a declared
+ * `color-scheme` the UA default stays black even under a dark
+ * prefers-color-scheme — black on the card's dark background.
+ */
+.markdown-body {
+	color: #111827;
+}
+.markdown-body :deep(p),
+.markdown-body :deep(ul),
+.markdown-body :deep(ol),
+.markdown-body :deep(blockquote),
+.markdown-body :deep(table),
+.markdown-body :deep(pre) {
+	margin: 0.5rem 0;
+}
+.markdown-body :deep(:first-child) {
+	margin-top: 0;
+}
+.markdown-body :deep(:last-child) {
+	margin-bottom: 0;
+}
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4),
+.markdown-body :deep(h5),
+.markdown-body :deep(h6) {
+	font-size: 0.95rem;
+	font-weight: 600;
+	margin: 0.75rem 0 0.35rem;
+}
+.markdown-body :deep(ul) {
+	list-style: disc;
+	padding-left: 1.25rem;
+}
+.markdown-body :deep(ol) {
+	list-style: decimal;
+	padding-left: 1.25rem;
+}
+.markdown-body :deep(li) {
+	margin: 0.2rem 0;
+}
+.markdown-body :deep(code) {
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 0.8rem;
+	background: rgb(0 0 0 / 0.06);
+	padding: 0.1rem 0.3rem;
+	border-radius: 0.25rem;
+}
+.markdown-body :deep(pre) {
+	background: #1f2937;
+	color: #f3f4f6;
+	padding: 0.75rem 1rem;
+	border-radius: 0.5rem;
+	overflow-x: auto;
+}
+.markdown-body :deep(pre code) {
+	background: transparent;
+	padding: 0;
+	font-size: 0.75rem;
+}
+.markdown-body :deep(blockquote) {
+	border-left: 3px solid rgb(156 163 175 / 0.5);
+	padding-left: 0.75rem;
+	color: #6b7280;
+}
+.markdown-body :deep(a) {
+	color: #0284c7;
+	text-decoration: underline;
+}
+.markdown-body :deep(table) {
+	border-collapse: collapse;
+}
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+	border: 1px solid rgb(209 213 219 / 0.5);
+	padding: 0.25rem 0.5rem;
+	text-align: left;
+}
+.markdown-body :deep(hr) {
+	border-color: rgb(209 213 219 / 0.5);
+	margin: 0.75rem 0;
+}
+@media (prefers-color-scheme: dark) {
+	.markdown-body {
+		color: #f3f4f6;
+	}
+	.markdown-body :deep(code) {
+		background: rgb(255 255 255 / 0.1);
+	}
+	.markdown-body :deep(blockquote) {
+		color: #9ca3af;
+	}
+	.markdown-body :deep(a) {
+		color: #38bdf8;
+	}
+	.markdown-body :deep(th),
+	.markdown-body :deep(td),
+	.markdown-body :deep(hr) {
+		border-color: rgb(75 85 99 / 0.5);
+	}
+}
+</style>
