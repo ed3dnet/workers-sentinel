@@ -477,6 +477,7 @@ function serializeApi0Event(
 	rawEvent: Record<string, unknown>,
 	issueId: string,
 	project: Project,
+	receivedAt?: string | null,
 ): Record<string, unknown> {
 	const eventID = String(rawEvent.event_id ?? '');
 	const exceptionValue = (rawEvent.exception as { values?: Array<{ value?: string }> } | undefined)
@@ -497,7 +498,9 @@ function serializeApi0Event(
 		metadata: {},
 		tags: Object.entries(tags ?? {}).map(([key, value]) => ({ key, value: String(value) })),
 		dateCreated: timestamp,
-		dateReceived: timestamp,
+		// Receipt time when the DO provided it (server clock); the client
+		// timestamp is only the fallback — dateReceived must mean receipt.
+		dateReceived: receivedAt ?? timestamp,
 		user: rawEvent.user ?? null,
 		contexts: rawEvent.contexts ?? {},
 		sdk: rawEvent.sdk ?? null,
@@ -779,7 +782,12 @@ async function handleIssueDelete(c: AppContext) {
 async function resolveEvent(
 	c: AppContext,
 	eventId: string,
-): Promise<{ event: Record<string, unknown>; issueId: string; project: MemberProject } | null> {
+): Promise<{
+	event: Record<string, unknown>;
+	issueId: string;
+	receivedAt?: string;
+	project: MemberProject;
+} | null> {
 	const projects = await memberProjects(c);
 	for (const project of projects) {
 		const response = await projectStateFetch(c, project.id, '/event', { eventId });
@@ -787,8 +795,9 @@ async function resolveEvent(
 		const data = (await response.json()) as {
 			event: Record<string, unknown>;
 			issueId: string;
+			receivedAt?: string;
 		};
-		return { event: data.event, issueId: data.issueId, project };
+		return { event: data.event, issueId: data.issueId, receivedAt: data.receivedAt, project };
 	}
 	return null;
 }
@@ -801,7 +810,12 @@ async function handleEventIdResolve(c: AppContext) {
 		return c.json({ detail: 'not found' }, 404);
 	}
 	return c.json({
-		event: serializeApi0Event(resolved.event, resolved.issueId, resolved.project),
+		event: serializeApi0Event(
+			resolved.event,
+			resolved.issueId,
+			resolved.project,
+			resolved.receivedAt,
+		),
 		eventId,
 		groupId: resolved.issueId,
 		organizationSlug: SYNTHETIC_ORG.slug,
@@ -816,8 +830,13 @@ async function fetchIssueEvents(
 	issueId: string,
 	needed: number,
 	order: 'asc' | 'desc' = 'desc',
-): Promise<{ events: Array<Record<string, unknown>>; exhausted: boolean } | null> {
+): Promise<{
+	events: Array<Record<string, unknown>>;
+	receivedAt: string[];
+	exhausted: boolean;
+} | null> {
 	const collected: Array<Record<string, unknown>> = [];
+	const collectedReceivedAt: string[] = [];
 	let cursor: string | undefined;
 	let exhausted = false;
 	for (let page = 0; page < ISSUE_PAGES_MAX && collected.length <= needed; page++) {
@@ -830,10 +849,12 @@ async function fetchIssueEvents(
 		if (!response.ok) return null;
 		const data = (await response.json()) as {
 			events?: Array<Record<string, unknown>>;
+			receivedAt?: string[];
 			nextCursor?: string;
 			hasMore?: boolean;
 		};
 		collected.push(...(data.events ?? []));
+		if (data.receivedAt) collectedReceivedAt.push(...data.receivedAt);
 		if (data.hasMore !== true || data.nextCursor === undefined || data.nextCursor === null) {
 			exhausted = true;
 			break;
@@ -843,7 +864,7 @@ async function fetchIssueEvents(
 	// An issue always has ≥1 event; an empty page means the issue does not
 	// live in this project (the DO treats the id as a filter).
 	if (collected.length === 0) return null;
-	return { events: collected, exhausted };
+	return { events: collected, receivedAt: collectedReceivedAt, exhausted };
 }
 
 /** Issue events list (org + project scoped paths share this). */
@@ -871,8 +892,11 @@ async function handleIssueEvents(c: AppContext) {
 		// report their exact end; the walk cap marks the horizon there.
 		const total = fetched.events.length;
 		const window = fetched.events.slice(offset, offset + limit);
+		const windowReceived = fetched.receivedAt.slice(offset, offset + limit);
 		c.header('Link', buildLinkHeader(c.req.url, offset, limit, total));
-		return c.json(window.map((event) => serializeApi0Event(event, issueId, project)));
+		return c.json(
+			window.map((event, i) => serializeApi0Event(event, issueId, project, windowReceived[i])),
+		);
 	}
 	return c.json({ detail: 'not found' }, 404);
 }
@@ -902,9 +926,10 @@ async function handleIssueEventDetail(c: AppContext) {
 			const data = (await response.json()) as {
 				event: Record<string, unknown>;
 				issueId: string;
+				receivedAt?: string;
 			};
 			if (data.issueId !== issueId) continue;
-			return c.json(serializeApi0Event(data.event, issueId, project));
+			return c.json(serializeApi0Event(data.event, issueId, project, data.receivedAt));
 		}
 		return c.json({ detail: 'not found' }, 404);
 	}
@@ -915,7 +940,7 @@ async function handleIssueEventDetail(c: AppContext) {
 		const fetched = await fetchIssueEvents(c, project.id, issueId, 1, order);
 		if (!fetched) continue;
 		if (fetched.events[0]) {
-			return c.json(serializeApi0Event(fetched.events[0], issueId, project));
+			return c.json(serializeApi0Event(fetched.events[0], issueId, project, fetched.receivedAt[0]));
 		}
 	}
 	return c.json({ detail: 'not found' }, 404);
@@ -936,8 +961,12 @@ async function handleProjectEventDetail(c: AppContext) {
 	if (!response.ok) {
 		return c.json({ detail: 'not found' }, 404);
 	}
-	const data = (await response.json()) as { event: Record<string, unknown>; issueId: string };
-	return c.json(serializeApi0Event(data.event, data.issueId, project));
+	const data = (await response.json()) as {
+		event: Record<string, unknown>;
+		issueId: string;
+		receivedAt?: string;
+	};
+	return c.json(serializeApi0Event(data.event, data.issueId, project, data.receivedAt));
 }
 
 /** GET /api/0/organizations/ */

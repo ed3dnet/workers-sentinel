@@ -1513,6 +1513,9 @@ export class ProjectState extends DurableObject<Env> {
 
 		return this.jsonResponse({
 			events,
+			// Receipt times parallel to `events` (the stored event JSON carries
+			// only the client timestamp).
+			receivedAt: pageRows.map((row) => String(row.received_at)),
 			nextCursor,
 			hasMore,
 		});
@@ -1531,6 +1534,9 @@ export class ProjectState extends DurableObject<Env> {
 		return this.jsonResponse({
 			event: JSON.parse(row.data as string),
 			issueId: row.issue_id,
+			// Receipt time (server clock) — the event JSON itself only carries the
+			// client timestamp; serializers need the real receipt time separately.
+			receivedAt: String(row.received_at),
 		});
 	}
 
