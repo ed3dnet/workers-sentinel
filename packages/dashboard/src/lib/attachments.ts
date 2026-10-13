@@ -209,7 +209,10 @@ export async function decompressCapped(
 		let truncated = false;
 		const decoder = new ZstdDecompressor((data: Uint8Array) => {
 			if (total >= cap) {
-				truncated = true;
+				// fzstd may invoke ondata once more (empty/trailing buffer) after
+				// the final content chunk; that is not a truncation. Only bytes
+				// actually arriving at an exhausted cap mean content was dropped.
+				if (data.length > 0) truncated = true;
 				throw new PreviewCapError();
 			}
 			const take = Math.min(data.length, cap - total);
