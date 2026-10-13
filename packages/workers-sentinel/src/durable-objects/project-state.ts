@@ -1809,11 +1809,19 @@ export class ProjectState extends DurableObject<Env> {
 		let sql = 'SELECT * FROM releases WHERE 1=1';
 
 		if (cursor) {
-			sql += ' AND last_seen < ?';
-			params.push(cursor);
+			// Composite keyset cursor `last_seen|version` (the repo-wide keyset
+			// convention: sort field with an id tie-break) so releases sharing a
+			// last_seen millisecond are never skipped at a page boundary. Parsed
+			// with lastIndexOf, mirroring the issues and issue-events handlers: a
+			// cursor without a delimiter degrades to an empty tie-break value.
+			const splitAt = cursor.lastIndexOf('|');
+			const cursorValue = splitAt === -1 ? cursor : cursor.slice(0, splitAt);
+			const cursorVersion = splitAt === -1 ? '' : cursor.slice(splitAt + 1);
+			sql += ' AND (last_seen < ? OR (last_seen = ? AND version < ?))';
+			params.push(cursorValue, cursorValue, cursorVersion);
 		}
 
-		sql += ' ORDER BY last_seen DESC LIMIT ?';
+		sql += ' ORDER BY last_seen DESC, version DESC LIMIT ?';
 		params.push(pageLimit + 1);
 
 		const rows = this.sql.exec(sql, ...params).toArray();
@@ -1827,8 +1835,9 @@ export class ProjectState extends DurableObject<Env> {
 			newIssueCount: row.new_issue_count as number,
 		}));
 
+		const lastRelease = releases.length > 0 ? releases[releases.length - 1] : undefined;
 		const nextCursor =
-			hasMore && releases.length > 0 ? releases[releases.length - 1].lastSeen : undefined;
+			hasMore && lastRelease ? `${lastRelease.lastSeen}|${lastRelease.version}` : undefined;
 
 		return this.jsonResponse({ releases, nextCursor, hasMore });
 	}
