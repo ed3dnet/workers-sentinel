@@ -197,6 +197,12 @@ function normalizeMessage(message: string): string {
 		message
 			// Remove UUIDs
 			.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
+			// Remove email addresses. Runs BEFORE the hex/number rules so a
+			// digit-heavy local part (408395@corp.example) is an email, not a bare
+			// id/number, and the lookbehind (instead of \b) lets a local part start
+			// with any character the address grammar allows (% escapes, . + -
+			// aliases) without leaving an unnormalized prefix behind.
+			.replace(/(?<![\w.%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '<email>')
 			// Remove hex strings (likely IDs). The lookahead requires at least
 			// one a-f letter: a pure-decimal run is a NUMBER, not a hex id, and
 			// must take the <num> path below regardless of length — otherwise
@@ -209,8 +215,6 @@ function normalizeMessage(message: string): string {
 			.replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/g, '<timestamp>')
 			// Remove IP addresses
 			.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, '<ip>')
-			// Remove email addresses
-			.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '<email>')
 			// Normalize whitespace
 			.replace(/\s+/g, ' ')
 			.trim()
