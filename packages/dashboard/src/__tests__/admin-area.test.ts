@@ -1,6 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils';
 import { describe, expect, it, vi } from 'vitest';
 import router from '../router';
+import { useProjectsStore } from '../stores/projects';
 import AdminAudit from '../views/admin/AdminAudit.vue';
 import AdminProjects from '../views/admin/AdminProjects.vue';
 import AdminSettings from '../views/admin/AdminSettings.vue';
@@ -9,7 +10,16 @@ import Layout from '../views/Layout.vue';
 import ProjectSettings from '../views/ProjectSettings.vue';
 import Projects from '../views/Projects.vue';
 import { atRoute, seedAuth, testRouter } from './helpers';
-import { MockApiError, mockApi, onDelete, onGet, onPost, onPut, resetMocks } from './mocks';
+import {
+	MockApiError,
+	mockApi,
+	onDelete,
+	onGet,
+	onPatch,
+	onPost,
+	onPut,
+	resetMocks,
+} from './mocks';
 
 vi.mock('../api/client', () =>
 	import('./mocks').then((m) => ({ api: m.api, ApiError: m.ApiError })),
@@ -177,6 +187,48 @@ describe('admin users page creates users with validation and surfaces owned-proj
 		expect(row.text()).toContain('member@example.com');
 	});
 
+	it('edit dialog sends only the changed fields', async () => {
+		// A user whose email is a format-free identifier (self-service
+		// profile edits allow them); the admin endpoint pattern-validates
+		// emails, so re-sending the unchanged identifier would reject the
+		// whole request and block unrelated edits
+		const formatFreeUser = {
+			...mockAdminUser,
+			id: 'user-3',
+			email: 'no-at-identifier',
+			name: 'Format Free User',
+		};
+		onGet('/api/admin/users', () => ({ users: [formatFreeUser] }));
+		onPatch('/api/admin/users/user-3', () => ({
+			user: { ...formatFreeUser, name: 'Renamed Free' },
+		}));
+		const wrapper = await mountUsersPage();
+
+		// A no-change save closes the dialog without a request
+		await wrapper.find('[data-testid="admin-user-edit-no-at-identifier"]').trigger('click');
+		await wrapper.find('[data-testid="admin-edit-submit"]').trigger('click');
+		await flushPromises();
+		expect(
+			mockApi.calls.filter(
+				(call) => call.method === 'patch' && call.url === '/api/admin/users/user-3',
+			),
+		).toHaveLength(0);
+		expect(wrapper.find('[data-testid="admin-edit-submit"]').exists()).toBe(false);
+
+		// A name-only edit sends only the name; the stored identifier is
+		// never re-sent
+		await wrapper.find('[data-testid="admin-user-edit-no-at-identifier"]').trigger('click');
+		await wrapper.find('[data-testid="admin-edit-name"]').setValue('Renamed Free');
+		await wrapper.find('[data-testid="admin-edit-submit"]').trigger('click');
+		await flushPromises();
+
+		const patchCalls = mockApi.calls.filter(
+			(call) => call.method === 'patch' && call.url === '/api/admin/users/user-3',
+		);
+		expect(patchCalls).toHaveLength(1);
+		expect(patchCalls[0]?.body).toEqual({ name: 'Renamed Free' });
+	});
+
 	it('creates users with local validation and the admin checkbox', async () => {
 		onGet('/api/admin/users', () => ({ users: [mockAdminUser] }));
 		onPost('/api/admin/users', () => ({ user: mockAdminUser }));
@@ -267,7 +319,12 @@ describe('admin projects page assigns owner at creation and reassigns with old o
 		},
 	];
 
+	// What the sidebar nav's GET /api/projects returns; tests mutate it to
+	// simulate the refreshed list after a project mutation.
+	let navProjects: Array<{ id: string; name: string; slug: string; platform: string }> = [];
+
 	async function mountProjectsPage() {
+		onGet('/api/projects', () => ({ projects: navProjects }));
 		const { pinia } = seedAuth({ role: 'admin', sessionAuthMethod: 'passkey' });
 		const componentRouter = testRouter();
 		await atRoute(componentRouter, '/admin/projects');
@@ -354,6 +411,39 @@ describe('admin projects page assigns owner at creation and reassigns with old o
 		expect(mockApi.calls.filter((call) => call.url === '/api/admin/projects/proj-1')).toHaveLength(
 			1,
 		);
+	});
+
+	it('refreshes the sidebar project list after rename and delete', async () => {
+		navProjects = [
+			{ id: 'proj-1', name: 'CLI Feedback', slug: 'cli-feedback', platform: 'javascript' },
+		];
+		onGet('/api/admin/projects', () => ({ projects: adminProjects }));
+		onGet('/api/admin/users', () => ({ users: [] }));
+		onPatch('/api/admin/projects/proj-1', () => ({
+			project: { ...adminProjects[0], name: 'Renamed' },
+		}));
+		onDelete('/api/admin/projects/proj-1', () => ({ success: true }));
+		const wrapper = await mountProjectsPage();
+
+		// The nav's project store (what the left-hand sidebar renders)
+		const store = useProjectsStore();
+		expect(store.projects).toEqual([]);
+
+		// Rename → the store re-fetches and reflects the new name
+		navProjects = [{ id: 'proj-1', name: 'Renamed', slug: 'cli-feedback', platform: 'javascript' }];
+		await wrapper.find('[data-testid="admin-project-rename-cli-feedback"]').trigger('click');
+		await wrapper.find('[data-testid="admin-project-rename-input"]').setValue('Renamed');
+		await wrapper.find('[data-testid="admin-project-rename-submit"]').trigger('click');
+		await flushPromises();
+		expect(store.projects.map((p) => p.name)).toEqual(['Renamed']);
+
+		// Delete → the project is gone from the store
+		navProjects = [];
+		await wrapper.find('[data-testid="admin-project-delete-cli-feedback"]').trigger('click');
+		await wrapper.find('[data-testid="admin-project-delete-confirm"]').setValue('CLI Feedback');
+		await wrapper.find('[data-testid="admin-project-delete-submit"]').trigger('click');
+		await flushPromises();
+		expect(store.projects).toEqual([]);
 	});
 });
 

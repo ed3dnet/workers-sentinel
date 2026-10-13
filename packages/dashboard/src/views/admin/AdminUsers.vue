@@ -115,15 +115,27 @@ function openEdit(user: AdminUser) {
 
 async function saveEdit() {
 	if (!editing.value) return;
+	const user = editing.value;
+	// Send only the changed fields: an unchanged email must never be
+	// re-sent — the admin endpoint pattern-validates emails, so re-sending
+	// a stored format-free identifier (self-service profile edits allow
+	// them) would reject the whole request and block unrelated edits. The
+	// DO applies any subset atomically and treats unchanged fields as
+	// no-ops, so a partial send is semantically identical.
+	const updates: { name?: string; email?: string; role?: string; disabled?: boolean } = {};
+	if (editForm.value.name !== user.name) updates.name = editForm.value.name;
+	if (editForm.value.email !== user.email) updates.email = editForm.value.email;
+	if (editForm.value.role !== user.role) updates.role = editForm.value.role;
+	if (editForm.value.disabled !== user.disabled) updates.disabled = editForm.value.disabled;
+	if (Object.keys(updates).length === 0) {
+		// Nothing changed — close without a request
+		editing.value = null;
+		return;
+	}
 	savingEdit.value = true;
 	editError.value = null;
 	try {
-		const response = await api.patch<{ user: AdminUser }>(`/api/admin/users/${editing.value.id}`, {
-			name: editForm.value.name,
-			email: editForm.value.email,
-			role: editForm.value.role,
-			disabled: editForm.value.disabled,
-		});
+		const response = await api.patch<{ user: AdminUser }>(`/api/admin/users/${user.id}`, updates);
 		editing.value = null;
 		await loadUsers();
 		// Keep a handle on the updated row (not strictly needed; loadUsers refreshes)

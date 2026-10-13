@@ -27,10 +27,6 @@ export const useProjectsStore = defineStore('projects', () => {
 		}
 	}
 
-	function addProject(project: Project) {
-		projects.value = [...projects.value, project];
-	}
-
 	function removeProject(slug: string) {
 		projects.value = projects.value.filter((p) => p.slug !== slug);
 	}
@@ -45,7 +41,6 @@ export const useProjectsStore = defineStore('projects', () => {
 		loading,
 		initialized,
 		loadProjects,
-		addProject,
 		removeProject,
 		reset,
 	};

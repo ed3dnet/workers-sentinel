@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { api } from '../../api/client';
+import { useProjectsStore } from '../../stores/projects';
 
 interface AdminUser {
 	id: string;
@@ -88,6 +89,20 @@ async function load() {
 	}
 }
 
+const projectsStore = useProjectsStore();
+
+/**
+ * Refresh the admin list and the sidebar nav's project list together.
+ * Every mutation here can change the signed-in user's accessible
+ * projects (create with self as owner, rename, delete, owner/member
+ * changes touching the acting admin), and the left-hand nav reads the
+ * shared projects store — which otherwise stays stale after its initial
+ * load until a full page reload.
+ */
+async function refreshLists() {
+	await Promise.all([load(), projectsStore.loadProjects()]);
+}
+
 onMounted(load);
 
 function openCreate() {
@@ -111,7 +126,7 @@ async function createProject() {
 			ownerId: createForm.value.ownerId,
 		});
 		createdDsn.value = response.dsn;
-		await load();
+		await refreshLists();
 	} catch (err) {
 		createError.value = err instanceof Error ? err.message : 'Failed to create project';
 	} finally {
@@ -134,7 +149,7 @@ async function renameProject() {
 			name: renameName.value,
 		});
 		renaming.value = null;
-		await load();
+		await refreshLists();
 	} catch (err) {
 		renameError.value = err instanceof Error ? err.message : 'Failed to rename project';
 	} finally {
@@ -157,7 +172,7 @@ async function reassignOwner() {
 			userId: reassignOwnerId.value,
 		});
 		reassigning.value = null;
-		await load();
+		await refreshLists();
 	} catch (err) {
 		reassignError.value = err instanceof Error ? err.message : 'Failed to reassign owner';
 	} finally {
@@ -202,7 +217,7 @@ async function addMember() {
 		newMemberEmail.value = '';
 		newMemberRole.value = 'member';
 		await loadMembers();
-		await load();
+		await refreshLists();
 	} catch (err) {
 		membersError.value = err instanceof Error ? err.message : 'Failed to add member';
 	} finally {
@@ -229,7 +244,7 @@ async function removeMember(member: ProjectMember) {
 	try {
 		await api.delete(`/api/admin/projects/${membersProject.value.id}/members/${member.userId}`);
 		await loadMembers();
-		await load();
+		await refreshLists();
 	} catch (err) {
 		membersError.value = err instanceof Error ? err.message : 'Failed to remove member';
 	}
@@ -248,7 +263,7 @@ async function deleteProject() {
 	try {
 		await api.delete(`/api/admin/projects/${deleting.value.id}`);
 		deleting.value = null;
-		await load();
+		await refreshLists();
 	} catch (err) {
 		deleteError.value = err instanceof Error ? err.message : 'Failed to delete project';
 	} finally {
