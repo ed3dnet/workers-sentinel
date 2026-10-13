@@ -2878,18 +2878,23 @@ export class ProjectState extends DurableObject<Env> {
 
 	/** Header names whose values are removed from stored events (case-insensitive). */
 	private getScrubHeaders(): string[] {
+		let configured: string[] = [];
 		try {
 			const rows = this.sql
 				.exec("SELECT value FROM settings WHERE key = 'scrub_headers'")
 				.toArray();
 			if (rows.length > 0) {
 				const parsed = JSON.parse(rows[0].value as string);
-				if (Array.isArray(parsed)) return parsed.filter((e) => typeof e === 'string');
+				if (Array.isArray(parsed)) configured = parsed.filter((e) => typeof e === 'string');
 			}
 		} catch {
 			// Fall through to defaults
 		}
-		return [...DEFAULT_SCRUB_HEADERS];
+		// Union semantics: a project's scrubHeaders list can only ADD entries.
+		// The default sensitive headers are the floor and are never removed —
+		// otherwise one settings change would silently disable scrubbing for
+		// authorization, cookies, and the rest of the default list.
+		return [...new Set([...DEFAULT_SCRUB_HEADERS, ...configured])];
 	}
 
 	/**
