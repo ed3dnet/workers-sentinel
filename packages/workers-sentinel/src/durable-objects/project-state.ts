@@ -3140,10 +3140,16 @@ export class ProjectState extends DurableObject<Env> {
 	}
 
 	private async handleMergeIssues(request: Request): Promise<Response> {
-		const { primaryIssueId, issueIds } = (await request.json()) as {
+		const { primaryIssueId, issueIds: rawIssueIds } = (await request.json()) as {
 			primaryIssueId: string;
 			issueIds: string[];
 		};
+
+		// Duplicate ids in the merge list are not an error — a client resending
+		// an id or building the list from overlapping selections still refers to
+		// issues that exist. Dedupe once, up front, so both the bound check and
+		// the existence check operate on unique ids.
+		const issueIds = Array.isArray(rawIssueIds) ? [...new Set(rawIssueIds)] : rawIssueIds;
 
 		// Bound the merge list: an unbounded array means unbounded SQL
 		// statements and DO CPU time per request (bulk-update caps at 100)
@@ -3162,7 +3168,7 @@ export class ProjectState extends DurableObject<Env> {
 			return this.jsonResponse({ error: 'primary_issue_not_found' }, 404);
 		}
 
-		// Filter out primary from merge list
+		// Filter out primary from merge list (already deduped above)
 		const secondaryIds = issueIds.filter((id) => id !== primaryIssueId);
 		if (secondaryIds.length === 0) {
 			return this.jsonResponse({ error: 'no_issues_to_merge' }, 400);
