@@ -241,8 +241,12 @@ The Sentry-compatible API under `/api/0` — the primary surface for agentic con
 
 - `GET /api/0/organizations/` — the synthetic organization (`id`, `slug`, `name`, `status`).
 - `GET /api/0/organizations/{org}/projects/` — the caller's member projects (Sentry Project serializer subset: `id`, `slug`, `name`, `platform`, `dateCreated`, flags). `?query=` filters by name/slug; `per_page`/`cursor` paginate.
+- `GET /api/0/projects/{org}/{project}/` — project detail: the same serializer as one list entry. `{project}` resolves by slug or id among the caller's member projects; anything else → `404`. (The Sentry MCP's `search_issues` with a project calls this first.)
+- `GET /api/0/auth/` — the authenticated user (session or `wst_` token owner), Sentry's DetailedUser subset: `id`, `name`, `username` (= email), `email`, `dateJoined`, `isSuperuser` (instance admin), `emails`, plus fixed `isActive`/`has2fa`/`avatar` values. Backs the MCP's `whoami`.
 
 ### Issues
+
+Every `…/issues/{issue_id}/…` route matches the id **case-insensitively** (ids are stored as lowercase UUIDs; the Sentry MCP uppercases the ids it is given because it treats them as short IDs).
 
 - `GET /api/0/organizations/{org}/issues/` and `GET /api/0/projects/{org}/{project}/issues/` — list of Sentry Group objects. `?query=` supports `is:unresolved` (default), `is:resolved`, `is:ignored`; an explicit empty `query=` means all statuses. `sort`: `date` (default), `new`, `freq`, `user`. `limit` (1..100, default 25), `cursor` (Link header). Org lists accept repeatable `?project=` filters (slug or id; `-1` = all).
 - `GET /api/0/organizations/{org}/issues/{issue_id}/` (alias `GET /api/0/issues/{issue_id}/`) — detail: the Group plus `activity`, `seenBy`, `participants`, `tags` (currently zero/empty), `firstRelease`/`lastRelease`, and `stats["24h"]` from the stored hourly series.
@@ -258,13 +262,16 @@ Group serializer fields: `id` (UUID string), `shortId` (null), `shareId` (null),
 - `GET …/issues/{issue_id}/events/{event_id}/` (org + project paths) — `{event_id}` may be a concrete 32-hex id, `latest`, or `oldest`.
 - `GET /api/0/projects/{org}/{project}/events/{event_id}/` — project event detail.
 
-Event serializer subset: `id`/`eventID` (32-hex), `groupID`, `projectID`, `message`, `title`, `culprit`, `platform`, `type`, `metadata`, `tags [{key,value}]`, `dateCreated`/`dateReceived`, `user`, `contexts`, `sdk`, `environment`, `release`, `fingerprint`, `entries` ([]), `occurrence`, `previousEventID`/`nextEventID` (null).
+Event serializer subset: `id`/`eventID` (32-hex), `groupID`, `projectID`, `message`, `title`, `culprit`, `platform`, `type`, `metadata`, `tags [{key,value}]`, `dateCreated`/`dateReceived`, `user`, `contexts`, `sdk`, `environment`, `release` (a Release object `{version, shortVersion, …}` with Sentry's empty values for the rest, or `null` — never the bare string), `fingerprint`, `entries`, `occurrence`, `previousEventID`/`nextEventID` (null).
 
-### Comments (notes)
+`entries` is built from the stored raw event by `src/lib/sentry-entries.ts`, in Sentry's order and shapes: `exception` (`values[]` with `type`, `value`, `module`, `mechanism`, `stacktrace`), `stacktrace` (event-level), `threads` (`values[]` with `id`, `name`, `current`, `crashed`, `stacktrace`), `message` (`formatted` from `logentry` or `message`), `breadcrumbs` (`type` default `default`, `level` default `info`, ISO `timestamp` even when the SDK sent unix seconds), and `request` (`url` without query/fragment, `query`/`headers`/`cookies` as sorted `[key, value]` pairs, `inferredContentType`). Frames are Sentry-serialized: snake_case SDK fields become `lineNo`, `colNo`, `absPath`, `inApp` (default `false`), and `pre_context`/`context_line`/`post_context` become `context: [[lineNo, text], …]`. Interfaces that are missing or malformed are left out, and malformed values become `null` instead of being echoed back. Source maps are not applied here; frames are what the SDK sent.
 
-- `GET /api/0/organizations/{org}/issues/{issue_id}/comments/` — array of `{id, issueId, projectId, text, data, dateCreated, user {id,name,username}}`.
-- `POST` the same path with `{"text": "…"}` → `201` with the created note.
-- `DELETE …/comments/{comment_id}/` → `204` (authors only; others get `403`).
+### Notes (comments) and activity
+
+- `GET /api/0/organizations/{org}/issues/{issue_id}/notes/` (Sentry's name; `…/comments/` is an alias over the same store) — array of `{id, type: "note", issueId, projectId, text, data: {text}, dateCreated, user {id,name,username}}`. Sentry clients read the text from `data.text`; the top-level `text` stays for older consumers.
+- `POST` the same paths with `{"text": "…"}` → `201` with the created note.
+- `DELETE …/notes/{note_id}/` (or `…/comments/{id}/`) → `204` (authors only; others get `403`).
+- `GET /api/0/organizations/{org}/issues/{issue_id}/activities/` — `{"activity": [...]}` newest first, from the stored issue activity (walked up to 1000 rows): comments as `note` entries (id = note id, `data.text`), status changes as `set_resolved` / `set_unresolved` / `set_ignored` (`data: {}`), system-made changes with `user: null`, closed by a synthetic `first_seen` entry at the issue's `firstSeen`.
 
 ### Attachments
 
@@ -277,7 +284,7 @@ The dashboard renders attachments on the issue and event views with inline previ
 
 - Non-2xx responses on this namespace use `{"detail": …}` (a namespace-local translator rewrites the native `{error[, message]}` shape, including auth 401s; unexpected non-JSON failures become a generic detail body). Unknown routes → `404 {"detail":"not found"}`; anonymous probes → 401. `OPTIONS /api/0/*` still answers the global bare 204 preflight. A session (or API token) whose account owes a forced password change receives `403 {"detail":"password_change_required"}` (sessions) / `401 {"detail":"password_change_required"}` (API tokens) until the password is changed; unflagged credentials are unaffected.
 - Cursor format `{id}:{offset}:{isPrev}` (exactly three segments; only the offset is honored; malformed → 0).
-- Deviations from Sentry (single-tenant constraints, deliberate): synthetic `sentinel` organization (any org segment accepted); UUID issue/event ids where Sentry serializes numeric ids as strings; `shortId` null; token scopes not modeled (any valid token with membership passes); `assignedTo` accepted but ignored (no assignment store); `numComments` is a placeholder `0`; stats carry an empty series in lists and the 7-day hourly series under the requested period key in detail; issue and event lists walk DO keyset pages and expose at most the first 1000 rows per project (Link marks that horizon exhausted; rows beyond it are not exposed); issue/event search grammar supports only `is:` tokens (the first recognized token wins); `resolvedInNextRelease`→`resolved` and `muted`→`ignored` mappings; DELETE is immediate but answers 202; the Event serializer is a subset; org-scoped lookups fan out across the caller's member projects.
+- Deviations from Sentry (single-tenant constraints, deliberate): synthetic `sentinel` organization (any org segment accepted); UUID issue/event ids where Sentry serializes numeric ids as strings; `shortId` null; token scopes not modeled (any valid token with membership passes); `assignedTo` accepted but ignored (no assignment store); `numComments` is a placeholder `0`; stats carry an empty series in lists and the 7-day hourly series under the requested period key in detail; issue and event lists walk DO keyset pages and expose at most the first 1000 rows per project (Link marks that horizon exhausted; rows beyond it are not exposed); no Discover (`/organizations/{org}/events/`), releases, teams or keys endpoints; issue/event search grammar supports only `is:` tokens (the first recognized token wins); `resolvedInNextRelease`→`resolved` and `muted`→`ignored` mappings; DELETE is immediate but answers 202; the Event serializer is a subset; org-scoped lookups fan out across the caller's member projects.
 
 ## Git hooks (lefthook)
 

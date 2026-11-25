@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { createMiddleware } from 'hono/factory';
 import type { AppContext } from '../lib/project-access';
+import { serializeEventEntries } from '../lib/sentry-entries';
 import type { AuthContext, Env, Project } from '../types';
 import { contentDisposition, safeContentType } from './attachments';
 
@@ -472,6 +473,41 @@ function statsSeries(stats?: Array<{ bucket: string; count: number }>): Array<[n
 		.sort((a, b) => a[0] - b[0]);
 }
 
+/**
+ * The event's `release` as Sentry serializes it: a Release object or null —
+ * never the bare version string the SDK sent (the official MCP server's
+ * schema rejects a string). Only the version is known per event; the
+ * remaining Release fields carry Sentry's empty values.
+ */
+function serializeEventRelease(raw: unknown): Record<string, unknown> | null {
+	const version =
+		typeof raw === 'string'
+			? raw
+			: raw !== null &&
+					typeof raw === 'object' &&
+					typeof (raw as { version?: unknown }).version === 'string'
+				? (raw as { version: string }).version
+				: '';
+	if (version.trim() === '') return null;
+	return {
+		version,
+		shortVersion: version,
+		versionInfo: null,
+		ref: null,
+		url: null,
+		dateCreated: null,
+		dateReleased: null,
+		data: {},
+		newGroups: 0,
+		commitCount: 0,
+		lastCommit: null,
+		deployCount: 0,
+		lastDeploy: null,
+		authors: [],
+		projects: [],
+	};
+}
+
 /** Sentry Event serializer subset (fields agents rely on for triage). */
 function serializeApi0Event(
 	rawEvent: Record<string, unknown>,
@@ -505,9 +541,9 @@ function serializeApi0Event(
 		contexts: rawEvent.contexts ?? {},
 		sdk: rawEvent.sdk ?? null,
 		environment: rawEvent.environment ?? null,
-		release: rawEvent.release ?? null,
+		release: serializeEventRelease(rawEvent.release),
 		fingerprint: rawEvent.fingerprint ?? null,
-		entries: [],
+		entries: serializeEventEntries(rawEvent),
 		occurrence: null,
 		previousEventID: null,
 		nextEventID: null,
@@ -680,6 +716,16 @@ function pageLimitOf(c: AppContext, fallback = 25): number {
 }
 
 /**
+ * The `{issue_id}` path segment, lowercased. Issue ids are lowercase UUIDs
+ * (crypto.randomUUID), but Sentry clients may change the case: the official
+ * MCP server uppercases ids it takes for short IDs (`PROJ-123`), so a
+ * case-sensitive match would 404 on `6C04D875-…`.
+ */
+function issueIdParam(c: AppContext): string {
+	return c.req.param('issueId').toLowerCase();
+}
+
+/**
  * Resolve an issue id across the caller's member projects (single-tenant
  * fan-out; early exit on first hit). Unknown → null.
  */
@@ -706,7 +752,7 @@ async function resolveIssue(
 
 /** GET issue detail (org-scoped path + the /issues/{id}/ alias). */
 async function handleIssueDetail(c: AppContext) {
-	const resolved = await resolveIssue(c, c.req.param('issueId'));
+	const resolved = await resolveIssue(c, issueIdParam(c));
 	if (!resolved) {
 		return c.json({ detail: 'not found' }, 404);
 	}
@@ -729,7 +775,7 @@ const STATUS_MAP: Record<string, string> = {
 
 /** PUT issue update: status triage (resolve / reopen / ignore). */
 async function handleIssueUpdate(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const body = (await c.req.json().catch(() => null)) as { status?: unknown } | null;
 	if (body === null || typeof body !== 'object' || Array.isArray(body)) {
 		return c.json({ detail: 'request body must be a JSON object' }, 400);
@@ -766,7 +812,7 @@ async function handleIssueUpdate(c: AppContext) {
 
 /** DELETE issue: deletion is immediate here; 202 matches Sentry's contract. */
 async function handleIssueDelete(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const resolved = await resolveIssue(c, issueId);
 	if (!resolved) {
 		return c.json({ detail: 'not found' }, 404);
@@ -869,7 +915,7 @@ async function fetchIssueEvents(
 
 /** Issue events list (org + project scoped paths share this). */
 async function handleIssueEvents(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const projectParam = 'project' in c.req.param() ? c.req.param('project') : undefined;
 	let target: MemberProject | null = null;
 	if (projectParam !== undefined) {
@@ -903,7 +949,7 @@ async function handleIssueEvents(c: AppContext) {
 
 /** Issue event detail; `{event_id}` may be a concrete id, `latest`, `oldest`. */
 async function handleIssueEventDetail(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const selector = c.req.param('eventId');
 	const projectParam = 'project' in c.req.param() ? c.req.param('project') : undefined;
 	let target: MemberProject | null = null;
@@ -992,7 +1038,7 @@ async function handleListProjects(c: AppContext) {
 
 /** Comments (Sentry notes shape) over the native comment store. */
 async function handleListComments(c: AppContext) {
-	const resolved = await resolveIssue(c, c.req.param('issueId'));
+	const resolved = await resolveIssue(c, issueIdParam(c));
 	if (!resolved) {
 		return c.json({ detail: 'not found' }, 404);
 	}
@@ -1010,20 +1056,48 @@ async function handleListComments(c: AppContext) {
 		}>;
 	};
 	return c.json(
-		(data.comments ?? []).map((comment) => ({
-			id: comment.id,
-			issueId: comment.issueId,
-			projectId: resolved.project.id,
-			text: comment.body,
-			data: {},
-			dateCreated: comment.createdAt,
-			user: { id: comment.userId, name: comment.userName, username: comment.userName },
-		})),
+		(data.comments ?? []).map((comment) =>
+			serializeNote({
+				id: comment.id,
+				issueId: comment.issueId,
+				projectId: resolved.project.id,
+				text: comment.body,
+				dateCreated: comment.createdAt,
+				userId: comment.userId,
+				userName: comment.userName,
+			}),
+		),
 	);
 }
 
+/**
+ * Sentry note shape: an Activity of `type: "note"` whose text lives in
+ * `data.text` (what Sentry clients read), plus the top-level `text`,
+ * `issueId` and `projectId` this surface has always returned.
+ */
+function serializeNote(note: {
+	id: string | undefined;
+	issueId: string;
+	projectId: string;
+	text: string;
+	dateCreated: string;
+	userId: string;
+	userName: string;
+}): Record<string, unknown> {
+	return {
+		id: note.id,
+		type: 'note',
+		issueId: note.issueId,
+		projectId: note.projectId,
+		text: note.text,
+		data: { text: note.text },
+		dateCreated: note.dateCreated,
+		user: { id: note.userId, name: note.userName, username: note.userName },
+	};
+}
+
 async function handleCreateComment(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const body = (await c.req.json().catch(() => null)) as { text?: unknown } | null;
 	if (
 		body === null ||
@@ -1053,21 +1127,21 @@ async function handleCreateComment(c: AppContext) {
 		comment?: { id: string; createdAt?: string; body?: string };
 	};
 	return c.json(
-		{
+		serializeNote({
 			id: comment.comment?.id,
 			issueId,
 			projectId: resolved.project.id,
 			text: comment.comment?.body ?? body.text.trim(),
-			data: {},
 			dateCreated: comment.comment?.createdAt ?? new Date().toISOString(),
-			user: { id: auth.user.id, name: auth.user.name, username: auth.user.name },
-		},
+			userId: auth.user.id,
+			userName: auth.user.name,
+		}),
 		201,
 	);
 }
 
 async function handleDeleteComment(c: AppContext) {
-	const issueId = c.req.param('issueId');
+	const issueId = issueIdParam(c);
 	const commentId = c.req.param('commentId');
 	const resolved = await resolveIssue(c, issueId);
 	if (!resolved) {
@@ -1087,7 +1161,153 @@ async function handleDeleteComment(c: AppContext) {
 	return c.body(null, 204);
 }
 
+/** Native issue_activity row (ProjectState `/issue/activity`). */
+interface NativeActivity {
+	id: string;
+	issueId: string;
+	userId: string;
+	userName: string;
+	type: string;
+	data: Record<string, unknown>;
+	createdAt: string;
+}
+
+/** Native status transitions → Sentry activity types. */
+const STATUS_ACTIVITY_TYPES: Record<string, string> = {
+	resolved: 'set_resolved',
+	unresolved: 'set_unresolved',
+	ignored: 'set_ignored',
+};
+
+/**
+ * Native activity row → Sentry Activity. Comments become `note` entries
+ * keyed by the comment id (Sentry notes ARE activities, so the id works on
+ * `notes/{id}/`); status changes map to `set_*` types; system-made changes
+ * carry `user: null`, as Sentry does for automatic activity.
+ */
+function serializeActivity(row: NativeActivity): Record<string, unknown> {
+	const user =
+		row.userId === 'system' ? null : { id: row.userId, name: row.userName, username: row.userName };
+	if (row.type === 'comment') {
+		const commentId = typeof row.data.commentId === 'string' ? row.data.commentId : row.id;
+		return {
+			id: commentId,
+			type: 'note',
+			data: { text: typeof row.data.body === 'string' ? row.data.body : '' },
+			dateCreated: row.createdAt,
+			user,
+		};
+	}
+	if (row.type === 'status_change') {
+		const to = typeof row.data.to === 'string' ? row.data.to : '';
+		return {
+			id: row.id,
+			type: STATUS_ACTIVITY_TYPES[to] ?? 'set_unresolved',
+			data: {},
+			dateCreated: row.createdAt,
+			user,
+		};
+	}
+	return { id: row.id, type: row.type, data: row.data ?? {}, dateCreated: row.createdAt, user };
+}
+
+/**
+ * GET /api/0/organizations/{org}/issues/{issue_id}/activities/ —
+ * `{"activity": [...]}` newest first, built from the stored issue activity
+ * (walked up to the same 1000-row horizon as the lists) plus Sentry's
+ * closing `first_seen` entry at the issue's firstSeen.
+ */
+async function handleIssueActivities(c: AppContext) {
+	const resolved = await resolveIssue(c, issueIdParam(c));
+	if (!resolved) {
+		return c.json({ detail: 'not found' }, 404);
+	}
+	const rows: NativeActivity[] = [];
+	let cursor: string | undefined;
+	for (let page = 0; page < ISSUE_PAGES_MAX; page++) {
+		const response = await projectStateFetch(c, resolved.project.id, '/issue/activity', {
+			issueId: resolved.issue.id,
+			limit: 100,
+			cursor,
+		});
+		if (!response.ok) {
+			return c.json({ detail: 'failed to load activity' }, 500);
+		}
+		const data = (await response.json()) as {
+			activity?: NativeActivity[];
+			nextCursor?: string;
+			hasMore?: boolean;
+		};
+		rows.push(...(data.activity ?? []));
+		if (data.hasMore !== true || !data.nextCursor) break;
+		cursor = data.nextCursor;
+	}
+	return c.json({
+		activity: [
+			...rows.map(serializeActivity),
+			{
+				id: `first-seen-${resolved.issue.id}`,
+				type: 'first_seen',
+				data: {},
+				dateCreated: resolved.issue.firstSeen,
+				user: null,
+			},
+		],
+	});
+}
+
+/** GET /api/0/projects/{org}/{project}/ — project detail (list serializer). */
+async function handleProjectDetail(c: AppContext) {
+	const projectParam = c.req.param('project');
+	const project = (await memberProjects(c)).find(
+		(p) => p.slug === projectParam || p.id === projectParam,
+	);
+	if (!project) {
+		return c.json({ detail: 'not found' }, 404);
+	}
+	return c.json(serializeApi0Project(project));
+}
+
+/**
+ * GET /api/0/auth/ — the authenticated user (session or `wst_` token
+ * owner), Sentry's DetailedUser subset. `whoami` in Sentry clients reads
+ * `id`, `name` and `email`.
+ */
+async function handleAuthUser(c: AppContext) {
+	const user = c.get('auth')!.user;
+	return c.json({
+		id: user.id,
+		name: user.name,
+		username: user.email,
+		email: user.email,
+		avatarUrl: null,
+		isActive: true,
+		hasPasswordAuth: true,
+		isManaged: false,
+		dateJoined: user.createdAt,
+		lastLogin: null,
+		lastActive: null,
+		has2fa: false,
+		isSuperuser: user.role === 'admin',
+		isStaff: false,
+		emails: [{ id: user.id, email: user.email, is_verified: true }],
+		avatar: { avatarType: 'letter_avatar', avatarUuid: null },
+	});
+}
+
 // Registrations: both slashed and unslashed forms (strict routing).
+for (const path of ['/auth', '/auth/']) {
+	api0Routes.get(path, handleAuthUser);
+}
+for (const base of ['/projects/:org/:project', '/projects/:org/:project/']) {
+	api0Routes.get(base, handleProjectDetail);
+}
+for (const base of [
+	'/organizations/:org/issues/:issueId/activities',
+	'/organizations/:org/issues/:issueId/activities/',
+]) {
+	api0Routes.get(base, handleIssueActivities);
+}
 for (const path of ['/organizations', '/organizations/']) {
 	api0Routes.get(path, handleListOrganizations);
 }
@@ -1138,18 +1358,22 @@ for (const base of [
 ]) {
 	api0Routes.get(base, handleProjectEventDetail);
 }
-for (const base of [
-	'/organizations/:org/issues/:issueId/comments',
-	'/organizations/:org/issues/:issueId/comments/',
-]) {
-	api0Routes.get(base, handleListComments);
-	api0Routes.post(base, handleCreateComment);
-}
-for (const base of [
-	'/organizations/:org/issues/:issueId/comments/:commentId',
-	'/organizations/:org/issues/:issueId/comments/:commentId/',
-]) {
-	api0Routes.delete(base, handleDeleteComment);
+// `notes/` is Sentry's own name for issue comments (the MCP server and
+// sentry-cli use it); `comments/` stays as the original alias.
+for (const collection of ['comments', 'notes']) {
+	for (const base of [
+		`/organizations/:org/issues/:issueId/${collection}`,
+		`/organizations/:org/issues/:issueId/${collection}/`,
+	]) {
+		api0Routes.get(base, handleListComments);
+		api0Routes.post(base, handleCreateComment);
+	}
+	for (const base of [
+		`/organizations/:org/issues/:issueId/${collection}/:commentId`,
+		`/organizations/:org/issues/:issueId/${collection}/:commentId/`,
+	]) {
+		api0Routes.delete(base, handleDeleteComment);
+	}
 }
 
 // Namespace-local unmatched-GET fallback: Sentry-style 404 instead of the
